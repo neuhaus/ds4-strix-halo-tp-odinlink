@@ -27,30 +27,16 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-The September 14 research runs used
-`research/glm53-flash-roce-v2-successor-20260914` at `9fefea6`; that
-implementation remains unmerged. These are individual source-clean runs,
-not repeated-run aggregates or new `main` release measurements. Earlier
-diagnostic runs used different binaries and are excluded from aggregation.
-The Huihui and Antirez runs use distinct model artifacts, so their throughput
-differences are not a controlled engine comparison. Evidence is retained at
-`$DS4_RESEARCH_ROOT/bench-runs/premain-q4-20260914T065732Z.{csv,manifest}`
-and `premain-q2-20260914T065732Z.{csv,manifest}` in the same directory.
+The `9fefea6` successor timings are unmerged research measurements. Huihui and
+Antirez artifacts are not directly comparable. Paired 100-case Huihui Q4/Q2
+quality scores matched main; the 8K promotion gate remains pending. Evidence:
+`$DS4_RESEARCH_ROOT/candidates/successor-quality-20260914/README.md` and
+`$DS4_RESEARCH_ROOT/bench-runs/premain-q{2,4}-20260914T065732Z.{csv,manifest}`.
 
-An independent paired quality test against main `8f75659` found identical
-recorded scores for both Huihui quantizations over 100 short continuation
-cases and 2,289 target tokens each. This establishes no measured drift on
-that fixture; it does not resolve historical FNV changes or complete the
-8K promotion gate. See
-`$DS4_RESEARCH_ROOT/candidates/successor-quality-20260914/README.md`.
-
-The registered-slab attention exchange is validated with both listed Q4_K
-layouts and both RDMA providers. On the affected OdinLink pair, the second
-Q4_K layout improved from 147.99 to **286.29 prefill t/s** while preserving
-**21.10 decode t/s**; its matched RoCE v2 run reached **319.05/21.22 t/s**.
-Both kept the exact token fingerprint and zero fallback. The repair reuses the
-existing communication slab, adds no cache, and replaces a separate 32 MiB
-attention-output allocation at the validated 2,048-row cap.
+The cache-free registered-slab repair kept exact fingerprints and zero
+fallback. For the second Q4_K layout, OdinLink improved from 147.99 to
+**286.29 prefill t/s** with **21.10 decode t/s**; matched RoCE v2 reached
+**319.05/21.22 t/s**.
 
 ### Q4_K throughput through 10K context
 
