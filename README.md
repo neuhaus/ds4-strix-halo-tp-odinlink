@@ -25,16 +25,14 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Huihui Q2_K over RoCE v2, archived | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | historical probe; FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
-| **Huihui Q4_K over RoCE v2, research** | balanced 50/50, 2,048 prompt + 300 decode; one run | **314.68 t/s** | **21.12 t/s** | clean successor `9fefea6`, 2026-09-14; FNV `ee2d32f1d0e4b8f4`, zero fallback |
-| **Huihui Q2_K over RoCE v2, research** | balanced 50/50, 2,048 prompt + 300 decode; one run | **233.53 t/s** | **19.96 t/s** | clean successor `9fefea6`, 2026-09-14; FNV `5e0fa38210276c41`, zero fallback |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-The September 14 research rows report steady decode from
+The September 14 research runs used
 `research/glm53-flash-roce-v2-successor-20260914` at `9fefea6`; that
 implementation remains unmerged. These are individual source-clean runs,
 not repeated-run aggregates or new `main` release measurements. Earlier
 diagnostic runs used different binaries and are excluded from aggregation.
-The Huihui and Antirez rows use distinct model artifacts, so their throughput
+The Huihui and Antirez runs use distinct model artifacts, so their throughput
 differences are not a controlled engine comparison. Evidence is retained at
 `$DS4_RESEARCH_ROOT/bench-runs/premain-q4-20260914T065732Z.{csv,manifest}`
 and `premain-q2-20260914T065732Z.{csv,manifest}` in the same directory.
@@ -99,8 +97,7 @@ weight cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its main Q4_K rows
-use the Antirez reference model listed below; the research rows use Huihui
-0731 models. The Antirez Q4_K model does not fit one node's
+use the Antirez reference model listed below. The Antirez Q4_K model does not fit one node's
 current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
 and Q4_K run without a persistent expanded-weight cache.
 
@@ -133,7 +130,7 @@ policy, and maintainer gates are preserved locally under
 | Model source | Tested target files | Support |
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
-| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Used for the September 14 research Q2_K and Q4_K rows. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Used for the September 14 research Q2_K and Q4_K runs. |
 | [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
