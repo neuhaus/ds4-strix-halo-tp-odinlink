@@ -22,7 +22,7 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| Huihui Q2_K over RoCE v2, archived | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | historical probe; FNV `2a44e523bf2d7947` |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run | **233.53 t/s** | **19.96 t/s** | measured on unmerged successor `9fefea6`, 2026-09-14; FNV `5e0fa38210276c41`, zero fallback |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
@@ -77,12 +77,11 @@ DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256 | **95.42 t/s** | **9.95 t/s** | current source-clean run; exact FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; one run | **100.38 t/s** | **10.95 t/s** | restored research recipe, 2026-09-14; FNV `9012bd4d7c5ce422`, zero fallback; diagnostic, not promoted |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256 | **52.74 t/s** | **10.35 t/s** | current source-clean mixed IQ2_XXS/Q2_K run; exact FNV `4dabfb16bc99c81b` |
-| GLM-5.3 Flash Q4_K over RoCE v2, research diagnostic | 4,096 prompt + 300 decode, batch 256; one run | **100.38 t/s** | **10.95 t/s** | restored recipe, 2026-09-14; FNV `9012bd4d7c5ce422`, zero fallback; not promoted |
 
-The diagnostic row uses the unchanged original Antirez GGUF and reports
+The Q4_K RoCE v2 row uses the unchanged original Antirez GGUF and reports
 steady decode (overall decode: 10.94 t/s). It restores
 `DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED=1` on frozen research executables;
 their original build provenance is incomplete, and the underlying Q8 path's
@@ -90,15 +89,16 @@ quality gate remains open. It is not a source-bound release benchmark or a
 successor-branch measurement. Evidence and executable hashes are recorded in
 `$DS4_RESEARCH_ROOT/candidates/glm53-flash-roce-v2-20260912/prefill-recipe-repair-20260914.md`;
 the run is `bench-runs/glm53-recipe-check-4096-shared1-r3bin-r1` within that
-candidate directory. The 300 prefill / 20 decode t/s GLM target remains unmet.
+candidate directory. The source-clean main baseline remains 95.42 prefill /
+9.95 decode t/s. The 300 prefill / 20 decode t/s GLM target remains unmet.
 
 The main Q4_K path keeps all 4,096 prompt rows batched, adds no persistent
 weight cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its main Q4_K rows
-use the Antirez reference model listed below. The Antirez Q4_K model does not fit one node's
-current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
+use the Antirez reference model listed below. The Antirez Q4_K model does not
+fit one node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
 and Q4_K run without a persistent expanded-weight cache.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
