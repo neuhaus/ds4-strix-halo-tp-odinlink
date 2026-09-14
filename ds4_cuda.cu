@@ -3906,8 +3906,12 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    fprintf(stderr,
+            "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB "
+            "expanded_weight_cache_bytes=%llu\n",
+            label ? label : "", (double)free_b / 1048576.0,
+            (double)total_b / 1048576.0,
+            (unsigned long long)g_q8_f16_bytes);
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {

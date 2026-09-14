@@ -345,6 +345,7 @@ struct ds4_tp {
     uint32_t big_capacity_rows; /* 0 unless DS4_TP_BIG_DIRECT=1 */
     uint64_t logits_seq;
     uint64_t timeout_sec;
+    uint64_t payload_fallback_calls;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -2787,6 +2788,9 @@ int ds4_tp_create(
     fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
             tp->rank == 0 ? "worker" : "leader",
             tp->rdma_active ? "rdma" : "tcp");
+    const char *bench_run_id = getenv("DS4_BENCH_RUN_ID");
+    if (bench_run_id && bench_run_id[0])
+        fprintf(stderr, "ds4-tp: benchmark run_id=%s\n", bench_run_id);
     *out = tp;
     return 1;
 fail:
@@ -2808,6 +2812,14 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
 
 void ds4_tp_free(ds4_tp *tp) {
     if (!tp) return;
+    fprintf(stderr,
+            "ds4-tp: transport proof requested=%s active=%s "
+            "payload_fallback_calls=%llu failed=%u\n",
+            tp->opt.transport == DS4_TP_TRANSPORT_RDMA ? "rdma" :
+            tp->opt.transport == DS4_TP_TRANSPORT_TCP ? "tcp" : "auto",
+            tp->rdma_active ? "rdma" : "tcp",
+            (unsigned long long)tp->payload_fallback_calls,
+            atomic_load_explicit(&tp->failed, memory_order_acquire) ? 1u : 0u);
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
@@ -2887,6 +2899,8 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     if (tp->rdma_active)
         return tp_rdma_gate_exchange(tp, layer, gate, seq, NULL);
 #endif
+    if (tp_refuse_payload_fallback(tp, "gate payload")) return 0;
+    tp->payload_fallback_calls++;
     /* TCP: both sides write their partial then read the peer's.  16KB per
      * direction fits comfortably in the socket buffers, so the symmetric
      * write-then-read cannot deadlock.  Header and payload go out in one
@@ -2998,6 +3012,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     }
 #endif
     if (tp_refuse_payload_fallback(tp, "batch-gate payload")) return 0;
+    tp->payload_fallback_calls++;
     struct iovec iov[2] = {
         { &h, sizeof(h) },
         { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
@@ -3111,6 +3126,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     }
 #endif
     if (tp_refuse_payload_fallback(tp, "big-gate payload")) return 0;
+    tp->payload_fallback_calls++;
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?

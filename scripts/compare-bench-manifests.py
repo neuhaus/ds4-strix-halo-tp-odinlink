@@ -14,6 +14,7 @@ import sys
 
 ENV_FIELDS = {"common_env", "worker_env", "coordinator_env", "extra_env"}
 RUN_FIELDS = {"tag", "run_id"}
+VOLATILE_ENV = {"DS4_BENCH_RUN_ID"}
 
 
 def read_manifest(path):
@@ -28,9 +29,10 @@ def read_manifest(path):
             effective = {}
             for assignment in shlex.split(value):
                 name, separator, setting = assignment.partition("=")
-                if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+                if (not separator or
+                        not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) or
+                        name in effective):
                     raise ValueError(f"{path}: invalid assignment in {key}")
-                # env processes assignments in order; the last one wins.
                 effective[name] = setting
             value = effective
         fields[key] = value
@@ -51,6 +53,8 @@ def compare(left, right, allow_fields=(), allow_env=()):
             continue
         if field in ENV_FIELDS and isinstance(a, dict) and isinstance(b, dict):
             for name in sorted(a.keys() | b.keys()):
+                if name in VOLATILE_ENV:
+                    continue
                 if a.get(name) != b.get(name):
                     entry = {"field": field, "env": name, "before": a.get(name), "after": b.get(name)}
                     (allowed if name in allow_env else rejected).append(entry)

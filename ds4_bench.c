@@ -27,6 +27,9 @@
 #include <time.h>
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
+#ifndef DS4_BENCH_PRODUCER_SOURCE_SHA256
+#define DS4_BENCH_PRODUCER_SOURCE_SHA256 "unbound"
+#endif
 
 typedef struct {
     const char *model_path;
@@ -1368,6 +1371,10 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--producer-source-sha256")) {
+        puts(DS4_BENCH_PRODUCER_SOURCE_SHA256);
+        return 0;
+    }
     bench_config cfg = parse_options(argc, argv);
 
     /* Hint the packer at the largest ctx this bench run will exercise
@@ -1814,15 +1821,27 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const double prefill_tps =
+            prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0;
+        const double gen_tps =
+            gen_sec > 0.0 ? (double)gen_done / gen_sec : 0.0;
         const int gen_steady_tokens =
             gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
+        if (gen_done >= 300 && isfinite(prefill_tps) && prefill_tps > 0.0 &&
+            isfinite(gen_tps) && gen_tps > 0.0) {
+            if (fprintf(stderr, "ds4-bench: headline_csv_complete=1\n") < 0 ||
+                fflush(stderr) != 0) {
+                rc = 1;
+                break;
+            }
+        }
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%llu,%016llx",
                 frontier,
                 prefill_tokens,
-                prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
+                prefill_tps,
                 gen_done,
-                gen_sec > 0.0 ? (double)gen_done / gen_sec : 0.0,
+                gen_tps,
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
@@ -1833,7 +1852,12 @@ int main(int argc, char **argv) {
             fprintf(out, ",%llu", (unsigned long long)accept_len_hist[i]);
         }
         fputc('\n', out);
-        fflush(out);
+        if (fflush(out) != 0 || ferror(out)) {
+            fprintf(stderr, "ds4-bench: failed to flush headline CSV: %s\n",
+                    strerror(errno));
+            rc = 1;
+            break;
+        }
 
         previous = frontier;
         if (frontier >= cfg.ctx_max) break;
