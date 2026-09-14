@@ -210,6 +210,7 @@ quality_sha = hashlib.sha256(quality_stream.getvalue().encode()).hexdigest()
 quality_manifest = (
     f"model={model_path}\nmodel_size={model_size}\n"
     f"model_sample_sha256={model_sample}\nsource_commit={'0' * 40}\n"
+    f"quality_input_sha256={'b' * 64}\n"
     "source_dirty=0\ndspark=0\n"
 )
 quality_manifest_sha = hashlib.sha256(quality_manifest.encode()).hexdigest()
@@ -353,7 +354,9 @@ for name, averages in (("quality-reference.tsv", reference_averages),
     manifest_source = "0" * 40 if name.startswith("quality-reference") else source_commit
     (root / name.replace(".tsv", ".manifest")).write_text(
         f"model={model_path}\nmodel_size=1\nmodel_sample_sha256={model_sample}\n"
-        f"source_commit={manifest_source}\nsource_dirty=0\ndspark=0\n")
+        f"source_commit={manifest_source}\n"
+        f"quality_input_sha256={'b' * 64}\n"
+        "source_dirty=0\ndspark=0\n")
 PY
 "$repo/scripts/compare-teacher-logits.py" \
   "$dossier/logits-reference" "$dossier/logits-candidate" \

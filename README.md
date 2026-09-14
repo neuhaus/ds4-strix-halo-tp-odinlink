@@ -25,8 +25,8 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Huihui Q2_K over RoCE v2 | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | archived branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
-| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; exact FNV `ee2d32f1d0e4b8f4`, zero fallback |
-| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; exact FNV `5e0fa38210276c41`, zero fallback |
+| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; zero fallback; independent quality validation pending |
+| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; zero fallback; independent quality validation pending |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 The registered-slab attention exchange is validated with both listed Q4_K
@@ -62,6 +62,10 @@ provenance manifest, and paired comparison under `$DS4_RESEARCH_ROOT`. It
 fails closed when the 100-case/2,289-token minimum, NLL confidence bound, or
 API agreement checks are not met. `REFERENCE.tsv` must be a score from the
 approved quality anchor using the same tracked fixture.
+The fixture is selected from the GGUF architecture: DeepSeek uses `flash`,
+GLM5.3 uses `glm53-flash-openrouter-zai-fp8-100`. A newly measured `main`
+reference provides a paired regression screen; it does not by itself establish
+an approved immutable quality anchor or authorize promotion.
 
 ### Q4_K throughput through 10K context
 

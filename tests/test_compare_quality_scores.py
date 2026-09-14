@@ -30,6 +30,7 @@ def write_scores(path: Path, averages: list[float], top1: int = 9,
             })
     path.with_suffix(".manifest").write_text(
         "model=/model.gguf\nmodel_size=1\nmodel_sample_sha256=" + "a" * 64 +
+        "\nquality_input_sha256=" + "b" * 64 +
         "\nsource_commit=" + "0" * 40 + "\nsource_dirty=0\ndspark=0\n",
         encoding="utf-8")
 
@@ -76,6 +77,31 @@ def main() -> int:
             [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
             text=True, capture_output=True, check=False)
         assert quality_drop.returncode != 0
+
+        # A smaller/easier API denominator must not improve the apparent rate.
+        write_scores(candidate, [0.49, 0.59, 0.69], top1=9, api_count=9)
+        coverage_drop = subprocess.run(
+            [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
+            text=True, capture_output=True, check=False)
+        assert coverage_drop.returncode != 0
+        assert "API coverage differs" in coverage_drop.stderr
+
+        write_scores(candidate, [0.49, 0.59, 0.69], top1=11)
+        invalid_count = subprocess.run(
+            [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
+            text=True, capture_output=True, check=False)
+        assert invalid_count.returncode != 0
+        assert "invalid API agreement" in invalid_count.stderr
+
+        for key in ("model_size", "model_sample_sha256", "quality_input_sha256"):
+            write_scores(candidate, [0.49, 0.59, 0.69])
+            manifest = candidate.with_suffix(".manifest")
+            manifest.write_text(manifest.read_text() + f"{key}=mismatch\n")
+            mismatch = subprocess.run(
+                [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
+                text=True, capture_output=True, check=False)
+            assert mismatch.returncode != 0
+            assert key in mismatch.stderr
 
         write_scores(reference, [0.5, 0.6, 0.7], api_count=0)
         write_scores(candidate, [0.49, 0.59, 0.69], api_count=0)

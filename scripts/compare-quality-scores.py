@@ -40,6 +40,17 @@ def manifest_for(path: Path) -> Path:
     return path.with_suffix(".manifest")
 
 
+def validate_pair(reference: Path, candidate: Path) -> None:
+    manifests = []
+    for path in (reference, candidate):
+        metadata = dict(line.split("=", 1) for line in
+                        manifest_for(path).read_text().splitlines() if "=" in line)
+        manifests.append(metadata)
+    for key in ("model_size", "model_sample_sha256", "quality_input_sha256"):
+        if not manifests[0].get(key) or manifests[0][key] != manifests[1].get(key):
+            raise ValueError(f"reference and candidate {key} differ or are missing")
+
+
 def number(row: dict[str, str], key: str, integer: bool = False) -> float | int:
     try:
         value = int(row[key]) if integer else float(row[key])
@@ -95,12 +106,24 @@ def main() -> int:
         thresholds = load_thresholds(args.thresholds)
         reference = load_rows(args.reference)
         candidate = load_rows(args.candidate)
+        validate_pair(args.reference, args.candidate)
         if [row["id"] for row in reference] != [row["id"] for row in candidate]:
             raise ValueError("reference and candidate case ids/order differ")
+        if len({row["id"] for row in reference}) != len(reference):
+            raise ValueError("duplicate case ids do not count as independent coverage")
         deltas: list[float] = []
         ref_nll = cand_nll = 0.0
         target_tokens = 0
         for ref_row, cand_row in zip(reference, candidate):
+            for denominator, numerator in (("api_top1_count", "api_top1_match"),
+                                           ("api_pair_total", "api_pair_agree")):
+                ref_count = number(ref_row, denominator, True)
+                cand_count = number(cand_row, denominator, True)
+                if ref_count < 0 or cand_count != ref_count:
+                    raise ValueError(f"case {ref_row['id']}: API coverage differs")
+                for row in (ref_row, cand_row):
+                    if not 0 <= number(row, numerator, True) <= ref_count:
+                        raise ValueError(f"case {row['id']}: invalid API agreement count")
             ref_tokens = number(ref_row, "target_tokens", True)
             cand_tokens = number(cand_row, "target_tokens", True)
             if ref_tokens <= 0 or cand_tokens != ref_tokens:

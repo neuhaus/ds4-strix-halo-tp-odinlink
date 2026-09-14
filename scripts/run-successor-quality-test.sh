@@ -9,6 +9,8 @@ REFERENCE=${3:?usage: run-successor-quality-test.sh TAG MODEL.gguf REFERENCE.tsv
 shift 3
 [[ $TAG =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: invalid tag" >&2; exit 2; }
 [[ -r $MODEL && -r $REFERENCE ]] || { echo "error: model or reference TSV is unreadable" >&2; exit 1; }
+MODEL=$(realpath "$MODEL")
+REFERENCE=$(realpath "$REFERENCE")
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
@@ -20,9 +22,23 @@ OUT=${DS4_QUALITY_OUT:-$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14}
 mkdir -p "$OUT"
 CANDIDATE="$OUT/$TAG.tsv"
 THRESHOLDS=${DS4_QUALITY_THRESHOLDS:-$REPO/quality-thresholds.successor.json}
-MANIFEST=${DS4_QUALITY_MANIFEST:-$REPO/gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv}
+ARCH=$(python3 "$REPO/scripts/gguf_tensor_types.py" --architecture "$MODEL")
+case $ARCH in
+  glm5-next) FIXTURE=glm53-flash-openrouter-zai-fp8-100 ;;
+  deepseek4) FIXTURE=flash ;;
+  *) echo "error: no quality fixture for architecture $ARCH" >&2; exit 2 ;;
+esac
+MANIFEST=${DS4_QUALITY_MANIFEST:-$REPO/gguf-tools/quality-testing/data/$FIXTURE/manifest.tsv}
 [[ -r $THRESHOLDS && -r $MANIFEST ]] || { echo "error: missing quality thresholds or tracked fixture manifest" >&2; exit 1; }
-[[ ! -e $CANDIDATE ]] || { echo "error: refusing to overwrite $CANDIDATE" >&2; exit 1; }
+for evidence in "$CANDIDATE" "$OUT/$TAG.manifest" "$OUT/$TAG.comparison.json" "$OUT/coordinator-$TAG.log" "$OUT/worker-$TAG.log"; do
+  [[ ! -e $evidence ]] || { echo "error: refusing to overwrite $evidence" >&2; exit 1; }
+done
+[[ ${DS4_QUALITY_RDMA_PROFILE:-roce-v2} == roce-v2 ]] || {
+  echo "error: successor quality tests require RoCE v2" >&2; exit 2;
+}
+
+# Manifest paths inside the tracked fixture are relative to the checkout.
+cd "$REPO"
 
 DS4_QUALITY_MANIFEST="$MANIFEST" \
   DS4_QUALITY_RDMA_PROFILE=${DS4_QUALITY_RDMA_PROFILE:-roce-v2} \
