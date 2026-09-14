@@ -782,6 +782,22 @@ def main() -> int:
             lambda values: values.pop("ds4_bench_producer_source_sha256")),
         "producer binary does not match")
     expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__(
+                "ds4_bench_producer_source_sha256", "0" * 64)),
+        "producer binary does not match")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.pop("ds4_bench_tp_sha256")),
+        "no valid benchmark binary identity")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__("ds4_bench_tp_sha256", "e" * 64)),
+        "provider runs used different benchmark binaries")
+    expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: (
                 value["record"]["key"].pop("source_commit"),

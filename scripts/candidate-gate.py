@@ -191,6 +191,10 @@ def _timing_noise_run(repo: Path, root: Path, value: object, *,
             manifest.get("ds4_sha256") != anchor["ds4_sha256"] or
             manifest.get("peer_ds4_sha256") != anchor["ds4_sha256"]):
         raise GateError("timing-noise run differs from the baseline scope")
+    bench_binary = verify_benchmark_producer(
+        repo, manifest, key["source_commit"], "timing-noise benchmark")
+    if bench_binary != anchor.get("ds4_bench_tp_sha256"):
+        raise GateError("timing-noise run used a different benchmark binary")
     environment = normalized_manifest_environment(
         manifest, "timing-noise manifest")
     if environment != anchor["environment"]:
@@ -525,6 +529,30 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def committed_source_sha256(repo: Path, commit: str, relative: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{relative}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise GateError(
+            f"cannot resolve {relative} from benchmark source commit {commit}")
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def verify_benchmark_producer(repo: Path, manifest: dict[str, str],
+                              source_commit: str, label: str) -> str:
+    bench_binary = manifest.get("ds4_bench_tp_sha256", "")
+    producer_source = manifest.get("ds4_bench_producer_source_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", bench_binary):
+        raise GateError(f"{label} has no valid benchmark binary identity")
+    if (not re.fullmatch(r"[0-9a-f]{64}", producer_source) or
+            producer_source != committed_source_sha256(
+                repo, source_commit, "ds4_bench.c")):
+        raise GateError(
+            f"{label} producer binary does not match committed ds4_bench.c")
+    return bench_binary
 
 
 def canonical_sha256(value: object) -> str:
@@ -1363,8 +1391,10 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
         provider: {"prefill": [], "decode": []} for provider in providers}
     provider_environments: dict[str, dict[str, str]] = {}
     provider_binaries: dict[str, str] = {}
+    provider_bench_binaries: dict[str, str] = {}
     run_ids = set()
     binary_hashes = set()
+    bench_binary_hashes = set()
     for item in benchmark_items:
         if (not isinstance(item, dict) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) or
@@ -1412,6 +1442,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 manifest.get("toolchain_id") != key.get("toolchain_id") or
                 manifest.get("dspark") != "0"):
             raise GateError("baseline genesis benchmark identity mismatch")
+        bench_binary = verify_benchmark_producer(
+            repo, manifest, key["source_commit"], "baseline genesis benchmark")
         verify_tp_layout_manifest(manifest, layout,
                                   "baseline genesis benchmark layout")
         for field in workload_manifest_fields(workload):
@@ -1427,10 +1459,18 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             raise GateError("baseline genesis provider runs used different binaries")
         provider_binaries[provider] = local_binary
         binary_hashes.add(local_binary)
+        if (provider in provider_bench_binaries and
+                provider_bench_binaries[provider] != bench_binary):
+            raise GateError(
+                "baseline genesis provider runs used different benchmark binaries")
+        provider_bench_binaries[provider] = bench_binary
+        bench_binary_hashes.add(bench_binary)
     if any(count < 3 for count in provider_counts.values()):
         raise GateError("baseline genesis requires three runs per RDMA provider")
     if len(binary_hashes) != 1:
         raise GateError("baseline genesis benchmarks used different binaries")
+    if len(bench_binary_hashes) != 1:
+        raise GateError("baseline genesis benchmarks used different benchmark binaries")
     reference["performance"] = {
         provider: {
             "runs": provider_counts[provider],
@@ -1440,6 +1480,7 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             },
             "environment": provider_environments[provider],
             "ds4_sha256": provider_binaries[provider],
+            "ds4_bench_tp_sha256": provider_bench_binaries[provider],
         }
         for provider in providers
     }

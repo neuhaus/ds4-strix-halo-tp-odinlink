@@ -85,10 +85,13 @@ benchmark producer, benchmark and quality launchers, worker supervisor,
 research-root resolver, and GGUF type inspector. GLM-5.3 Flash promotion is
 fixed to RoCE v2 with zero payload fallback.
 
-Before candidate inference or `record-run`, the launcher must verify that the
+Before baseline or candidate inference, remote worker launch, or `record-run`,
+the launcher must verify that the
 benchmark executable's embedded producer-source SHA-256 matches the live
 `ds4_bench.c`. Promotion proof resolves the same identity from each run's
 committed source. A stale or unbound benchmark executable is ineligible.
+Baseline genesis independently resolves the committed producer bytes and
+rejects missing, stale, or mixed benchmark executable identities.
 
 ## Research-track lifecycle
 

@@ -8,10 +8,12 @@ else
   expected=$(shasum -a 256 "$repo/ds4_bench.c" | awk '{print $1}')
 fi
 
-make -s -B -C "$repo" ds4_bench.o
-grep -Fxq "$expected" < <(strings "$repo/ds4_bench.o") || {
-  echo "error: ds4_bench.o does not embed its producer source SHA-256" >&2
-  exit 1
-}
+make -s -B -C "$repo" ds4_bench.o ds4_bench_cpu.o
+for object in ds4_bench.o ds4_bench_cpu.o; do
+  grep -Fxq "$expected" < <(strings "$repo/$object") || {
+    echo "error: $object does not embed its producer source SHA-256" >&2
+    exit 1
+  }
+done
 
 echo "test_bench_producer_identity: PASS"

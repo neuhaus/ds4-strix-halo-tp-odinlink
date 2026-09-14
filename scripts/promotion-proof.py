@@ -251,7 +251,7 @@ def read_manifest(path: Path) -> dict[str, str]:
 
 def committed_source_sha256(repo: Path, commit: str, relative: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{commit}:{relative}"],
+        ["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{relative}"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise ProofError(

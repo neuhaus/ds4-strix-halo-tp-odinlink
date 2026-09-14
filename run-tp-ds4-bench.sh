@@ -1013,23 +1013,20 @@ BINARY_RUNPATH=$(LC_ALL=C readelf -d "$REPO/ds4" 2>/dev/null |
 TOOLCHAIN_ID=${DECLARED_TOOLCHAIN_ID:-elf-comment-sha256:$BINARY_TOOLCHAIN_SHA256}
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
 BENCH_PRODUCER_SOURCE_SHA256=$(sha256sum "$REPO/ds4_bench.c" | awk '{print $1}')
-BENCH_BINARY_PRODUCER_SOURCE_SHA256=unverified
-if [[ $CANDIDATE == 1 ]]; then
-  if ! BENCH_BINARY_PRODUCER_SOURCE_SHA256=$(
-    "$REPO/ds4-bench-tp" --producer-source-sha256 2>/dev/null
-  ); then
-    echo "error: candidate benchmark binary has no producer source identity; rebuild it" >&2
-    exit 1
-  fi
-  [[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
-    echo "error: candidate benchmark binary returned an invalid producer source identity" >&2
-    exit 1
-  }
-  [[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 == "$BENCH_PRODUCER_SOURCE_SHA256" ]] || {
-    echo "error: candidate benchmark binary is stale for ds4_bench.c; rebuild it" >&2
-    exit 1
-  }
+if ! BENCH_BINARY_PRODUCER_SOURCE_SHA256=$(
+  "$REPO/ds4-bench-tp" --producer-source-sha256 2>/dev/null
+); then
+  echo "error: benchmark binary has no producer source identity; rebuild it" >&2
+  exit 1
 fi
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+  echo "error: benchmark binary returned an invalid producer source identity" >&2
+  exit 1
+}
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 == "$BENCH_PRODUCER_SOURCE_SHA256" ]] || {
+  echo "error: benchmark binary is stale for ds4_bench.c; rebuild it" >&2
+  exit 1
+}
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
