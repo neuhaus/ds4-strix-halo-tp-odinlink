@@ -25207,6 +25207,176 @@ __global__ static void glm5_expand_pool_selection_kernel(
     selected_tokens[i] = value;
 }
 
+__global__ static void glm5_mask_pool_scores_batch_kernel(
+        float *scores,
+        const uint32_t *pool_valid,
+        uint32_t n_pools,
+        uint32_t score_stride,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t pool_size) {
+    const uint32_t pool = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (pool >= n_pools || token >= n_tokens) return;
+    const uint64_t visible_rows = (uint64_t)pos0 + token + 1u;
+    if (pool >= visible_rows / pool_size || pool_valid[pool] == 0u)
+        scores[(uint64_t)token * score_stride + pool] = -3.402823466e+38F;
+}
+
+template <typename CT>
+__global__ static void glm5_indexer_scores_pool_batch_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const CT *indexer_key_cache,
+        const uint32_t *pool_valid,
+        uint32_t n_pools,
+        uint32_t score_stride,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t pool_size,
+        uint32_t n_head,
+        uint32_t head_dim,
+        float scale) {
+    const uint32_t pool = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (pool >= n_pools || token >= n_tokens) return;
+    float *dst = scores + (uint64_t)token * score_stride + pool;
+    const uint64_t visible_rows = (uint64_t)pos0 + token + 1u;
+    if (pool >= visible_rows / pool_size || pool_valid[pool] == 0u) {
+        if (tid == 0u) *dst = -3.402823466e+38F;
+        return;
+    }
+    __shared__ float partial[128];
+    float score = 0.0f;
+    for (uint32_t h = 0u; h < n_head; ++h) {
+        const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+        float acc = 0.0f;
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x)
+            acc += qh[d] * (float)indexer_key_cache[
+                (uint64_t)pool * head_dim + d];
+        partial[tid] = acc;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1u; stride > 0u;
+             stride >>= 1u) {
+            if (tid < stride) partial[tid] += partial[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0u)
+            score += fmaxf(partial[0] * scale, 0.0f) *
+                     weights[(uint64_t)token * n_head + h];
+        __syncthreads();
+    }
+    if (tid == 0u) *dst = score;
+}
+
+__global__ static void glm5_expand_pool_selection_batch_kernel(
+        int32_t *selected_tokens,
+        const uint32_t *selected_pools,
+        const int32_t *pool_indices,
+        const uint32_t *pool_valid,
+        const uint32_t *valid_keys,
+        uint32_t n_pools,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_rows,
+        uint32_t first_valid,
+        uint32_t selected_pool_count,
+        uint32_t token_budget,
+        uint32_t pool_size) {
+    const uint32_t token = blockIdx.y;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t output_width = token_budget + pool_size - 1u;
+    if (token >= n_tokens || i >= output_width) return;
+    const uint64_t raw_visible = (uint64_t)pos0 + token + 1u;
+    const uint32_t visible = raw_visible > first_valid
+        ? (uint32_t)(raw_visible - first_valid) : 0u;
+    const uint32_t tail_count = visible % pool_size;
+    const uint32_t expanded = selected_pool_count * pool_size;
+    int32_t value = -1;
+    if (i < expanded) {
+        const uint32_t slot = i / pool_size;
+        const uint32_t member = i % pool_size;
+        const uint32_t pool = selected_pools[
+            (uint64_t)token * selected_pool_count + slot];
+        if (pool < n_pools && pool_valid[pool] != 0u)
+            value = pool_indices[(uint64_t)pool * pool_size + member];
+    } else if (i < expanded + pool_size - 1u) {
+        const uint32_t member = i - expanded;
+        const uint64_t tail_start = (uint64_t)first_valid + visible -
+            tail_count;
+        const uint64_t row = tail_start + member;
+        if (member < tail_count && row < n_rows &&
+            valid_keys[row] != 0u) value = (int32_t)row;
+    }
+    selected_tokens[(uint64_t)token * output_width + i] = value;
+}
+
+extern "C" int ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t              n_pools,
+        uint32_t              score_stride,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    uint32_t end_pos = 0u;
+    uint64_t score_elems = 0u, score_bytes = 0u;
+    uint64_t q_elems = 0u, q_bytes = 0u;
+    uint64_t weight_elems = 0u, weight_bytes = 0u;
+    uint64_t key_elems = 0u, key_bytes = 0u;
+    const int token_span_ok = n_tokens != 0u &&
+        pos0 <= UINT32_MAX - n_tokens;
+    if (token_span_ok) end_pos = pos0 + n_tokens;
+    const int sizes_ok =
+        cuda_u64_mul_checked(n_tokens, score_stride, &score_elems) &&
+        cuda_u64_mul_checked(score_elems, sizeof(float), &score_bytes) &&
+        cuda_u64_mul3_checked(n_tokens, n_head, head_dim, &q_elems) &&
+        cuda_u64_mul_checked(q_elems, sizeof(float), &q_bytes) &&
+        cuda_u64_mul_checked(n_tokens, n_head, &weight_elems) &&
+        cuda_u64_mul_checked(weight_elems, sizeof(float), &weight_bytes) &&
+        cuda_u64_mul_checked(n_pools, head_dim, &key_elems) &&
+        cuda_u64_mul_checked(key_elems,
+                             cache_f16 ? sizeof(__half) : sizeof(float),
+                             &key_bytes);
+    if (!scores || !q || !weights || !indexer_key_cache || !pool_valid ||
+        n_pools == 0u || score_stride < n_pools || n_tokens == 0u ||
+        pool_size == 0u || n_head == 0u ||
+        head_dim != 128u || !isfinite(scale) || scale <= 0.0f ||
+        !token_span_ok || !sizes_ok || n_tokens > 65535u ||
+        end_pos == UINT32_MAX || (uint64_t)(end_pos / pool_size) > n_pools ||
+        !scores->ptr || !q->ptr || !weights->ptr ||
+        !indexer_key_cache->ptr || !pool_valid->ptr ||
+        scores->bytes < score_bytes || q->bytes < q_bytes ||
+        weights->bytes < weight_bytes || indexer_key_cache->bytes < key_bytes ||
+        !cuda_tensor_has_f32(pool_valid, n_pools)) return 0;
+    const dim3 grid(n_pools, n_tokens, 1u);
+    if (cache_f16) {
+        glm5_indexer_scores_pool_batch_kernel<__half><<<grid, 128>>>(
+            (float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const __half *)indexer_key_cache->ptr,
+            (const uint32_t *)pool_valid->ptr, n_pools, score_stride,
+            n_tokens, pos0, pool_size, n_head, head_dim, scale);
+    } else {
+        glm5_indexer_scores_pool_batch_kernel<float><<<grid, 128>>>(
+            (float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const float *)indexer_key_cache->ptr,
+            (const uint32_t *)pool_valid->ptr, n_pools, score_stride,
+            n_tokens, pos0, pool_size, n_head, head_dim, scale);
+    }
+    return cuda_ok(cudaGetLastError(), "glm indexer pool batch launch");
+}
+
 extern "C" int ds4_gpu_glm5_mask_pool_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *pool_valid,
@@ -25264,6 +25434,68 @@ extern "C" int ds4_gpu_glm5_expand_pool_selection_tensor(
             selected_pool_count, n_rows, first_valid, visible_count,
             token_budget);
     return cuda_ok(cudaGetLastError(), "glm5 expand pool selection launch");
+}
+
+extern "C" int ds4_gpu_glm5_expand_pool_selection_batch_tensor(
+        ds4_gpu_tensor       *selected_tokens,
+        const ds4_gpu_tensor *selected_pools,
+        const ds4_gpu_tensor *pool_indices,
+        const ds4_gpu_tensor *pool_valid,
+        const ds4_gpu_tensor *valid_keys,
+        uint32_t              n_pools,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              first_valid,
+        uint32_t              selected_pool_count,
+        uint32_t              token_budget,
+        uint32_t              pool_size) {
+    uint32_t end_pos = 0u;
+    if (!selected_tokens || !selected_pools || !pool_indices || !pool_valid ||
+        !valid_keys || !selected_tokens->ptr || !selected_pools->ptr ||
+        !pool_indices->ptr || !pool_valid->ptr || !valid_keys->ptr ||
+        n_pools == 0u || n_tokens == 0u || n_rows == 0u || pool_size == 0u ||
+        token_budget == 0u || token_budget % pool_size != 0u ||
+        token_budget > DS4_GLM5_NEXT_INDEX_TOP_K ||
+        selected_pool_count == 0u || selected_pool_count > n_pools ||
+        selected_pool_count > token_budget / pool_size ||
+        first_valid != 0u ||
+        pos0 > UINT32_MAX - n_tokens) return 0;
+    end_pos = pos0 + n_tokens;
+    if (end_pos == UINT32_MAX || end_pos > n_rows ||
+        (uint64_t)(end_pos / pool_size) > n_pools ||
+        token_budget > UINT32_MAX - (pool_size - 1u)) return 0;
+    const uint32_t output_width = token_budget + pool_size - 1u;
+    const uint64_t selected_token_elems =
+        (uint64_t)n_tokens * output_width;
+    const uint64_t selected_pool_elems =
+        (uint64_t)n_tokens * selected_pool_count;
+    const uint64_t pool_index_elems = (uint64_t)n_pools * pool_size;
+    if (selected_token_elems > UINT64_MAX / sizeof(int32_t) ||
+        selected_pool_elems > UINT64_MAX / sizeof(uint32_t) ||
+        pool_index_elems > UINT64_MAX / sizeof(int32_t) ||
+        selected_tokens->bytes < selected_token_elems * sizeof(int32_t) ||
+        selected_pools->bytes < selected_pool_elems * sizeof(uint32_t) ||
+        pool_indices->bytes < pool_index_elems * sizeof(int32_t) ||
+        pool_valid->bytes < (uint64_t)n_pools * sizeof(uint32_t) ||
+        valid_keys->bytes < (uint64_t)n_rows * sizeof(uint32_t)) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    const uint64_t grid_x64 =
+        ((uint64_t)output_width + threads - 1u) / threads;
+    if (grid_x64 == 0u || grid_x64 > UINT32_MAX || n_tokens > 65535u)
+        return 0;
+    const dim3 grid((uint32_t)grid_x64, n_tokens, 1u);
+    glm5_expand_pool_selection_batch_kernel<<<grid, threads>>>(
+        (int32_t *)selected_tokens->ptr,
+        (const uint32_t *)selected_pools->ptr,
+        (const int32_t *)pool_indices->ptr,
+        (const uint32_t *)pool_valid->ptr,
+        (const uint32_t *)valid_keys->ptr, n_pools, n_tokens, pos0, n_rows,
+        first_valid, selected_pool_count, token_budget, pool_size);
+    return cuda_ok(cudaGetLastError(),
+                   "glm5 expand pool selection batch launch");
 }
 
 extern "C" int ds4_gpu_glm_k_b_project_typed_tensor(

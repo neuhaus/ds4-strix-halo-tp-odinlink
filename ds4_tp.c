@@ -7,7 +7,7 @@
  * TCP stream carrying framed commands.  Gate traffic goes over RDMA
  * (Thunderbolt UC queue pair, two-sided send/recv — see the driver quirks
  * note at ds4_tp_rdma) or over a dedicated full-duplex TCP socket at 16KB
- * per direction as the fallback. */
+ * per direction as the AUTO/TCP fallback. Explicit RDMA never falls back. */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -316,6 +316,7 @@ struct ds4_tp {
     bool rdma_active;
     uint32_t peer_ctx;
     uint32_t runtime_features;
+    uint64_t prefill_config;
     uint32_t n_layer;
     uint32_t n_embd;
     uint64_t vec_bytes;
@@ -418,6 +419,17 @@ static int tp_select_transport(ds4_tp_transport requested,
     return 1;
 }
 
+static int tp_refuse_payload_fallback(ds4_tp *tp, const char *kind) {
+    if (!tp || tp->opt.transport != DS4_TP_TRANSPORT_RDMA)
+        return 0;
+    fprintf(stderr,
+            "ds4-tp: explicit --transport rdma cannot use TCP %s fallback; "
+            "failing closed\n",
+            kind ? kind : "payload");
+    ds4_tp_mark_failed(tp);
+    return 1;
+}
+
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen) {
@@ -484,7 +496,7 @@ static void tp_socket_tune(int fd) {
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     /* Gate exchanges are latency-critical 16KB messages; large socket
-     * buffers only matter for the TCP fallback's pipelining. */
+     * buffers only matter for AUTO's TCP fallback pipelining. */
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
@@ -2423,6 +2435,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 
         uint32_t recv_done = 0;
         uint32_t send_done = 0;
+        uint8_t recv_seen[DS4_TP_RDMA_BULK_SLOTS];
+        memset(recv_seen, 0, sizeof(recv_seen));
         const double deadline = tp_now_sec() + (double)tp->timeout_sec;
         uint32_t peer_poll = 0;
         bool bg_seen_first = false;
@@ -2458,7 +2472,54 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     continue;
                 }
                 if (wc[i].opcode & IBV_WC_RECV) {
+                    const uint64_t wr_chunk =
+                        (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG);
+                    if (wr_chunk == 0u || wr_chunk > chunks ||
+                        recv_seen[wr_chunk - 1u]) {
+                        fprintf(stderr,
+                                "ds4-tp: invalid or duplicate bulk receive completion\n");
+                        return 0;
+                    }
+                    const uint32_t chunk = (uint32_t)(wr_chunk - 1u);
+                    recv_seen[chunk] = 1u;
                     recv_done++;
+                    /* A receive completion makes the message bytes visible to
+                     * this CPU. Copy staged data immediately, before any wave
+                     * release; the staging slots are not reused until this
+                     * round has drained all receives. */
+                    if (!direct) {
+                        const double c0 = g_bg_trace ? tp_now_sec() : 0.0;
+                        tp_stage_copy((uint8_t *)in + off + chunk_off[chunk],
+                                      stage_recv + chunk_off[chunk],
+                                      lens[chunk]);
+                        if (g_bg_trace) bg_copy += tp_now_sec() - c0;
+                    }
+                    atomic_thread_fence(memory_order_acquire);
+                    /* Release only complete wave byte ranges. Completions can
+                     * arrive out of order, so inspect every message touching
+                     * the next boundary instead of using recv_done as a byte
+                     * count. A message crossing a boundary is released once
+                     * that whole message is complete, which is conservative
+                     * and keeps the consumer from observing partial input. */
+                    while (ready && ready_waves < waves) {
+                        const uint64_t boundary =
+                            (uint64_t)(ready_waves + 1u) * wave_bytes;
+                        if (boundary <= off) {
+                            ready(ready_ud, ready_waves++);
+                            continue;
+                        }
+                        if (boundary > off + round_bytes) break;
+                        const uint64_t upto = boundary - off;
+                        bool complete = true;
+                        for (uint32_t j = 0; j < chunks; j++) {
+                            if (chunk_off[j] < upto && !recv_seen[j]) {
+                                complete = false;
+                                break;
+                            }
+                        }
+                        if (!complete) break;
+                        ready(ready_ud, ready_waves++);
+                    }
                     if (g_bg_trace && recv_done == chunks)
                         g_bg_towait_lastrecv_s += tp_now_sec() - ps1;
                 } else {
@@ -2489,16 +2550,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             g_bg_rounds++;
         }
         atomic_thread_fence(memory_order_acquire);
-        if (!direct) {
-            const double c1 = g_bg_trace ? tp_now_sec() : 0.0;
-            round_bytes = 0;
-            for (uint32_t i = 0; i < chunks; i++) {
-                tp_stage_copy((uint8_t *)in + off + round_bytes,
-                              stage_recv + chunk_off[i], lens[i]);
-                round_bytes += lens[i];
-            }
-            if (g_bg_trace) bg_copy += tp_now_sec() - c1;
-        }
+        /* Staged receive bytes were copied at each completion, before the
+         * corresponding wave callback. Keep the round-level accounting but do
+         * not copy the staging slots a second time. */
         off += round_bytes;
         while (ready && ready_waves < waves &&
                off >= (uint64_t)(ready_waves + 1u) * wave_bytes) {
@@ -2638,6 +2692,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     }
     tp->peer_ctx = theirs.ctx_size;
     tp->runtime_features = mine.runtime_features;
+    tp->prefill_config = mine.prefill_config;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
@@ -2809,6 +2864,9 @@ uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp) {
     return tp ? tp->runtime_features : 0;
 }
+uint64_t ds4_tp_prefill_config(const ds4_tp *tp) {
+    return tp ? tp->prefill_config : 0u;
+}
 uint64_t ds4_tp_vec_bytes(const ds4_tp *tp) {
     return tp ? tp->vec_bytes : 0u;
 }
@@ -2900,7 +2958,7 @@ int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
 
 /* Verify-block batch gate: one exchange per layer moving all block rows at
  * once. The payload lives in the registered slab, so RDMA sends it directly;
- * TCP remains the symmetric write-then-read fallback. */
+ * TCP remains the symmetric write-then-read fallback for AUTO/TCP. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
     DS4_TP_TEST_COUNT_EXCHANGE();
@@ -2939,6 +2997,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 bytes, 0u, 0u, NULL, NULL);
     }
 #endif
+    if (tp_refuse_payload_fallback(tp, "batch-gate payload")) return 0;
     struct iovec iov[2] = {
         { &h, sizeof(h) },
         { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
@@ -2977,9 +3036,9 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 }
 
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
- * The fallback alternates 2MB TCP write/read rounds in the same order, so
- * neither side can fill its send buffer while the peer is also only writing
- * (the 4MB socket buffers absorb one round). */
+ * AUTO/TCP fallback alternates 2MB TCP write/read rounds in the same order,
+ * so neither side can fill its send buffer while the peer is also only
+ * writing (the 4MB socket buffers absorb one round). */
 #define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
 
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
@@ -3051,6 +3110,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         return ok;
     }
 #endif
+    if (tp_refuse_payload_fallback(tp, "big-gate payload")) return 0;
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
@@ -3117,6 +3177,66 @@ int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
     return 0;
 #endif
 }
+
+#ifdef DS4_TP_TEST_HOOKS
+/* Exercise both payload paths without live verbs: the peer's reply is queued
+ * before the call, and an active endpoint with no registered bulk MR must
+ * either use AUTO/TCP payloads or refuse explicit RDMA. */
+int ds4_tp_test_payload_fallback(ds4_tp_transport requested, int big_gate,
+                                  int *exchange_ok, int *failed,
+                                  uint64_t *tcp_payload_bytes) {
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 0;
+    float payload[8] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const uint64_t bytes = 4u * sizeof(float);
+    ds4_tp tp = {
+        .opt = {.transport = requested},
+        .data_fd = sockets[0],
+        .rdma_active = requested != DS4_TP_TRANSPORT_TCP,
+        .n_layer = 1u,
+        .vec_bytes = bytes,
+        .slab = (uint8_t *)payload,
+        .slab_bytes = sizeof(payload),
+        .batch_in_off = bytes,
+    };
+    ds4_tp_gate_header ph = {
+        DS4_TP_BATCH_MAGIC, 0u, big_gate ? 0xB16u : 1u, 1u
+    };
+    int ok = tp_write_full(sockets[1], &ph, sizeof(ph)) &&
+             tp_write_full(sockets[1], payload, bytes);
+    if (ok) {
+        const int exchanged = big_gate
+            ? ds4_tp_big_gate_exchange(&tp, 0u, 1u, payload,
+                                       payload + 4u, bytes)
+            : ds4_tp_batch_gate_exchange(&tp, 0u, 1u, 1u);
+        uint8_t received[sizeof(ph) + 4u * sizeof(float)];
+        size_t total = 0u;
+        for (;;) {
+            ssize_t got = recv(sockets[1], received,
+                               sizeof(received), MSG_DONTWAIT);
+            if (got > 0) {
+                total += (size_t)got;
+                continue;
+            }
+            if (got == 0 || (got < 0 &&
+                             (errno == EAGAIN || errno == EWOULDBLOCK)))
+                break;
+            ok = 0;
+            break;
+        }
+        if (ok) {
+            if (exchange_ok) *exchange_ok = exchanged;
+            if (failed) *failed = ds4_tp_failed(&tp) ? 1 : 0;
+            if (tcp_payload_bytes)
+                *tcp_payload_bytes = total > sizeof(ph) ?
+                    (uint64_t)(total - sizeof(ph)) : 0u;
+        }
+    }
+    close(sockets[0]);
+    close(sockets[1]);
+    return ok;
+}
+#endif
 
 /* ------------------------------------------------------------------------
  * Lockstep control plane.

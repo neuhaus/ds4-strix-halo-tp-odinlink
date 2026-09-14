@@ -4,6 +4,7 @@
 /ds4-bench-tp
 /ds4-eval
 /ds4-agent
+/gguf-tools/quality-testing/score_official
 /ds4_native
 /ds4_agent_test
 /ds4_server_test

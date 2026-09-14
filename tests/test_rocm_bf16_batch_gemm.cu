@@ -1360,13 +1360,35 @@ void run_wmma_hilo_dispatch_guard() {
     std::printf("BF16 WMMA hi/lo dispatch and rollback guards pass\n");
 }
 
-void run_wmma_hilo_qkv_multiptr(const uint16_t *weight) {
+void run_kda_six_prefill_dispatch_guard() {
+    /* The six-pointer KDA arm is a prefill consumer of the ordinary WMMA
+     * selector.  Keep its accepted shapes and rollback modes explicit here so
+     * a future selector cannot bypass the shared quality/graph-dump contract. */
+    if (!ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 4096u, 256u, false, false) ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 512u, false, false))
+        fail("BF16 KDA six-prefill expected dispatch");
+    if (ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, true, 4096u, 8192u, 256u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 256u, true, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 256u, false, true) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 128u, 256u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 1u, false, false))
+        fail("BF16 KDA six-prefill rollback/shape guard");
+    std::printf("BF16 KDA six-prefill dispatch guards pass\n");
+}
+
+void run_wmma_hilo_qkv_multiptr(const uint16_t *weight, uint32_t out_dim) {
     constexpr uint32_t tokens = 256u;
     constexpr uint32_t in_dim = 4096u;
-    constexpr uint32_t out_dim = 4096u;
-    constexpr uint64_t weight_count = (uint64_t)in_dim * out_dim;
-    constexpr uint64_t x_count = (uint64_t)tokens * in_dim;
-    constexpr uint64_t out_count = (uint64_t)tokens * out_dim;
+    const uint64_t weight_count = (uint64_t)in_dim * out_dim;
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
     const uint16_t *weight_q = weight;
     const uint16_t *weight_k = weight + weight_count;
     const uint16_t *weight_v = weight + 2u * weight_count;
@@ -1378,6 +1400,13 @@ void run_wmma_hilo_qkv_multiptr(const uint16_t *weight) {
     float *d_x = nullptr;
     float *d_seq_q = nullptr, *d_seq_k = nullptr, *d_seq_v = nullptr;
     float *d_fused_q = nullptr, *d_fused_k = nullptr, *d_fused_v = nullptr;
+    float *d_shared_q = nullptr, *d_shared_k = nullptr, *d_shared_v = nullptr;
+    float *d_shared_m256_q = nullptr, *d_shared_m256_k = nullptr,
+          *d_shared_m256_v = nullptr;
+    float *d_shared_m80_q = nullptr, *d_shared_m80_k = nullptr,
+          *d_shared_m80_v = nullptr;
+    float *d_shared_n1_q = nullptr, *d_shared_n1_k = nullptr,
+          *d_shared_n1_v = nullptr;
     hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
            "allocate QKV multiptr input");
     hip_ok(hipMalloc(&d_seq_q, out_count * sizeof(float)),
@@ -1392,6 +1421,30 @@ void run_wmma_hilo_qkv_multiptr(const uint16_t *weight) {
            "allocate QKV multiptr k");
     hip_ok(hipMalloc(&d_fused_v, out_count * sizeof(float)),
            "allocate QKV multiptr v");
+    hip_ok(hipMalloc(&d_shared_q, out_count * sizeof(float)),
+           "allocate QKV shared-A q");
+    hip_ok(hipMalloc(&d_shared_k, out_count * sizeof(float)),
+           "allocate QKV shared-A k");
+    hip_ok(hipMalloc(&d_shared_v, out_count * sizeof(float)),
+           "allocate QKV shared-A v");
+    hip_ok(hipMalloc(&d_shared_m256_q, out_count * sizeof(float)),
+           "allocate QKV shared-A M256 q");
+    hip_ok(hipMalloc(&d_shared_m256_k, out_count * sizeof(float)),
+           "allocate QKV shared-A M256 k");
+    hip_ok(hipMalloc(&d_shared_m256_v, out_count * sizeof(float)),
+           "allocate QKV shared-A M256 v");
+    hip_ok(hipMalloc(&d_shared_m80_q, out_count * sizeof(float)),
+           "allocate QKV shared-A M80 q");
+    hip_ok(hipMalloc(&d_shared_m80_k, out_count * sizeof(float)),
+           "allocate QKV shared-A M80 k");
+    hip_ok(hipMalloc(&d_shared_m80_v, out_count * sizeof(float)),
+           "allocate QKV shared-A M80 v");
+    hip_ok(hipMalloc(&d_shared_n1_q, out_count * sizeof(float)),
+           "allocate QKV shared-A N1 q");
+    hip_ok(hipMalloc(&d_shared_n1_k, out_count * sizeof(float)),
+           "allocate QKV shared-A N1 k");
+    hip_ok(hipMalloc(&d_shared_n1_v, out_count * sizeof(float)),
+           "allocate QKV shared-A N1 v");
     hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
                      hipMemcpyHostToDevice), "copy QKV multiptr input");
 
@@ -1415,17 +1468,71 @@ void run_wmma_hilo_qkv_multiptr(const uint16_t *weight) {
                 tokens);
         hip_ok(hipGetLastError(), "QKV multiptr WMMA launch");
     };
+    const auto shared_a = [&] {
+        matmul_bf16_f32_wmma_hilo_qkv_shared_a_kernel<<<
+            dim3(out_dim / 32u, tokens / 128u), 24u * 32u>>>(
+                d_shared_q, d_shared_k, d_shared_v,
+                weight_q, weight_k, weight_v, d_x, in_dim, out_dim,
+                tokens);
+        hip_ok(hipGetLastError(), "QKV true shared-A WMMA launch");
+    };
+    const auto shared_a_m256 = [&] {
+        matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_kernel<<<
+            dim3(out_dim / 32u, tokens / 256u), 16u * 32u>>>(
+                d_shared_m256_q, d_shared_m256_k, d_shared_m256_v,
+                weight_q, weight_k, weight_v, d_x, in_dim, out_dim,
+                tokens);
+        hip_ok(hipGetLastError(), "QKV true shared-A M256 WMMA launch");
+    };
+    const auto shared_a_m80 = [&] {
+        matmul_bf16_f32_wmma_hilo_qkv_shared_a_m80_kernel<<<
+            dim3(out_dim / 32u, (tokens + 79u) / 80u), 16u * 32u>>>(
+                d_shared_m80_q, d_shared_m80_k, d_shared_m80_v,
+                weight_q, weight_k, weight_v, d_x, in_dim, out_dim,
+                tokens);
+        hip_ok(hipGetLastError(), "QKV true shared-A M80 WMMA launch");
+    };
+    const auto shared_a_n1 = [&] {
+        matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel<<<
+            dim3(out_dim / 16u, tokens / 256u), 16u * 32u>>>(
+                d_shared_n1_q, d_shared_n1_k, d_shared_n1_v,
+                weight_q, weight_k, weight_v, d_x, in_dim, out_dim,
+                tokens);
+        hip_ok(hipGetLastError(), "QKV true shared-A N1 WMMA launch");
+    };
     const float sequential_ms = time_ms(sequential);
     const float multiptr_ms = time_ms(multiptr);
+    const float shared_a_ms = time_ms(shared_a);
+    const float shared_a_m256_ms = time_ms(shared_a_m256);
+    const float shared_a_m80_ms = time_ms(shared_a_m80);
+    const float shared_a_n1_ms = time_ms(shared_a_n1);
     sequential();
     multiptr();
+    shared_a();
+    shared_a_m256();
+    shared_a_m80();
+    shared_a_n1();
     hip_ok(hipDeviceSynchronize(), "QKV multiptr synchronize");
 
     std::vector<float> seq(out_count), fused(out_count);
     bool exact = true;
     const float *seq_ptrs[] = {d_seq_q, d_seq_k, d_seq_v};
     const float *fused_ptrs[] = {d_fused_q, d_fused_k, d_fused_v};
+    const float *shared_ptrs[] = {d_shared_q, d_shared_k, d_shared_v};
+    const float *shared_m256_ptrs[] = {
+        d_shared_m256_q, d_shared_m256_k, d_shared_m256_v,
+    };
+    const float *shared_m80_ptrs[] = {
+        d_shared_m80_q, d_shared_m80_k, d_shared_m80_v,
+    };
+    const float *shared_n1_ptrs[] = {
+        d_shared_n1_q, d_shared_n1_k, d_shared_n1_v,
+    };
     double max_nrmse = 0.0;
+    bool shared_exact = true;
+    bool shared_m256_exact = true;
+    bool shared_m80_exact = true;
+    bool shared_n1_exact = true;
     for (uint32_t projection = 0u; projection < 3u; ++projection) {
         hip_ok(hipMemcpy(seq.data(), seq_ptrs[projection],
                          out_count * sizeof(float), hipMemcpyDeviceToHost),
@@ -1436,15 +1543,63 @@ void run_wmma_hilo_qkv_multiptr(const uint16_t *weight) {
         exact = exact && std::memcmp(seq.data(), fused.data(),
                                      out_count * sizeof(float)) == 0;
         max_nrmse = std::max(max_nrmse, compare(seq, fused).nrmse);
+        hip_ok(hipMemcpy(fused.data(), shared_ptrs[projection],
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read QKV shared-A output");
+        shared_exact = shared_exact && std::memcmp(seq.data(), fused.data(),
+                                                   out_count * sizeof(float)) == 0;
+        hip_ok(hipMemcpy(fused.data(), shared_m256_ptrs[projection],
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read QKV shared-A M256 output");
+        shared_m256_exact = shared_m256_exact &&
+            std::memcmp(seq.data(), fused.data(), out_count * sizeof(float)) == 0;
+        hip_ok(hipMemcpy(fused.data(), shared_m80_ptrs[projection],
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read QKV shared-A M80 output");
+        shared_m80_exact = shared_m80_exact &&
+            std::memcmp(seq.data(), fused.data(),
+                        out_count * sizeof(float)) == 0;
+        hip_ok(hipMemcpy(fused.data(), shared_n1_ptrs[projection],
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read QKV shared-A N1 output");
+        shared_n1_exact = shared_n1_exact &&
+            std::memcmp(seq.data(), fused.data(),
+                        out_count * sizeof(float)) == 0;
     }
     std::printf(
         "BF16 QKV multiptr shape=3x%ux%ux%u residency=host-registered "
-        "sequential_ms=%.4f multiptr_ms=%.4f speedup=%.3fx "
-        "bit_exact=%d max_nrmse=%.9g\n",
+        "sequential_ms=%.4f multiptr_ms=%.4f shared_a_ms=%.4f "
+        "shared_a_m256_ms=%.4f shared_a_m80_ms=%.4f shared_a_n1_ms=%.4f "
+        "speedup=%.3fx "
+        "shared_a_speedup=%.3fx shared_a_m256_speedup=%.3fx "
+        "shared_a_m80_speedup=%.3fx shared_a_n1_speedup=%.3fx "
+        "bit_exact=%d shared_a_bit_exact=%d "
+        "shared_a_m256_bit_exact=%d shared_a_m80_bit_exact=%d "
+        "shared_a_n1_bit_exact=%d "
+        "max_nrmse=%.9g\n",
         tokens, out_dim, in_dim, sequential_ms, multiptr_ms,
-        sequential_ms / multiptr_ms, exact ? 1 : 0, max_nrmse);
-    if (!exact) fail("QKV multiptr launch collapse must match WMMA outputs");
+        shared_a_ms, shared_a_m256_ms, shared_a_m80_ms, shared_a_n1_ms,
+        sequential_ms / multiptr_ms, sequential_ms / shared_a_ms,
+        sequential_ms / shared_a_m256_ms, sequential_ms / shared_a_m80_ms,
+        sequential_ms / shared_a_n1_ms,
+        exact ? 1 : 0, shared_exact ? 1 : 0, shared_m256_exact ? 1 : 0,
+        shared_m80_exact ? 1 : 0, shared_n1_exact ? 1 : 0, max_nrmse);
+    if (!exact || !shared_exact || !shared_m256_exact || !shared_m80_exact ||
+        !shared_n1_exact)
+        fail("QKV multiptr launch collapse must match WMMA outputs");
 
+    hip_ok(hipFree(d_shared_n1_v), "free QKV shared-A N1 v");
+    hip_ok(hipFree(d_shared_n1_k), "free QKV shared-A N1 k");
+    hip_ok(hipFree(d_shared_n1_q), "free QKV shared-A N1 q");
+    hip_ok(hipFree(d_shared_m80_v), "free QKV shared-A M80 v");
+    hip_ok(hipFree(d_shared_m80_k), "free QKV shared-A M80 k");
+    hip_ok(hipFree(d_shared_m80_q), "free QKV shared-A M80 q");
+    hip_ok(hipFree(d_shared_m256_v), "free QKV shared-A M256 v");
+    hip_ok(hipFree(d_shared_m256_k), "free QKV shared-A M256 k");
+    hip_ok(hipFree(d_shared_m256_q), "free QKV shared-A M256 q");
+    hip_ok(hipFree(d_shared_v), "free QKV shared-A v");
+    hip_ok(hipFree(d_shared_k), "free QKV shared-A k");
+    hip_ok(hipFree(d_shared_q), "free QKV shared-A q");
     hip_ok(hipFree(d_fused_v), "free QKV multiptr v");
     hip_ok(hipFree(d_fused_k), "free QKV multiptr k");
     hip_ok(hipFree(d_fused_q), "free QKV multiptr q");
@@ -1640,7 +1795,39 @@ int main() {
     run_rowtile_m2048_guard(device_weight, 4096u, 4096u);
     run_rowtile_dispatch_guard();
     run_wmma_hilo_dispatch_guard();
-    run_wmma_hilo_qkv_multiptr(device_weight);
+    run_kda_six_prefill_dispatch_guard();
+    run_wmma_hilo_qkv_multiptr(device_weight, 4096u);
+    /* TP GLM-5.3 owns 8,192 Q/K/V rows per rank.  Keep a separate mapped
+     * fixture with that row stride so the shared-A experiment is measured at
+     * the production shape instead of only at the square diagnostic shape. */
+    constexpr uint64_t tp_qkv_weight_count =
+        (uint64_t)3u * 8192u * 4096u;
+    constexpr uint64_t tp_qkv_weight_bytes =
+        tp_qkv_weight_count * sizeof(uint16_t);
+    void *tp_qkv_host_allocation = nullptr;
+    if (posix_memalign(&tp_qkv_host_allocation, 4096u,
+                       tp_qkv_weight_bytes) != 0 ||
+        !tp_qkv_host_allocation)
+        fail("allocate TP QKV host weights");
+    auto *tp_qkv_host_weight =
+        static_cast<uint16_t *>(tp_qkv_host_allocation);
+    for (uint64_t i = 0u; i < tp_qkv_weight_count; ++i) {
+        const float value = 0.035f *
+            std::sin((double)(i % 7919u) * 0.017 + 0.13);
+        tp_qkv_host_weight[i] = bf16_rne(value);
+    }
+    hip_ok(hipHostRegister(tp_qkv_host_weight, tp_qkv_weight_bytes,
+                           hipHostRegisterMapped | hipHostRegisterReadOnly),
+           "register TP QKV mapped weights");
+    uint16_t *tp_qkv_device_weight = nullptr;
+    hip_ok(hipHostGetDevicePointer(
+               reinterpret_cast<void **>(&tp_qkv_device_weight),
+               tp_qkv_host_weight, 0u),
+           "resolve TP QKV mapped weight pointer");
+    run_wmma_hilo_qkv_multiptr(tp_qkv_device_weight, 8192u);
+    hip_ok(hipHostUnregister(tp_qkv_host_weight),
+           "unregister TP QKV mapped weights");
+    std::free(tp_qkv_host_allocation);
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);

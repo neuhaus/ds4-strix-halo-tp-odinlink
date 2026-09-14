@@ -117,6 +117,8 @@ static int test_workspace_byte_contract_and_reuse(void) {
     CHECK(workspace.capacity_tokens == 2 &&
           workspace.bytes == UINT64_C(361984),
           "workspace records exact physical bytes");
+    CHECK(workspace.g_low == workspace.f_low,
+          "ordinary workspace aliases the low-rank buffer");
     CHECK(alloc_calls == 8,
           "workspace allocates only reusable physical buffers");
     ds4_glm5_kda_workspace_free(&workspace);
@@ -173,6 +175,36 @@ static int test_one_layer_lifecycle(void) {
     return 1;
 }
 
+static int test_activation_panel_lifetime(void) {
+    uint64_t normal = 0, prepared = 0;
+    unsetenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    CHECK(ds4_glm5_kda_workspace_bytes(256, &normal), "normal panel-size control");
+    setenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL", "1", 1);
+    CHECK(ds4_glm5_kda_workspace_bytes(1, &prepared) && prepared == 180992u,
+          "decode panel request adds no allocation");
+    CHECK(ds4_glm5_kda_workspace_bytes(256, &prepared) &&
+          prepared == normal + UINT64_C(4194304), "one fixed 4 MiB panel accounted");
+    CHECK(ds4_glm5_kda_workspace_bytes(2048, &prepared) &&
+          prepared == UINT64_C(370671616) + UINT64_C(4194304),
+          "larger workspace still accounts for only one M256 panel");
+    CHECK(ds4_glm5_kda_workspace_bytes(256, &prepared), "restore M256 accounting");
+    ds4_glm5_kda_workspace w = {0};
+    reset_fakes();
+    CHECK(ds4_glm5_kda_workspace_init(&w, 256), "prepared workspace initializes");
+    CHECK(w.qkv_activation_panel && w.qkv_activation_panel->bytes == 4194304u &&
+          w.bytes == prepared && alloc_calls == 9, "single owned panel allocation");
+    ds4_glm5_kda_workspace_free(&w);
+    CHECK(free_calls == 9 && !w.qkv_activation_panel && !w.bytes,
+          "panel freed once with workspace");
+    reset_fakes();
+    fail_alloc_call = 9;
+    CHECK(!ds4_glm5_kda_workspace_init(&w, 256), "panel allocation failure propagates");
+    CHECK(free_calls == 8 && !w.capacity_tokens && !w.qkv_activation_panel,
+          "panel allocation failure frees preceding buffers");
+    unsetenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    return 1;
+}
+
 static int test_partial_allocation_failure_cleans_up(void) {
     reset_fakes();
     ds4_glm5_layer_kind schedule[2] = {
@@ -212,9 +244,13 @@ static int test_zero_kda_schedule_is_valid_and_empty(void) {
 }
 
 int main(void) {
+    unsetenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    unsetenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    unsetenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     int ok = 1;
     ok &= test_state_byte_contract();
     ok &= test_workspace_byte_contract_and_reuse();
+    ok &= test_activation_panel_lifetime();
     ok &= test_one_layer_lifecycle();
     ok &= test_partial_allocation_failure_cleans_up();
     ok &= test_zero_kda_schedule_is_valid_and_empty();

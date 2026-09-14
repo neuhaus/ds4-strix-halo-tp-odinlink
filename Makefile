@@ -139,7 +139,7 @@ tests/test_rocm_glm53_expert_window: tests/test_rocm_glm53_expert_window.o tests
 test-rocm-glm53-expert-window: tests/test_rocm_glm53_expert_window
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm53_expert_window
 
-tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_q4k_pair_probe.hpp tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o ds4_glm5_next_runtime.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
@@ -211,6 +211,17 @@ tests/ds4_rocm_compat_glm5_hooks.o: ds4_rocm_compat.cu ds4_glm5_kda.h ds4_gpu.h 
 
 tests/test_rocm_glm5_kda_layer: tests/test_rocm_glm5_kda_layer.o tests/ds4_glm5_kda_hooks.o tests/ds4_rocm_compat_glm5_hooks.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_qkv_dispatch.o: tests/test_rocm_glm5_qkv_dispatch.cu ds4_glm5_kda.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_qkv_dispatch: tests/test_rocm_glm5_qkv_dispatch.o tests/ds4_glm5_kda_hooks.o tests/ds4_rocm_compat_glm5_hooks.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-glm5-qkv-dispatch
+test-rocm-glm5-qkv-dispatch: tests/test_rocm_glm5_qkv_dispatch
+	./tests/test_rocm_glm5_qkv_dispatch 0
+	./tests/test_rocm_glm5_qkv_dispatch 1
 
 test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
@@ -364,6 +375,16 @@ test-rocm-glm5-kpool: tests/test_rocm_glm5_kpool
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kpool
 
 .PHONY: test-rocm-glm5-indexer-select
+tests/test_rocm_glm5_indexer_score_one.o: tests/test_rocm_glm5_indexer_score_one.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_indexer_score_one: tests/test_rocm_glm5_indexer_score_one.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-glm5-indexer-score-one
+test-rocm-glm5-indexer-score-one: tests/test_rocm_glm5_indexer_score_one
+	./tests/test_rocm_glm5_indexer_score_one
+
 tests/test_rocm_glm5_indexer_select.o: tests/test_rocm_glm5_indexer_select.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
@@ -458,6 +479,27 @@ tests/glm5_q8_sharedx_prefetch_bench: tests/glm5_q8_sharedx_prefetch_bench.o tes
 bench-rocm-glm5-q8-sharedx-prefetch: tests/glm5_q8_sharedx_prefetch_bench
 	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/glm5_q8_sharedx_prefetch_bench
+
+.PHONY: bench-rocm-glm5-q8-shapes
+.PHONY: test-rocm-glm5-mla-output-wmma
+tests/test_rocm_glm5_mla_output_wmma.o: tests/test_rocm_glm5_mla_output_wmma.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_output_wmma: tests/test_rocm_glm5_mla_output_wmma.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-mla-output-wmma: tests/test_rocm_glm5_mla_output_wmma
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_mla_output_wmma
+
+tests/glm5_q8_shape_bench.o: scripts/glm5_q8_shape_bench.cu tests/glm5_gguf_test.hpp ds4_gpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/glm5_q8_shape_bench: tests/glm5_q8_shape_bench.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+bench-rocm-glm5-q8-shapes: tests/glm5_q8_shape_bench
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/glm5_q8_shape_bench
 
 .PHONY: test-rocm-glm5-mla-compose
 tests/test_rocm_glm5_mla_compose.o: tests/test_rocm_glm5_mla_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
@@ -1236,6 +1278,13 @@ test-rocm-q4k-device-repack: tests/test_rocm_q4k_device_repack
 	./tests/test_rocm_q4k_device_repack
 
 .PHONY: test-rocm-bf16-batch-gemm
+.PHONY: test-rocm-glm5-bf16-panel
+tests/test_rocm_glm5_bf16_panel: scripts/glm5_bf16_panel_bench.cu scripts/glm5_bf16_panel_kernels.cuh tests/glm5_gguf_test.hpp rocm/ds4_rocm_bf16_toktile.cuh
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -o $@ $<
+
+test-rocm-glm5-bf16-panel: tests/test_rocm_glm5_bf16_panel
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_bf16_panel
+
 tests/test_rocm_bf16_batch_gemm: tests/test_rocm_bf16_batch_gemm.cu rocm/ds4_rocm_bf16_toktile.cuh
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $< $(ROCM_LDLIBS)
 

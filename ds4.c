@@ -4448,6 +4448,20 @@ static void tensor_expect_layout_types(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+/* Q2 artifacts use Q4_K Q/K; newer Q4 artifacts use compact Q8_0.
+ * Keep the original BF16 layout accepted without widening other roles. */
+static void tensor_expect_glm5_kda_qk_layout(const ds4_tensor *t) {
+    if (!t) ds4_die("internal error: missing KDA Q/K tensor");
+    if (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q4_K &&
+        t->type != DS4_TENSOR_Q8_0) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected BF16, Q4_K or Q8_0\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, 2, 4096, 8192, 0);
+}
+
 /* GLM-5.3 has a different graph and therefore cannot use ds4_layer_weights,
  * whose fields encode the older GLM/DeepSeek attention schedule.  This small
  * reference-only table reuses the normal GGUF name lookup and mmap-backed
@@ -6343,8 +6357,8 @@ static void config_validate_glm5_next_model(const ds4_model *m,
             tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.weight", il), DS4_TENSOR_F32, 1, 128, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.bias", il), DS4_TENSOR_F32, 1, 128, 0, 0);
         } else {
-            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_q.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q4_K, 2, 4096, 8192, 0);
-            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_k.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q4_K, 2, 4096, 8192, 0);
+            tensor_expect_glm5_kda_qk_layout(required_tensorf(m, "blk.%u.kda_q.weight", il));
+            tensor_expect_glm5_kda_qk_layout(required_tensorf(m, "blk.%u.kda_k.weight", il));
             tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_v.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 4096, 8192, 0);
             tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_output.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 8192, 4096, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_q_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
@@ -51514,6 +51528,21 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const uint32_t capacity = (uint32_t)ctx_size;
+    const char *mla_output_wmma = getenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
+    if (mla_output_wmma && strcmp(mla_output_wmma, "0") != 0 &&
+        strcmp(mla_output_wmma, "1") != 0) {
+        fprintf(stderr, "ds4: DS4_ROCM_GLM5_MLA_OUTPUT_WMMA must be 0 or 1\n");
+        return 0;
+    }
+    const char *indexer_score_batch_env =
+        getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH");
+    if (indexer_score_batch_env &&
+        strcmp(indexer_score_batch_env, "0") != 0 &&
+        strcmp(indexer_score_batch_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_ROCM_GLM5_INDEXER_SCORE_BATCH must be 0 or 1\n");
+        return 0;
+    }
     const char *sparse_bridge_env =
         getenv("DS4_GLM5_SPARSE_BATCH_BRIDGE");
     if (sparse_bridge_env &&
@@ -51799,7 +51828,8 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         strcmp(reuse_ws_env, "1") == 0 && s->glm5_next_prefill_ws &&
         ds4_glm5_next_workspace_capacity(s->glm5_next_prefill_ws) >= n_tokens;
     ds4_glm5_next_workspace *w = reuse_ws ? s->glm5_next_ws :
-        ds4_glm5_next_workspace_create_capacity(n_tokens);
+        ds4_glm5_next_workspace_create_capacity_context(
+            n_tokens, (uint32_t)s->ctx_size);
     if (reuse_ws) w = s->glm5_next_prefill_ws;
     ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)n_tokens * sizeof(uint32_t));
     ds4_gpu_tensor *cur = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);
@@ -53847,15 +53877,32 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
 }
 
 uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
-    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return 0u;
-    const bool dspark = e &&
-        e->support_kind == DS4_SUPPORT_DSPARK && e->dspark;
-    return ds4_tp_prefill_config_encode(
-        metal_graph_tp_prefill_split_min_attn(),
-        metal_graph_tp_prefill_split_min(),
-        metal_graph_tp_prefill_split_resumed() && !dspark,
-        metal_graph_tp_subgate_pipeline(),
-        metal_graph_tp_prefill_ffn_wavefront_requested());
+    if (!e) return 0u;
+    uint64_t config = 0u;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        const bool dspark =
+            e->support_kind == DS4_SUPPORT_DSPARK && e->dspark;
+        config = ds4_tp_prefill_config_encode(
+            metal_graph_tp_prefill_split_min_attn(),
+            metal_graph_tp_prefill_split_min(),
+            metal_graph_tp_prefill_split_resumed() && !dspark,
+            metal_graph_tp_subgate_pipeline(),
+            metal_graph_tp_prefill_ffn_wavefront_requested());
+    }
+#if defined(DS4_ROCM_BUILD)
+    const char *score_batch =
+        getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH");
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
+        score_batch && score_batch[0] == '1' && score_batch[1] == '\0') {
+        config |= DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH;
+    }
+    const char *mla_wmma = getenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
+        mla_wmma && strcmp(mla_wmma, "1") == 0) {
+        config |= DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA;
+    }
+#endif
+    return config;
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {

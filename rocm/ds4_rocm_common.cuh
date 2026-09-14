@@ -470,6 +470,86 @@ __global__ static void matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kern
     if (lane == 0u) out[row] = acc;
 }
 
+/* Decode-only GLM KDA projection candidate.  The six matrices retain their
+ * independent GGUF addresses; only the input vector is staged once per
+ * block.  Twenty-four waves cover eight rows each of Q/K/V and one wave each
+ * covers the narrow f_a/g_a/beta projections.  The small projections therefore
+ * share the launch without forcing a concatenated weight allocation. */
+template <uint32_t PREFETCH, bool NONTEMPORAL>
+__global__ __launch_bounds__(27u * 32u, 1)
+static void matmul_bf16_f32_sharedx_kda_six_multiptr_decode_kernel(
+        float *out_q, float *out_k, float *out_v,
+        float *out_f, float *out_g, float *out_beta,
+        const uint16_t *weight_q, const uint16_t *weight_k,
+        const uint16_t *weight_v, const uint16_t *weight_f,
+        const uint16_t *weight_g, const uint16_t *weight_beta,
+        const float *x, uint32_t in_dim, uint32_t q_rows,
+        uint32_t low_rows, uint32_t beta_rows) {
+    static_assert(PREFETCH > 0u, "KDA projection load window must be nonzero");
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    constexpr uint32_t qkv_waves = 24u;
+    constexpr uint32_t qkv_rows_per_wave_group = 8u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x)
+        shx[i] = x[i];
+    __syncthreads();
+
+    uint32_t projection = 0u;
+    uint32_t row = 0u;
+    uint32_t out_rows = 0u;
+    if (wave < qkv_waves) {
+        projection = wave / qkv_rows_per_wave_group;
+        row = blockIdx.x * qkv_rows_per_wave_group +
+              wave % qkv_rows_per_wave_group;
+        out_rows = q_rows;
+    } else if (wave < qkv_waves + 3u) {
+        projection = 3u + (wave - qkv_waves);
+        row = blockIdx.x;
+        out_rows = projection == 5u ? beta_rows : low_rows;
+    } else {
+        return;
+    }
+    if (row >= out_rows) return;
+
+    const uint16_t *weight = projection == 0u ? weight_q :
+                             projection == 1u ? weight_k :
+                             projection == 2u ? weight_v :
+                             projection == 3u ? weight_f :
+                             projection == 4u ? weight_g : weight_beta;
+    float *out = projection == 0u ? out_q :
+                 projection == 1u ? out_k :
+                 projection == 2u ? out_v :
+                 projection == 3u ? out_f :
+                 projection == 4u ? out_g : out_beta;
+    const uint16_t *wr = weight + (uint64_t)row * in_dim;
+    float acc = 0.0f;
+    uint32_t i = lane;
+    for (; i + (PREFETCH - 1u) * 32u < in_dim;
+         i += PREFETCH * 32u) {
+        uint16_t packed_w[PREFETCH];
+        float packed_x[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = matmul_bf16_exact_load<NONTEMPORAL>(&wr[index]);
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u)
+            acc += __uint_as_float((uint32_t)packed_w[u] << 16u) *
+                   packed_x[u];
+    }
+    for (; i < in_dim; i += 32u)
+        acc += __uint_as_float(
+                   (uint32_t)matmul_bf16_exact_load<NONTEMPORAL>(&wr[i]) <<
+                   16u) * shx[i];
+    acc = warp_sum_f32(acc);
+    if (lane == 0u)
+        out[row] = acc;
+}
+
 /* Keep the arithmetic body shared by the diagnostic full-width split-order
  * kernel and the candidate 4096-wide K-slice kernel.  The two paths are
  * intended to differ only in ownership and transport, so giving the compiler

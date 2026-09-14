@@ -14,6 +14,24 @@ static int shared_gate_up_swiglu_sharedx_enabled(void) {
     return enabled;
 }
 
+/* Experimental M>1 paired WMMA path.  It is opt-in because its f16 staged
+ * activation/weight arithmetic belongs to Lane B and must not silently alter
+ * the established scalar/F32 production path. */
+static int shared_gate_up_wmma_batch_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_SHARED_GU_WMMA_BATCH");
+        enabled = env && strcmp(env, "1") == 0;
+    }
+    return enabled;
+}
+
+static uint32_t shared_gate_up_wmma_batch_tile(void) {
+    const char *env = getenv("DS4_ROCM_SHARED_GU_WMMA_BATCH_TILE");
+    if (env && strcmp(env, "256") == 0) return 256u;
+    return 128u;
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -622,6 +640,36 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_clamp_tensor(
     const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_batch");
     const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_batch");
     if (!wg || !wu) return 0;
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    if (!g_quality_mode && !cuda_runtime_config()->graph_dump &&
+        shared_gate_up_wmma_batch_enabled() && n_tok >= 64u &&
+        in_dim == 4096u && out_dim == 1024u) {
+        const uint32_t m_tile = shared_gate_up_wmma_batch_tile();
+        const dim3 grid((uint32_t)((out_dim + m_tile - 1u) / m_tile),
+                        (uint32_t)((n_tok + 63u) / 64u), 1u);
+        const int store_gate_up = 0;
+        if (m_tile == 256u) {
+            shared_gate_up_swiglu_q8_0_batch_wmma_kernel<256u, 128u>
+                <<<grid, 512u>>>(
+                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                    reinterpret_cast<const unsigned char *>(wg),
+                    reinterpret_cast<const unsigned char *>(wu),
+                    (const float *)x->ptr, (uint32_t)n_tok, (uint32_t)in_dim,
+                    (uint32_t)out_dim, row_bytes, store_gate_up, clamp);
+        } else {
+            shared_gate_up_swiglu_q8_0_batch_wmma_kernel<128u, 128u>
+                <<<grid, 256u>>>(
+                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                    reinterpret_cast<const unsigned char *>(wg),
+                    reinterpret_cast<const unsigned char *>(wu),
+                    (const float *)x->ptr, (uint32_t)n_tok, (uint32_t)in_dim,
+                    (uint32_t)out_dim, row_bytes, store_gate_up, clamp);
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "shared gate/up fused q8 WMMA batch launch");
+    }
+#endif
 
     const uint32_t rows_per_block = 32u;
     const uint32_t tile = 16u;

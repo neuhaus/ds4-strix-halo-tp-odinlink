@@ -56,8 +56,12 @@ typedef struct {
 } ds4_glm5_kda_weight_offsets;
 
 typedef struct {
-    ds4_gpu_tensor *norm, *q, *k, *v, *f_low, *forget;
+    ds4_gpu_tensor *norm, *q, *k, *v, *f_low, *g_low, *forget;
     ds4_gpu_tensor *beta, *recurrent_out;
+    /* Optional, single M256/K4096 hi/lo activation panel, reused per call. */
+    ds4_gpu_tensor *qkv_activation_panel;
+    /* Set only after the opt-in fused norm-to-panel producer completes. */
+    bool qkv_activation_panel_valid;
     uint32_t capacity_tokens;
     uint64_t bytes;
 } ds4_glm5_kda_workspace;

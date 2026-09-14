@@ -737,6 +737,10 @@ static bool full_model_residency(const MappedGGUF &gguf) {
 }
 
 static bool run_test(void) {
+    // This fixture asserts the default residency and uses its own oracle.
+    unsetenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    unsetenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    unsetenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     ds4_tp_test_reset_exchange_calls();
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *prefix = std::getenv("DS4_GLM5_KDA_ORACLE_PREFIX");

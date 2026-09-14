@@ -56,7 +56,9 @@ The pre-main gate requires both Q4_K and Q2_K to pass:
 - an isolated 1,532-token retrieval case;
 - exact TP feature matching and observed IQ2 kernel engagement.
 
-The accepted Q2 fingerprint is `f9cb3a8a17e95c71`. The arithmetic case
+The historical Q2 fingerprint `f9cb3a8a17e95c71` belongs to an earlier
+checkpoint. The current Huihui DeepSeek-V4 Flash 0731 Q2 artifact used by the
+pre-main regression gate has fingerprint `5e0fa38210276c41`. The arithmetic case
 returned 4 and the retrieval case returned 731942 on every acceptance run.
 
 ## Performance

@@ -98,6 +98,27 @@ static int check_connect_timeout(const char *name, const char *value,
     return 1;
 }
 
+static int check_payload_fallback(const char *name,
+                                  ds4_tp_transport requested,
+                                  int big_gate, int want_exchange,
+                                  int want_failed, uint64_t want_bytes) {
+    int exchanged = -1, failed = -1;
+    uint64_t bytes = UINT64_MAX;
+    if (!ds4_tp_test_payload_fallback(requested, big_gate, &exchanged,
+                                      &failed, &bytes) ||
+        exchanged != want_exchange || failed != want_failed ||
+        bytes != want_bytes) {
+        fprintf(stderr,
+                "FAIL %s: got exchange=%d failed=%d payload=%llu "
+                "want exchange=%d failed=%d payload=%llu\n",
+                name, exchanged, failed, (unsigned long long)bytes,
+                want_exchange, want_failed, (unsigned long long)want_bytes);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 static void build_glm53_mask(uint64_t mask[DS4_TP_GATE_MASK_WORDS],
                              uint32_t *count,
                              uint32_t features) {
@@ -250,6 +271,37 @@ int main(void) {
         "hello mismatched-prefill-wavefront",
         prefill, ds4_tp_prefill_config_encode(2048u, 32u, true, false, false),
         0, NULL);
+    ok &= check_prefill(
+        "hello equal-glm5-indexer-score-batch",
+        DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH,
+        DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH, 1, NULL);
+    ok &= check_prefill("hello equal-glm5-mla-output-wmma",
+        DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA,
+        DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA, 1, NULL);
+    ok &= check_prefill("hello mismatched-glm5-mla-output-wmma",
+        DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA, 0u, 0, NULL);
+    if ((DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA &
+         (DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH |
+          DS4_TP_PREFILL_CONFIG_RESUMED | DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE |
+          DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT | UINT64_C(0xffffffff))) != 0u) {
+        fprintf(stderr, "FAIL GLM5 MLA WMMA prefill bit overlap\n");
+        ok = 0;
+    }
+    ok &= check_prefill(
+        "hello mismatched-glm5-indexer-score-batch",
+        DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH, 0u, 0, NULL);
+    if ((DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH &
+         (UINT64_C(0xffffffff) |
+          DS4_TP_PREFILL_CONFIG_RESUMED |
+          DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE |
+          DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 indexer-score batch prefill bit overlaps prior fields\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 indexer-score batch prefill bit is disjoint\n");
+    }
     if ((ds4_tp_prefill_config_encode(UINT32_MAX, UINT32_MAX,
                                       false, false, false) &
          UINT64_C(0xffffffff)) != UINT64_C(0xffffffff)) {
@@ -748,6 +800,18 @@ int main(void) {
     ok &= check_transport("explicit RDMA rejects missing peer device",
                           DS4_TP_TRANSPORT_RDMA, 1, 0, 0, 0,
                           "tp: --transport rdma but the peer side has no active device");
+    ok &= check_payload_fallback("batch AUTO keeps TCP payload fallback",
+                                DS4_TP_TRANSPORT_AUTO, 0, 1, 0, 16u);
+    ok &= check_payload_fallback("big AUTO keeps TCP payload fallback",
+                                DS4_TP_TRANSPORT_AUTO, 1, 1, 0, 16u);
+    ok &= check_payload_fallback("batch TCP keeps TCP payload exchange",
+                                DS4_TP_TRANSPORT_TCP, 0, 1, 0, 16u);
+    ok &= check_payload_fallback("big TCP keeps TCP payload exchange",
+                                DS4_TP_TRANSPORT_TCP, 1, 1, 0, 16u);
+    ok &= check_payload_fallback("batch explicit RDMA refuses TCP payload",
+                                DS4_TP_TRANSPORT_RDMA, 0, 0, 1, 0u);
+    ok &= check_payload_fallback("big explicit RDMA refuses TCP payload",
+                                DS4_TP_TRANSPORT_RDMA, 1, 0, 1, 0u);
     ok &= check_connect_timeout("connect timeout default", NULL, 1800u);
     ok &= check_connect_timeout("connect timeout override", "2400", 2400u);
     ok &= check_connect_timeout("connect timeout rejects zero", "0", 1800u);

@@ -38,4 +38,24 @@ reported midpoint. They do not establish workload diversity. Every ordinary infe
 candidate must also pass `scripts/run-tp-diverse-bench.sh`: one 4,096+300 run
 over the frozen cross-disciplinary v1 prompt. Its manifest and CSV are checked
 against the versioned two-run baseline by `scripts/diverse-bench-gate.py`.
-The diverse run is a regression screen, not another headline benchmark.
+The diverse run is a regression screen, not another headline benchmark. Before
+promotion, the candidate must additionally pass a final matched 8,192-token or
+longer context run (control and candidate, 300 generated tokens) with the same
+model, transport, and quality/trajectory checks. A candidate that has only the
+4,096-token diverse screen is incomplete and cannot merge to `main`.
+
+## Research-track lifecycle
+
+Named research branches are durable tracks rather than disposable release
+candidates. A track may be marked `paused` or `given-up` when its hypothesis is
+not worth pursuing; that status does not authorize merging it to `main`,
+deleting its source, or treating its timing as a baseline. Preserve the branch,
+its scoped commits, and its evidence so a later review can inspect it.
+
+When a later direction finds a transferable idea, start a new named branch from
+current `main`. Record the donor branch and commit, the exact adaptation (or
+rejection), and the resulting patch hash in an adaptation ledger. Re-run the
+current correctness, ordinary-regression, long-context, and mandatory-RDMA
+gates for the new branch. Only that independently validated successor may be
+merged; a direct merge or cherry-pick from a paused/given-up track is not a
+promotion path.

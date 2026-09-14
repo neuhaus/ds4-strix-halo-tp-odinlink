@@ -17,6 +17,7 @@ extern "C" {
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #define CHECK(expr, message) do {                                           \
@@ -2235,6 +2236,17 @@ bool run_test() {
     return true;
 }
 
+#include "tests/glm5_q4k_pair_probe.hpp"
+
 }  // namespace
 
-int main() { return run_test() ? 0 : 1; }
+int main() {
+    const char *probe = std::getenv("DS4_GLM5_Q4K_PAIR_PROBE");
+    if (!probe) return run_test() ? 0 : 1;
+    if (std::strcmp(probe, "0") && std::strcmp(probe, "1") &&
+        std::strcmp(probe, "2")) {
+        std::fprintf(stderr, "FAIL invalid DS4_GLM5_Q4K_PAIR_PROBE\n");
+        return 1;
+    }
+    return run_pair_probe() ? 0 : 1;
+}

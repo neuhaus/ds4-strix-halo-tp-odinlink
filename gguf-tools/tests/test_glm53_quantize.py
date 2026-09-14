@@ -102,10 +102,18 @@ class GLM53QuantizeTests(unittest.TestCase):
             regular_qtype("q2", "linear_attention", "blk.0.kda_v.weight", QTYPE_BF16),
             QTYPE_Q8_0,
         )
-        self.assertEqual(
-            regular_qtype("q4", "linear_attention", "blk.0.kda_q.weight", QTYPE_BF16),
-            QTYPE_BF16,
-        )
+
+    def test_q4_compact_dense_recipe(self):
+        for part in ("q", "k", "v", "f_a", "f_b", "g_a", "g_b", "beta", "output"):
+            with self.subTest(part=part):
+                self.assertEqual(
+                    regular_qtype("q4", "linear_attention", f"blk.0.kda_{part}.weight", QTYPE_BF16),
+                    QTYPE_Q8_0,
+                )
+        for role, name in (("embedding", "token_embd.weight"), ("output", "output.weight")):
+            self.assertEqual(regular_qtype("q4", role, name, QTYPE_BF16), QTYPE_Q8_0)
+        self.assertEqual(regular_qtype("q4", "mhc", "blk.0.hc_attn_fn.weight", QTYPE_BF16), QTYPE_BF16)
+        self.assertEqual(regular_qtype("q4", "linear_attention", "blk.0.kda_q.weight", QTYPE_Q4_K), QTYPE_Q4_K)
 
     def test_fp8_e4m3_edge_values(self):
         lut = bare_quantizer().fp8_lut

@@ -1,0 +1,161 @@
+{
+  "entries": [
+    {
+      "decision": "deferred",
+      "donor_commit": "0e9cc2d43ec7fed31d648658b3e9cb74a4ccad4b",
+      "donor_commit_name": "0e9cc2d",
+      "donor_patch_id": "40db7cd6cdc8dbac8df3188e2bc8e4e8e25f8cf9",
+      "donor_patch_sha256": "855616394badd4276a4c0a2698e78eb1cc8d82a4e998ae9fa8810e5868de211f",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/upstream-ledger-audit-20260913.md"
+      ],
+      "paths": [],
+      "reason": "Broader masking, padding, vision and backend changes still require scoped audit. The reduction barrier subset is represented by the separate fea665c adaptation; do not claim this complete commit was imported.",
+      "recorded_at": "2026-09-13T09:48:20+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": null,
+      "result_patch_id": null,
+      "result_patch_sha256": null,
+      "source": {
+        "access_date": "2026-09-13",
+        "title": "antirez/ds4: Fix GLM attention masking and reductions across GPU backends",
+        "url": "https://github.com/antirez/ds4/commit/0e9cc2d"
+      }
+    },
+    {
+      "decision": "deferred",
+      "donor_commit": "10badf696c1975d27f6f65a74ca76754e5fa0713",
+      "donor_commit_name": "10badf6",
+      "donor_patch_id": "fba0c4b57af6f9297fed72c0a6134acd0442c844",
+      "donor_patch_sha256": "c040eba920dc13c3240b88e4387c1f823c65033f8ef956e395b0f7eb0b5aebce",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/astra-direction-audit-20260913.md"
+      ],
+      "paths": [],
+      "reason": "Promising compact Q8 KDA/embedding/output model-layout direction. Requires a fresh research branch from current main, unchanged original-model control, no duplicated resident weights, and Lane C validation before promotion.",
+      "recorded_at": "2026-09-13T09:48:21+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": null,
+      "result_patch_id": null,
+      "result_patch_sha256": null,
+      "source": {
+        "access_date": "2026-09-13",
+        "title": "antirez/ds4: Quantize GLM 5.3 Q4 dense weights to Q8",
+        "url": "https://github.com/antirez/ds4/commit/10badf696c1975d27f6f65a74ca76754e5fa0713"
+      }
+    },
+    {
+      "decision": "adapted",
+      "donor_commit": "94818d89209a76706c6588bae5d939198e6db065",
+      "donor_commit_name": "94818d8",
+      "donor_patch_id": "42e92b913ee7b11334047350ef48ad2fe2ba9327",
+      "donor_patch_sha256": "ddd91852a73a84bbfc8f1fd4623e3a4ab73977691300337f6b5586bb4c116e82",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/builds/glm53-shared-a-repair-bzwwD0/run.log",
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/repair-round-shared-a-qkv-geometry.md"
+      ],
+      "paths": [
+        "ds4_gpu.h",
+        "ds4_rocm_compat.cu",
+        "rocm/ds4_rocm_bf16_toktile.cuh",
+        "rocm/ds4_rocm_matmul.cuh",
+        "run-tp-ds4-bench.sh",
+        "tests/test_rocm_bf16_batch_gemm.cu"
+      ],
+      "reason": "Adapted the cache-free independent-pointer QKV grid and retained separate physical weight pointers; rejected the donor's concatenated persistent weight cache. The shared-A M256 TP arm is a separately gated experiment and remains default-off.",
+      "recorded_at": "2026-09-12T22:30:58+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": "b320ee2bf936f1b1c745a0435b4bf802cc9e9338",
+      "result_patch_id": "1065336bdf9c16f5bdd47f5d2b27dd810109e708",
+      "result_patch_sha256": "505bf51537b985436cdce0fda6178e7dd07ab5d726e810754de9226e7021648b",
+      "source": {
+        "access_date": "2026-09-13",
+        "title": "antirez/ds4: perf(glm5): collapse KDA QKV WMMA grids",
+        "url": "https://github.com/antirez/ds4/commit/94818d89209a76706c6588bae5d939198e6db065"
+      }
+    },
+    {
+      "decision": "adapted",
+      "donor_commit": "c285966175390b528cd7db564b7639d7511cad03",
+      "donor_commit_name": "c285966",
+      "donor_patch_id": "empty",
+      "donor_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/q8-tile-production-hypothesis-20260913.md",
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-metal-q8-dense-20260913/existing-q8-shapes-and-placement-addendum-20260913.md"
+      ],
+      "paths": [
+        "rocm/ds4_rocm_glm5_q8_decode_tile.cuh",
+        "rocm/ds4_rocm_matmul.cuh",
+        "rocm/ds4_rocm_q8.cuh",
+        "tests/test_rocm_glm5_q8_decode_tile.cu"
+      ],
+      "reason": "Adapt active compact-Q8 research tile to original-GGUF measured shapes with full source row strides, paired pointers, full-output leaf oracle and default-off GLM M1 gates; no weight cache or main promotion.",
+      "recorded_at": "2026-09-13T11:08:16+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": "0cbb4f27aa732fc4bf8643fefa357e10d55cee1b",
+      "result_patch_id": "37170be2d2cc288b812276260b9c6fb7310eb737",
+      "result_patch_sha256": "f31ddaaf43eb3ce8d9bc4254a4be0d89d9e021518d06fae3a8f76995ccfa2aa7",
+      "source": {
+        "access_date": "",
+        "title": "",
+        "url": ""
+      }
+    },
+    {
+      "decision": "adapted",
+      "donor_commit": "cb9a1abdd2252ac80dda3cf9a68ab1f7bb115a04",
+      "donor_commit_name": "cb9a1ab",
+      "donor_patch_id": "b60c065f76bde566f1aa2de5a5d1ca8b815cc2f8",
+      "donor_patch_sha256": "5dd47127ffcf6c62daacf937535b7d4b15982a2a3c525c8b35414aa7f7108d64",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/compact-q8-import-provenance-20260913.md"
+      ],
+      "paths": [
+        "ds4.c",
+        "ds4_glm5_next_runtime.c",
+        "gguf-tools/glm53_quantize.py",
+        "gguf-tools/tests/test_glm53_quantize.py",
+        "tests/test_glm5_next_runtime_offsets.c",
+        "tests/test_glm5_quantized_kda_dequant.py"
+      ],
+      "reason": "Record the existing policy/validation adaptation from active research/glm53-metal-q8-dense-20260913. Quantizer and runtime-offset checks pass; original BF16 GGUF check does not establish Q8 GPU runtime correctness. No model conversion, expanded cache or main promotion.",
+      "recorded_at": "2026-09-13T15:30:00+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": "23fb482b8fbdc7d4937366cc3395d3784bb78c55",
+      "result_patch_id": "b60c065f76bde566f1aa2de5a5d1ca8b815cc2f8",
+      "result_patch_sha256": "453cef64c3e9f91c7c92916358408bedbaa93215ffaaf6b74aa4fc6428f8249b",
+      "source": {
+        "access_date": "2026-09-13",
+        "title": "antirez/ds4: Quantize GLM 5.3 Q4 dense weights to Q8 (via active cb9a1ab donor)",
+        "url": "https://github.com/antirez/ds4/commit/10badf696c1975d27f6f65a74ca76754e5fa0713"
+      }
+    },
+    {
+      "decision": "adapted",
+      "donor_commit": "fea665ce460f429761649ec6c2fae1b168976f89",
+      "donor_commit_name": "fea665c",
+      "donor_patch_id": "aee7630f5f56edaf0051d039218507b032900d29",
+      "donor_patch_sha256": "9f44a2da98d8e80e45ac38471cf722240a0e0e5f59175ce5598941202cfb4041",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/barrier-repair-tests.log",
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-flash-roce-v2-20260912/upstream-ledger-audit-20260913.md"
+      ],
+      "paths": [
+        "rocm/ds4_rocm_glm.cuh"
+      ],
+      "reason": "Adapt the read-before-overwrite softmax reduction barrier to live ROCm GLM variants. Backfill provenance for the existing research checkpoint; no new promotion claim.",
+      "recorded_at": "2026-09-13T09:48:20+00:00",
+      "research_branch": "research/glm53-flash-roce-v2-20260912",
+      "result_commit": "db18eb049244d7304cc60ab7e27fbe0c3f3bf239",
+      "result_patch_id": "611c0a8e6a01fc5444d5eeda427d37250fc36886",
+      "result_patch_sha256": "d10dc3216efc4296a7dd115110d20cb11a855a4ef02f2fd3f30fba2215f171c1",
+      "source": {
+        "access_date": "2026-09-13",
+        "title": "antirez/ds4: Fix ROCm GLM 5.3 causal attention race",
+        "url": "https://github.com/antirez/ds4/commit/fea665c"
+      }
+    }
+  ],
+  "schema": 1
+}

@@ -192,23 +192,41 @@ void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace) {
     ds4_gpu_tensor_free(workspace->k);
     ds4_gpu_tensor_free(workspace->v);
     ds4_gpu_tensor_free(workspace->f_low);
+    if (workspace->g_low != workspace->f_low)
+        ds4_gpu_tensor_free(workspace->g_low);
     ds4_gpu_tensor_free(workspace->forget);
     ds4_gpu_tensor_free(workspace->beta);
     ds4_gpu_tensor_free(workspace->recurrent_out);
+    ds4_gpu_tensor_free(workspace->qkv_activation_panel);
     memset(workspace, 0, sizeof(*workspace));
 }
 
+static int kda_six_workspace_requested(void) {
+    const char *decode = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *prefill = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
+    return (decode && strcmp(decode, "1") == 0) ||
+           (prefill && strcmp(prefill, "1") == 0);
+}
+
+static int kda_activation_panel_requested(uint32_t capacity_tokens) {
+    const char *value = getenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    return capacity_tokens >= 256u && value && strcmp(value, "1") == 0;
+}
+
 int ds4_glm5_kda_workspace_bytes(uint32_t capacity_tokens, uint64_t *bytes) {
-    /* Physical rows only. f_low is reused for g_low after recurrence; forget
-     * is reused for out_gate; gated norm writes recurrent_out in place. */
+    /* Physical rows only. The six-pointer experiment opts into a second
+     * low-rank buffer; the ordinary path aliases g_low to f_low. */
+    const uint64_t low_buffers = kda_six_workspace_requested() ? 2u : 1u;
     const uint64_t floats_per_token =
-        4096u + 3u * DS4_GLM5_KDA_CHANNELS + 128u +
+        4096u + 3u * DS4_GLM5_KDA_CHANNELS + low_buffers * 128u +
         DS4_GLM5_KDA_CHANNELS + DS4_GLM5_KDA_HEADS +
         DS4_GLM5_KDA_CHANNELS;
     uint64_t values = 0;
     return bytes && capacity_tokens != 0u &&
            mul_u64(capacity_tokens, floats_per_token, &values) &&
-           mul_u64(values, sizeof(float), bytes);
+           mul_u64(values, sizeof(float), bytes) &&
+           add_u64(*bytes, kda_activation_panel_requested(capacity_tokens)
+                   ? UINT64_C(256) * 4096u * sizeof(uint32_t) : 0u, bytes);
 }
 
 static ds4_gpu_tensor *workspace_alloc_rows(uint32_t tokens,
@@ -237,15 +255,23 @@ int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
     workspace->v = workspace_alloc_rows(capacity_tokens,
                                          DS4_GLM5_KDA_CHANNELS);
     workspace->f_low = workspace_alloc_rows(capacity_tokens, 128u);
+    workspace->g_low = workspace->f_low;
+    if (kda_six_workspace_requested())
+        workspace->g_low = workspace_alloc_rows(capacity_tokens, 128u);
     workspace->forget = workspace_alloc_rows(capacity_tokens,
                                               DS4_GLM5_KDA_CHANNELS);
     workspace->beta = workspace_alloc_rows(capacity_tokens,
                                             DS4_GLM5_KDA_HEADS);
     workspace->recurrent_out = workspace_alloc_rows(
         capacity_tokens, DS4_GLM5_KDA_CHANNELS);
+    const int panel_requested = kda_activation_panel_requested(capacity_tokens);
+    if (panel_requested)
+        workspace->qkv_activation_panel = workspace_alloc_rows(256u, 4096u);
     if (!workspace->norm || !workspace->q || !workspace->k ||
-        !workspace->v || !workspace->f_low || !workspace->forget ||
-        !workspace->beta || !workspace->recurrent_out) {
+        !workspace->v || !workspace->f_low || !workspace->g_low ||
+        !workspace->forget ||
+        !workspace->beta || !workspace->recurrent_out ||
+        (panel_requested && !workspace->qkv_activation_panel)) {
         ds4_glm5_kda_workspace_free(workspace);
         return 0;
     }

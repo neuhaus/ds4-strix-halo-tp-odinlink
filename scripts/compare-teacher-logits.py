@@ -126,7 +126,10 @@ def load_thresholds(path: Path | None) -> dict | None:
 
 
 def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
-                 allow_quality_difference: bool = False) -> dict:
+                 allow_quality_difference: bool = False,
+                 require_production_quality: bool = False) -> dict:
+    if require_production_quality and (reference["quality"] or candidate["quality"]):
+        raise ValueError("Q8 decode tile comparison requires quality=false in both arms")
     for field in ("vocab", "prefix_tokens", "decode_step", "position",
                   "teacher_token", "quant_bits", "quality", "dspark",
                   "dspark_strict"):
@@ -213,7 +216,7 @@ def main() -> int:
                         help="explicitly compare an unfused quality oracle with an optimized path")
     parser.add_argument(
         "--score-arm-mode", choices=(
-            "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
+            "kda-tp", "kda-kslice", "repeat", "q8-decode-tile", "full-split-order-null",
             "null-vs-kslice", "fallback-vs-kslice",
             "attn-scalar-vs-f32-gemm",
             "attn-scalar-vs-f32-gemm-sync",
@@ -228,6 +231,8 @@ def main() -> int:
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
+        if args.score_arm_mode == "q8-decode-tile" and args.allow_quality_difference:
+            raise ValueError("Q8 decode tile comparison forbids --allow-quality-difference")
         thresholds = load_thresholds(args.thresholds)
         reference_files = sorted(args.reference_dir.glob("decode_*.logits.json"))
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
@@ -275,6 +280,7 @@ def main() -> int:
                 "kda-tp": ("kda-off", "kda-tp"),
                 "kda-kslice": ("kda-tp", "kda-kslice"),
                 "repeat": ("kda-kslice", "kda-kslice"),
+                "q8-decode-tile": ("kda-tp", "kda-tp"),
                 "full-split-order-null": ("kda-tp", "kda-tp"),
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
                 "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
@@ -307,13 +313,20 @@ def main() -> int:
                     if "=" not in item:
                         raise ValueError(f"malformed extra_env item {item!r}")
                     key, value = item.split("=", 1)
+                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+                        raise ValueError(f"duplicate or invalid extra_env key {key!r}")
                     values[key] = value
                 return values
 
             ref_env = parse_env(reference_manifest.get("extra_env", ""))
             cand_env = parse_env(candidate_manifest.get("extra_env", ""))
             selectors = {"DS4_GLM5_KDA_TP", "DS4_GLM5_KDA_OUTPUT_KSLICE"}
-            if args.score_arm_mode == "full-split-order-null":
+            if args.score_arm_mode == "q8-decode-tile":
+                tile_key = "DS4_ROCM_GLM5_Q8_DECODE_TILE"
+                if (ref_env.get(tile_key), cand_env.get(tile_key)) != ("0", "1"):
+                    raise ValueError("Q8 decode tile comparison requires explicit TILE=0 versus TILE=1")
+                selectors.add(tile_key)
+            elif args.score_arm_mode == "full-split-order-null":
                 null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
                 if null_key in ref_env or cand_env.get(null_key) != "1":
                     raise ValueError(
@@ -450,7 +463,7 @@ def main() -> int:
                     selectors.add(diagnostic)
             if ({k: v for k, v in ref_env.items() if k not in selectors} !=
                     {k: v for k, v in cand_env.items() if k not in selectors}):
-                raise ValueError("score arms differ outside the KDA selectors")
+                raise ValueError("score arms differ outside the declared selectors")
             selector_expectations = {
                 "kda-off": ("0", "0"),
                 "kda-tp": ("1", "0"),
@@ -477,11 +490,13 @@ def main() -> int:
             raise ValueError("--score-arm-mode applies only to score_official dumps")
 
         steps = [compare_pair(first_pair[0], first_pair[1], thresholds,
-                              args.allow_quality_difference)]
+                              args.allow_quality_difference,
+                              args.score_arm_mode == "q8-decode-tile")]
         for ref_path, cand_path in zip(reference_files[1:], candidate_files[1:]):
             steps.append(compare_pair(load(ref_path, reference=True),
                                       load(cand_path), thresholds,
-                                      args.allow_quality_difference))
+                                      args.allow_quality_difference,
+                                      args.score_arm_mode == "q8-decode-tile"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
         return 1

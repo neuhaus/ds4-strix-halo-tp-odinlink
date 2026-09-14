@@ -193,6 +193,37 @@ int ds4_rocm_glm5_sparse_attention_f16_gemm_reserve(void) {
     return -1;
 }
 
+/* Optimized builds can fold the non-ROCm selector arm, but debug and Metal
+ * builds must not acquire a hard link dependency on the ROCm/CUDA scorer. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t n_pools, uint32_t score_stride, uint32_t n_tokens,
+        uint32_t pos0, uint32_t pool_size, uint32_t n_head,
+        uint32_t head_dim, float scale, bool cache_f16) {
+    (void)scores;
+    (void)q;
+    (void)weights;
+    (void)indexer_key_cache;
+    (void)pool_valid;
+    (void)n_pools;
+    (void)score_stride;
+    (void)n_tokens;
+    (void)pos0;
+    (void)pool_size;
+    (void)n_head;
+    (void)head_dim;
+    (void)scale;
+    (void)cache_f16;
+    return 0;
+}
+
 /* ROCm-only RDMA cache-ordering probes. Other backends retain a fail-closed
  * weak implementation so selecting the diagnostic cannot silently do
  * nothing. */
@@ -291,6 +322,16 @@ void ds4_glm5_next_workspace_begin_prefill(ds4_glm5_next_workspace *w) {
 
 void ds4_glm5_next_workspace_begin_decode(ds4_glm5_next_workspace *w) {
     if (w) w->decode_phase = true;
+}
+
+/* The decode probe relies on same-default-stream ordering.  Keep it
+ * explicitly opt-in so prefill and any path with a different lifetime or
+ * stream contract retain the historical fence. */
+static int glm5_decode_async_layer_enabled(
+        const ds4_glm5_next_workspace *w, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_ROCM_GLM5_DECODE_ASYNC_LAYER");
+    return w && w->decode_phase && n_tokens == 1u && enabled &&
+           strcmp(enabled, "1") == 0;
 }
 
 static ds4_gpu_tensor *f32_rows(uint32_t rows, uint64_t width) {
@@ -427,7 +468,12 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity_context(
     w->mla_index_q = f32_rows(
         capacity_tokens, (uint64_t)GLM5_INDEX_HEADS * GLM5_INDEX_DIM);
     w->mla_index_weights = f32_rows(capacity_tokens, GLM5_INDEX_HEADS);
-    w->mla_pool_scores = f32(w->sparse_pool_capacity);
+    /* Pool scores are row-major [query tile][compact pool].  Keeping the
+     * column width at the full context lets a tile score newly published
+     * pools without allocating a persistent weight/cache copy; scalar
+     * workspaces have one row and retain the old footprint. */
+    w->mla_pool_scores = f32_rows(capacity_tokens,
+                                  w->sparse_pool_capacity);
     w->mla_selected_pool = bytes_rows(
         DS4_GLM5_NEXT_INDEX_TOP_K / 4u, sizeof(uint32_t));
     w->mla_selected_token = bytes_rows(
@@ -1142,14 +1188,16 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
                                   ds4_gpu_tensor *hc_out,
                                   uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const uint32_t token_ordinal =
-        state->kda.layer[il].token_count <= UINT32_MAX ?
-        (uint32_t)state->kda.layer[il].token_count : UINT32_MAX;
     const int finite_debug = getenv("DS4_GLM5_NEXT_VALIDATE_FINITE") != NULL;
+    const int async_terminal =
+        glm5_decode_async_layer_enabled(w, n_tokens);
     if (finite_debug) route_failure_stats("dense_hc_in", hc_in,
                                           n_tokens * GLM5_HC_WIDTH);
     int ok = kda_attention_rows(ctx, il, state, w, hc_in, n_tokens);
 #ifdef DS4_TP_TEST_HOOKS
+    const uint32_t token_ordinal =
+        state->kda.layer[il].token_count <= UINT32_MAX ?
+        (uint32_t)state->kda.layer[il].token_count : UINT32_MAX;
     if (ok && n_tokens == 1u) {
         ok = trace_tensor(
                  ctx, il, token_ordinal, "kda_out.f32",
@@ -1201,7 +1249,17 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
             ctx, il, token_ordinal, "output_hc.f32", hc_out,
             (uint64_t)GLM5_HC_WIDTH * sizeof(float));
 #endif
-    if (ok) ok = ds4_gpu_synchronize();
+    if (ok && !async_terminal) ok = ds4_gpu_synchronize();
+    if (ok && async_terminal) {
+        static int logged_async_terminal[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_async_terminal[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 decode terminal layer fence omitted "
+                    "on same default stream rank=%u\n", ctx->tp_rank);
+            logged_async_terminal[rank] = 1;
+        }
+    }
     if (!ok) ds4_glm5_next_state_invalidate(state);
     return ok;
 }
@@ -1937,10 +1995,9 @@ static int mla_publish_completed_pool(
 }
 
 /* Compute the stateless and token-addressed sparse MLA prelude as one row
- * batch. Pool publication deliberately remains outside this helper: every
- * query must publish only its newly completed pool before scoring, never the
- * complete tile ahead of time. Future compact-KV rows are harmless because
- * the per-query selector exposes only completed causal pools plus its tail. */
+ * batch. Pool publication normally remains outside this helper. The optional
+ * pooled-score lane publishes a complete aligned tile before scoring, while
+ * its score mask still exposes only floor((pos0+t+1)/4) pools to query t. */
 static int mla_sparse_prelude_rows(
         const ds4_glm5_next_exec_ctx *ctx,
         uint32_t il,
@@ -2292,7 +2349,9 @@ static int mla_sparse_selection_from_prelude_row(
         bool publish_pool,
         uint32_t top_k,
         ds4_gpu_tensor *selected_out,
-        bool run_attention) {
+        bool run_attention,
+        const ds4_gpu_tensor *batched_scores,
+        uint32_t batched_n_pools) {
     const ds4_glm5_next_mla_offsets *m = &ctx->model->layer[il].mla;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos = mla->token_count;
@@ -2317,7 +2376,10 @@ static int mla_sparse_selection_from_prelude_row(
         n_pools > scalar_w->sparse_pool_capacity || selected_pools == 0u ||
         top_k > DS4_GLM5_NEXT_INDEX_TOP_K ||
         selected_pools > top_k / GLM5_INDEX_POOL ||
-        selected_tokens > top_k + GLM5_INDEX_POOL - 1u) {
+        selected_tokens > top_k + GLM5_INDEX_POOL - 1u ||
+        (batched_scores && (batched_n_pools != n_pools ||
+            ds4_gpu_tensor_bytes(batched_scores) <
+                (uint64_t)n_pools * sizeof(float)))) {
         return 0;
     }
     ds4_gpu_tensor *query = run_attention ? ds4_gpu_tensor_view(
@@ -2333,25 +2395,30 @@ static int mla_sparse_selection_from_prelude_row(
         scalar_w->mla_selected_token;
     int ok = (!run_attention || (query && qk_low)) && selected &&
         index_q && index_weights &&
-        ds4_gpu_tensor_copy(
-            mla->index_tail, (uint64_t)tail_slot * index_k_row,
-            batch_w->mla_index_k_norm, (uint64_t)row * index_k_row,
-            index_k_row) &&
-        ds4_gpu_tensor_copy(
-            mla->pool_gate_tail, (uint64_t)tail_slot * index_k_row,
-            batch_w->mla_pool_gate_raw, (uint64_t)row * index_k_row,
-            index_k_row) &&
-        mla_publish_completed_pool(
-            ctx, m, mla, scalar_w, pool_index, publish_pool) &&
-        ds4_gpu_glm_indexer_score_one_tensor(
-            scalar_w->mla_pool_scores, index_q, index_weights,
-            mla->index_pool, n_pools, GLM5_INDEX_HEADS, GLM5_INDEX_DIM,
-            0.015625f, false) &&
-        ds4_gpu_glm5_mask_pool_scores_tensor(
-            scalar_w->mla_pool_scores, mla->index_pool_valid, n_pools) &&
-        ds4_gpu_indexer_topk_tensor(
-            scalar_w->mla_selected_pool, scalar_w->mla_pool_scores,
-            n_pools, 1u, selected_pools) &&
+        (batched_scores ||
+         (ds4_gpu_tensor_copy(
+              mla->index_tail, (uint64_t)tail_slot * index_k_row,
+              batch_w->mla_index_k_norm, (uint64_t)row * index_k_row,
+              index_k_row) &&
+          ds4_gpu_tensor_copy(
+              mla->pool_gate_tail, (uint64_t)tail_slot * index_k_row,
+              batch_w->mla_pool_gate_raw, (uint64_t)row * index_k_row,
+              index_k_row) &&
+          mla_publish_completed_pool(
+              ctx, m, mla, scalar_w, pool_index, publish_pool))) &&
+        (batched_scores ?
+         ds4_gpu_indexer_topk_tensor(
+             scalar_w->mla_selected_pool, batched_scores,
+             batched_n_pools, 1u, selected_pools) :
+         (ds4_gpu_glm_indexer_score_one_tensor(
+              scalar_w->mla_pool_scores, index_q, index_weights,
+              mla->index_pool, n_pools, GLM5_INDEX_HEADS, GLM5_INDEX_DIM,
+              0.015625f, false) &&
+          ds4_gpu_glm5_mask_pool_scores_tensor(
+              scalar_w->mla_pool_scores, mla->index_pool_valid, n_pools) &&
+          ds4_gpu_indexer_topk_tensor(
+              scalar_w->mla_selected_pool, scalar_w->mla_pool_scores,
+              n_pools, 1u, selected_pools))) &&
         ds4_gpu_glm5_expand_pool_selection_tensor(
             selected, scalar_w->mla_selected_pool,
             mla->index_pool_ids, mla->index_pool_valid,
@@ -2391,10 +2458,12 @@ static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
 #ifdef DS4_ROCM_BUILD
     const char *batch_pool_value =
         getenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE");
-    const int batch_pool_stage = batch_pool_value != NULL &&
-        strcmp(batch_pool_value, "1") == 0;
-    if (batch_pool_value != NULL &&
-        strcmp(batch_pool_value, "0") != 0 && !batch_pool_stage) {
+    const int batch_pool_stage =
+        (batch_pool_value != NULL && strcmp(batch_pool_value, "1") == 0) ||
+        (ctx->tp && (ds4_tp_prefill_config(ctx->tp) &
+                     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH) != 0u);
+    if (batch_pool_value != NULL && strcmp(batch_pool_value, "0") != 0 &&
+        strcmp(batch_pool_value, "1") != 0) {
         return 0;
     }
     if (batch_pool_stage && pos0 <= mla->capacity_tokens &&
@@ -2890,6 +2959,10 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     bool overlap_prefetched = false;
     const int q4_residency = mixed_q2 ? 0 :
         local_q4k_half_residency(ctx, layer);
+    /* A nonresident layer releases packed descriptors below; retain its
+     * historical fence even when the diagnostic switch is enabled. */
+    const int async_terminal = q4_residency == 1 &&
+        glm5_decode_async_layer_enabled(w, 1u);
     int ok = ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
             ctx->model->rms_norm_eps);
@@ -2933,6 +3006,12 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank);
         ok = 0;
     }
+    const char *shared_q8_pair_env =
+        getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+    const int shared_q8_pair_decode =
+        w->decode_phase && shared_q8_pair_env &&
+        strcmp(shared_q8_pair_env, "1") == 0 &&
+        GLM5_WIDTH == 4096u && GLM5_RANK_MID == 1024u;
     if (ok && mixed_q2) {
         /* The mixed GLM Q2 layout is handled by the existing type-aware
          * routed launcher. It consumes the original GGUF tables and uses
@@ -3029,18 +3108,39 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 cache, w->router_selected, w->router_weights,
                 GLM5_EXPERTS_USED);
         }
-        if (ok && overlap_prefetched) ok =
-            ds4_gpu_matmul_q8_0_tensor(
-                w->shared_gate, ctx->model_map, ctx->model_size,
-                f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
-                GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
-            ds4_gpu_matmul_q8_0_tensor(
-                w->shared_up, ctx->model_map, ctx->model_size,
-                f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
-                GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
-            ds4_gpu_swiglu_tensor(
+        if (ok && overlap_prefetched) {
+            if (shared_q8_pair_decode) {
+                ok = ds4_gpu_matmul_q8_0_pair_tensor(
+                    w->shared_gate, w->shared_up, ctx->model_map,
+                    ctx->model_size,
+                    f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID,
+                    w->ffn_hidden, 1u);
+            } else {
+                ok = ds4_gpu_matmul_q8_0_tensor(
+                    w->shared_gate, ctx->model_map, ctx->model_size,
+                    f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+                    ds4_gpu_matmul_q8_0_tensor(
+                    w->shared_up, ctx->model_map, ctx->model_size,
+                    f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
+            }
+            if (ok) ok = ds4_gpu_swiglu_tensor(
                 w->shared_mid, w->shared_gate, w->shared_up,
                 GLM5_RANK_MID, 10.0f, 1.0f);
+            if (ok && shared_q8_pair_decode) {
+                static int logged_shared_q8_pair[2] = {0, 0};
+                const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+                if (!logged_shared_q8_pair[rank]) {
+                    fprintf(stderr,
+                            "ds4: GLM5 shared gate/up Q8 decode pair engaged "
+                            "rank=%u overlap=1\n", ctx->tp_rank);
+                    logged_shared_q8_pair[rank] = 1;
+                }
+            }
+        }
         ok = cache && ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
                  w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
                  w->routed_experts, cache, w->router_selected,
@@ -3052,12 +3152,20 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank, mixed_q2 ? 1 : 0);
         goto routed_one_done;
     }
-    if (ok && !overlap_prefetched) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !overlap_prefetched && shared_q8_pair_decode) ok =
+        ds4_gpu_matmul_q8_0_pair_tensor(
+            w->shared_gate, w->shared_up, ctx->model_map, ctx->model_size,
+            f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+            f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+            GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID,
+            w->ffn_hidden, 1u);
+    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok =
+        ds4_gpu_matmul_q8_0_tensor(
             w->shared_gate, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared gate rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok && !overlap_prefetched) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok = ds4_gpu_matmul_q8_0_tensor(
             w->shared_up, ctx->model_map, ctx->model_size,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
@@ -3065,6 +3173,16 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     if (ok && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
             GLM5_RANK_MID, 10.0f, 1.0f);
+    if (ok && !overlap_prefetched && shared_q8_pair_decode) {
+        static int logged_shared_q8_pair_serial[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_shared_q8_pair_serial[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 shared gate/up Q8 decode pair engaged "
+                    "rank=%u overlap=0\n", ctx->tp_rank);
+            logged_shared_q8_pair_serial[rank] = 1;
+        }
+    }
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared SwiGLU rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
     if (ok) ok = ds4_gpu_matmul_q8_0_kslice_tensor(
             w->shared_out, ctx->model_map, ctx->model_size, f->down_shexp,
@@ -3083,7 +3201,17 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             hc_out, w->down, w->after_attention, w->ffn_split,
             GLM5_WIDTH, GLM5_HC);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at mHC expand rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_synchronize();
+    if (ok && !async_terminal) ok = ds4_gpu_synchronize();
+    if (ok && async_terminal) {
+        static int logged_async_terminal[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_async_terminal[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 routed decode terminal layer fence "
+                    "omitted with resident Q4_K rank=%u\n", ctx->tp_rank);
+            logged_async_terminal[rank] = 1;
+        }
+    }
     if (!ok) fprintf(stderr, "ds4: GLM5 routed layer %u failed at synchronize rank=%u\n", il, ctx->tp_rank);
     /* The packed slices are layer-scoped.  The final synchronize above makes
      * it safe to release them before the next layer is declared. */
@@ -3350,7 +3478,37 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             w->ffn_hidden, il, n_tokens, &routed_mid_is_f16);
     }
     int shared_projection_ok = 1;
-    if (ok && !routed_mid_is_f16 &&
+    int shared_projection_fused = 0;
+    /* The paired WMMA path owns both Q8 projections and the SwiGLU
+     * epilogue.  Keep it explicitly opt-in: unsupported shapes and mixed
+     * quantization remain on the established pair-GEMM route. */
+    const char *shared_wmma_env =
+        getenv("DS4_ROCM_SHARED_GU_WMMA_BATCH");
+    const int shared_wmma_batch =
+        shared_wmma_env && strcmp(shared_wmma_env, "1") == 0;
+    if (ok && !routed_mid_is_f16 && shared_wmma_batch && n_tokens >= 64u) {
+        shared_projection_ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+            w->shared_gate, w->shared_up, w->shared_mid,
+            ctx->model_map, ctx->model_size,
+            f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+            f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+            GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, n_tokens, 10.0f);
+        shared_projection_fused = shared_projection_ok;
+        if (shared_projection_fused) {
+            static int logged_shared_wmma[2] = {0, 0};
+            const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+            if (!logged_shared_wmma[rank]) {
+                fprintf(stderr,
+                        "ds4: GLM5 shared gate/up paired WMMA batch engaged "
+                        "rank=%u tokens=%u tile=%s\n",
+                        ctx->tp_rank, n_tokens,
+                        getenv("DS4_ROCM_SHARED_GU_WMMA_BATCH_TILE") &&
+                        strcmp(getenv("DS4_ROCM_SHARED_GU_WMMA_BATCH_TILE"),
+                               "256") == 0 ? "256" : "128");
+                logged_shared_wmma[rank] = 1;
+            }
+        }
+    } else if (ok && !routed_mid_is_f16 &&
         getenv("DS4_ROCM_GLM5_BATCH_SHARED_SERIAL") != NULL) {
         const uint64_t hc_row_bytes = (uint64_t)GLM5_WIDTH * sizeof(float);
         const uint64_t mid_row_bytes = (uint64_t)GLM5_RANK_MID * sizeof(float);
@@ -3381,9 +3539,9 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             w->ffn_hidden, n_tokens);
     }
     ok = ok && !routed_mid_is_f16 && shared_projection_ok &&
-        ds4_gpu_swiglu_tensor(
+        (shared_projection_fused || ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
-            n_tokens * GLM5_RANK_MID, 10.0f, 1.0f);
+            n_tokens * GLM5_RANK_MID, 10.0f, 1.0f));
     int shared_down_ok = ok;
     if (shared_down_ok &&
         getenv("DS4_ROCM_GLM5_BATCH_SHARED_DOWN_SERIAL") != NULL) {
@@ -3954,12 +4112,55 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         return 0;
     }
     const uint32_t token_ordinal = mla->token_count;
+    const bool batch_indexer_score = batch_prelude &&
+        ctx->tp &&
+        (ds4_tp_prefill_config(ctx->tp) &
+         DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH) != 0u &&
+        mla->first_valid == 0u && (token_ordinal & 3u) == 0u &&
+        (n_tokens & 3u) == 0u &&
+        (uint64_t)token_ordinal + n_tokens <= UINT32_MAX;
+    const uint32_t batch_score_pools = batch_indexer_score
+        ? (uint32_t)(((uint64_t)token_ordinal + n_tokens) / 4u) : 0u;
     const int phase_profile = getenv("DS4_GLM5_PHASE_PROFILE") != NULL;
     const double phase_t0 = phase_profile ? glm5_exec_now_sec() : 0.0;
     if (batch_prelude && !mla_sparse_prelude_rows(
             ctx, il, state, batch_w, hc_in, n_tokens)) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
+    }
+    /* The prelude must populate normalized index rows before pool publication
+     * and scoring. Aligned tiles may publish all complete pools up front; the
+     * score kernel applies the per-query causal mask below. */
+    if (batch_indexer_score &&
+        (batch_score_pools == 0u ||
+         batch_score_pools > mla->capacity_pools ||
+         batch_score_pools > batch_w->sparse_pool_capacity ||
+         ds4_gpu_tensor_bytes(batch_w->mla_pool_scores) <
+             (uint64_t)n_tokens * batch_w->sparse_pool_capacity *
+                 sizeof(float) ||
+         !mla_stage_index_rows(ctx, &layer->mla, mla, batch_w,
+                                token_ordinal, n_tokens) ||
+         !ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+             batch_w->mla_pool_scores, batch_w->mla_index_q,
+             batch_w->mla_index_weights, mla->index_pool,
+             mla->index_pool_valid, batch_score_pools,
+             batch_w->sparse_pool_capacity, n_tokens,
+             token_ordinal, GLM5_INDEX_POOL, GLM5_INDEX_HEADS,
+             GLM5_INDEX_DIM, 0.015625f, false))) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    if (batch_indexer_score) {
+        static int logged_batch_indexer_score[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_batch_indexer_score[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 pooled indexer score batch engaged "
+                    "rank=%u pos0=%u rows=%u pools=%u\n",
+                    ctx->tp_rank, token_ordinal, n_tokens,
+                    batch_score_pools);
+            logged_batch_indexer_score[rank] = 1;
+        }
     }
     for (uint32_t t = 0u; t < n_tokens; ++t) {
         ds4_gpu_tensor *in_row = batch_prelude ? NULL :
@@ -3975,6 +4176,15 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
                 batch_w->mla_selected_token,
                 (uint64_t)t * selected_row_bytes,
                 selected_row_bytes) : NULL;
+        const uint64_t row_end64 = (uint64_t)token_ordinal + t + 1u;
+        const uint32_t row_pools = row_end64 <= UINT32_MAX
+            ? (uint32_t)(row_end64 / GLM5_INDEX_POOL) : 0u;
+        ds4_gpu_tensor *score_row = batch_indexer_score && row_pools != 0u
+            ? ds4_gpu_tensor_view(
+                batch_w->mla_pool_scores,
+                (uint64_t)t * batch_w->sparse_pool_capacity *
+                    sizeof(float),
+                (uint64_t)row_pools * sizeof(float)) : NULL;
         uint32_t tail_slot = 0u, pool_index = 0u;
         bool publish_pool = false;
         const int planned = ds4_glm5_next_mla_append_plan(
@@ -3984,7 +4194,7 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
             mla_sparse_selection_from_prelude_row(
                 &scalar_ctx, il, state, batch_w, scalar_w, t, tail_slot,
                 pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
-                selected_row, !batch_value) :
+                selected_row, !batch_value, score_row, row_pools) :
             (in_row && mla_sparse_selection_attention(
                 &scalar_ctx, il, state, scalar_w, in_row, tail_slot,
                 pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
@@ -4001,6 +4211,7 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         ds4_gpu_tensor_free(local_row);
         ds4_gpu_tensor_free(in_row);
         ds4_gpu_tensor_free(selected_row);
+        ds4_gpu_tensor_free(score_row);
         if (!row_ok) {
             ds4_glm5_next_state_invalidate(state);
             return 0;

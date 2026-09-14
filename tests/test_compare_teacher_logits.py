@@ -49,7 +49,9 @@ def score_manifest(path: Path, *, arm: str,
                    attention_f32_gemm: bool = False,
                    attention_repair: str | None = None,
                    attention_repairs: tuple[str, ...] = (),
-                   attention_exact_split: str | None = None) -> None:
+                   attention_exact_split: str | None = None,
+                   q8_decode_tile: str | None = None,
+                   extra_env: str = "") -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
@@ -87,7 +89,9 @@ def score_manifest(path: Path, *, arm: str,
                       (f"{attention_repair}=1 " if attention_repair else "") +
                       "".join(f"{repair}=1 " for repair in attention_repairs) +
                       (f"DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT={attention_exact_split} "
-                       if attention_exact_split is not None else "")),
+                       if attention_exact_split is not None else "") +
+                      (f"DS4_ROCM_GLM5_Q8_DECODE_TILE={q8_decode_tile} "
+                       if q8_decode_tile is not None else "") + extra_env),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -216,6 +220,42 @@ def main() -> int:
                              "--score-arm-mode", "kda-kslice")
         assert score_mismatch.returncode == 1
         assert "manifest model_sample_sha256" in score_mismatch.stderr
+
+        tile_args = (str(reference), str(candidate), "--score-arm-mode", "q8-decode-tile")
+        score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile="0")
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1")
+        tile = run(*tile_args)
+        assert tile.returncode == 0, tile.stderr
+        assert json.loads(tile.stdout)["mode"] == "diagnostic"
+        assert run(*tile_args, "--allow-quality-difference").returncode == 1
+        for ref_tile, cand_tile in ((None, "1"), ("0", None), ("1", "0"),
+                                    ("0", "0"), ("0", "2")):
+            score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile=ref_tile)
+            score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile=cand_tile)
+            invalid_tile = run(*tile_args)
+            assert invalid_tile.returncode == 1
+            assert "explicit TILE=0 versus TILE=1" in invalid_tile.stderr
+        score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile="0")
+        score_manifest(candidate / "manifest", arm="kda-kslice", q8_decode_tile="1")
+        assert "score arm relationship" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                       extra_env="DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1")
+        assert "outside the declared selectors" in run(*tile_args).stderr
+        for extra in ("DS4_ROCM_GLM5_Q8_DECODE_TILE=1", "=bad", "BAD-KEY=1"):
+            score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                           extra_env=extra)
+            assert "duplicate or invalid extra_env key" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                       model_hash="wrong-model")
+        assert "manifest model_sample_sha256" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1")
+        # A later QUALITY=1 dump must fail too: that dispatch bypasses the pair tile.
+        for directory in (reference, candidate):
+            dump(directory / "decode_000001.logits.json", [0.0, 1.0, 2.0, 3.0],
+                 quality=True, source="ds4-score-official-frozen-teacher")
+        assert "requires quality=false" in run(*tile_args).stderr
+        for directory in (reference, candidate):
+            (directory / "decode_000001.logits.json").unlink()
 
         score_manifest(reference / "manifest", arm="kda-tp")
         score_manifest(candidate / "manifest", arm="kda-tp",
