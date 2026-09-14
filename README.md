@@ -22,9 +22,11 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
+| Huihui Q2_K over RoCE v2 | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | archived branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
+| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; exact FNV `ee2d32f1d0e4b8f4`, zero fallback |
+| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; exact FNV `5e0fa38210276c41`, zero fallback |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 The registered-slab attention exchange is validated with both listed Q4_K
@@ -34,6 +36,13 @@ Q4_K layout improved from 147.99 to **286.29 prefill t/s** while preserving
 Both kept the exact token fingerprint and zero fallback. The repair reuses the
 existing communication slab, adds no cache, and replaces a separate 32 MiB
 attention-output allocation at the validated 2,048-row cap.
+
+The successor-gate rows use the Huihui 0731 Q2/Q4 files and the clean
+`research/glm53-flash-roce-v2-successor-20260914` artifact. Their FNV values
+are deterministic generated-token fingerprints for the complete workload and
+configuration; they are not model-file checksums. The older fingerprints above
+remain valid for their archived model/configuration checkpoints and are kept
+for reproducibility.
 
 ### Q4_K throughput through 10K context
 
@@ -67,10 +76,11 @@ The Q4_K path keeps all 4,096 prompt rows batched, adds no persistent weight
 cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
-followed by 300 generated tokens over mandatory RDMA. Its current Q4_K rows
-use the Antirez reference model listed below. It does not fit one node's
-current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
-and Q4_K run without a persistent expanded-weight cache.
+followed by 300 generated tokens over mandatory RDMA. The existing Antirez Q4_K
+rows use the reference model listed below; the successor rows use the Huihui
+0731 files. The model does not fit one node's current 96 GiB ROCm aperture;
+TP=2 keeps one expert shard on each node. Q2_K and Q4_K run without a
+persistent expanded-weight cache.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
@@ -100,8 +110,8 @@ policy, and maintainer gates are preserved locally under
 
 | Model source | Tested target files | Support |
 |---|---|---|
-| [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
-| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
+| [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the existing Q4_K OdinLink and RoCE v2 rows. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Both files are used by the successor pre-main Q2/Q4 regression rows. |
 | [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 

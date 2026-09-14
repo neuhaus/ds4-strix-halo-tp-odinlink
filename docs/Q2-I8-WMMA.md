@@ -63,14 +63,17 @@ returned 4 and the retrieval case returned 731942 on every acceptance run.
 
 ## Performance
 
-All results use balanced 128/128 experts, mandatory OdinLink RDMA, no DSpark,
-and no Q8-to-FP16 weight cache.
+The historical rows below use balanced 128/128 experts and mandatory OdinLink
+RDMA. The final row is the current Huihui 0731 pre-main regression on the clean
+successor artifact and uses mandatory RoCE v2; no row uses DSpark or a
+Q8-to-FP16 weight cache.
 
 | Path | Prefill | Decode | Fingerprint |
 |---|---:|---:|---|
 | Safe Q2 control before mixed-Q4 discovery | 127.07 t/s | 14.75 t/s | `c000c594c5ea0328` |
 | Mixed Q4 discovery, before IQ2 integer WMMA | 149.85 t/s | 14.72 t/s | `fec62421edc8d73c` |
-| Final IQ2 integer-WMMA median | **162.78 t/s** | **14.68 t/s** | `f9cb3a8a17e95c71` |
+| Historical final IQ2 integer-WMMA median | **162.78 t/s** | **14.68 t/s** | `f9cb3a8a17e95c71` |
+| Current Huihui 0731 Q2_K pre-main successor gate (RoCE v2) | **233.53 t/s** | **19.96 t/s** | `5e0fa38210276c41` |
 
 The final clean samples were 160.38/14.68, 162.78/13.77, and 164.07/14.73
 prefill/decode t/s. The second run retained 14.03 steady decode after an
@@ -84,8 +87,10 @@ fingerprint, and retained zero RDMA fallback calls. This proves the rollback
 selects the established arithmetic path rather than only suppressing logging.
 
 Candidate mode deliberately runs semantic cases before the timed workload and
-therefore heats the UMA system. Its final pre-main result was 151.69/14.62 t/s;
-that number is correctness evidence, not the clean performance measurement.
+therefore heats the UMA system. Its historical pre-main result was 151.69/14.62
+t/s; that number is correctness evidence, not the clean successor measurement.
+The clean successor run was 233.53/19.96 t/s; the paired repeat was 238.24/19.92
+t/s, giving a 235.89/19.94 t/s midpoint with the same fingerprint.
 
 ## Prior art and remaining work
 
