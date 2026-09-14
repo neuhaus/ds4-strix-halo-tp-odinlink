@@ -44,6 +44,25 @@ configuration; they are not model-file checksums. The older fingerprints above
 remain valid for their archived model/configuration checkpoints and are kept
 for reproducibility.
 
+## Quality test
+
+FNV is only the trajectory check. The independent quality test scores the
+tracked 100-case official-continuation fixture by target-token NLL and API
+top-1/pair agreement, then applies the predeclared thresholds in
+`quality-thresholds.successor.json`:
+
+```sh
+./scripts/run-successor-quality-test.sh successor-q4 \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K-0731.gguf \
+  /path/to/reference.tsv
+```
+
+The command runs the TP scorer over mandatory RoCE v2 and writes the score,
+provenance manifest, and paired comparison under `$DS4_RESEARCH_ROOT`. It
+fails closed when the 100-case/2,289-token minimum, NLL confidence bound, or
+API agreement checks are not met. `REFERENCE.tsv` must be a score from the
+approved quality anchor using the same tracked fixture.
+
 ### Q4_K throughput through 10K context
 
 ![Antirez DeepSeek V4 Flash Q4_K TP=2 throughput through 10K context](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
