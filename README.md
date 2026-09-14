@@ -25,8 +25,8 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Huihui Q2_K over RoCE v2 | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | archived branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
-| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; zero fallback; independent quality validation pending |
-| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; zero fallback; independent quality validation pending |
+| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; zero fallback; 100-case continuation quality identical to main |
+| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; zero fallback; 100-case continuation quality identical to main |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 The registered-slab attention exchange is validated with both listed Q4_K
@@ -52,6 +52,7 @@ top-1/pair agreement, then applies the predeclared thresholds in
 `quality-thresholds.successor.json`:
 
 ```sh
+make -j3 strix-halo-quality-score
 ./scripts/run-successor-quality-test.sh successor-q4 \
   /absolute/path/DeepSeek-V4-Flash-Q4_K-0731.gguf \
   /path/to/reference.tsv
@@ -62,10 +63,37 @@ provenance manifest, and paired comparison under `$DS4_RESEARCH_ROOT`. It
 fails closed when the 100-case/2,289-token minimum, NLL confidence bound, or
 API agreement checks are not met. `REFERENCE.tsv` must be a score from the
 approved quality anchor using the same tracked fixture.
+The build target links the scorer and worker from the same freshly built core
+objects and checks the gfx1151 ROCm toolchain; deploy that worker binary to the
+peer before running the test.
 The fixture is selected from the GGUF architecture: DeepSeek uses `flash`,
 GLM5.3 uses `glm53-flash-openrouter-zai-fp8-100`. A newly measured `main`
 reference provides a paired regression screen; it does not by itself establish
 an approved immutable quality anchor or authorize promotion.
+The DeepSeek fixture's API logprobs use `0`/`-9999` values. Its API agreement
+columns are ordering checks, not calibrated probability-error measurements;
+NLL is computed from the local model's probabilities of the official tokens.
+
+The 2026-09-14 paired run compared clean `main` (`8f75659`) with clean
+successor `8fedc37`, whose inference sources and scorer are unchanged from
+the timed `9fefea6` artifact. Each model scored 100 cases and 2,289 target
+tokens over required RoCE v2 on both ranks, with the same effective settings
+and unchanged GGUF. The complete score TSVs matched byte for byte:
+
+| DeepSeek 0731 model | Main NLL | Successor NLL | API top-1, both | API pair agreement, both |
+|---|---:|---:|---:|---:|
+| Q4_K | 0.518347917 | 0.518347917 | 84.6221% | 98.5708% |
+| Q2_K | 0.560052157 | 0.560052157 | 83.4426% | 98.4876% |
+
+Every per-case NLL delta is zero at recorded precision; both the gate's
+paired CI95 and the separate descriptive bootstrap CI99 are `[0, 0]`.
+This establishes no measured short-continuation quality regression relative
+to current main, with no evidence of positive drift. It does not establish
+the effect of every historical FNV change or replace the final 8,192+300
+quality/numerical gate, frozen-logit comparison, or immutable-anchor approval.
+The branch remains unmerged. Raw scores, clean manifests, both-rank logs,
+comparisons, bootstrap reports, build recipes and the Grok review are under
+`$DS4_RESEARCH_ROOT/candidates/successor-quality-20260914/`.
 
 ### Q4_K throughput through 10K context
 

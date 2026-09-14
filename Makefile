@@ -840,8 +840,8 @@ strix-halo: check-rocm-strix
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
-strix-halo-quality-score:
-	$(MAKE) -B gguf-tools/quality-testing/score_official \
+strix-halo-quality-score: check-rocm-strix
+	$(MAKE) -B ds4 gguf-tools/quality-testing/score_official \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
