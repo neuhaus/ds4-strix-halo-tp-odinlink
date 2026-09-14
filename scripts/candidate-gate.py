@@ -1057,7 +1057,7 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
         for provider, anchor in performance.items():
             if (not isinstance(anchor, dict) or
                     set(anchor) != {"runs", "geometric_mean_tps", "environment",
-                                    "ds4_sha256"} or
+                                    "ds4_sha256", "ds4_bench_tp_sha256"} or
                     not isinstance(anchor["runs"], int) or anchor["runs"] < 3 or
                     not isinstance(anchor["geometric_mean_tps"], dict) or
                     set(anchor["geometric_mean_tps"]) != {"prefill", "decode"} or
@@ -1069,7 +1069,9 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
                     any(not isinstance(item, str)
                         for item in anchor["environment"].values()) or
                     not re.fullmatch(r"[0-9a-f]{64}",
-                                     str(anchor["ds4_sha256"]))):
+                                     str(anchor["ds4_sha256"])) or
+                    not re.fullmatch(r"[0-9a-f]{64}",
+                                     str(anchor["ds4_bench_tp_sha256"]))):
                 raise GateError(
                     f"production baseline has invalid {provider} performance anchor: {path}")
     if (value["schema_version"] == 2 and
@@ -3304,6 +3306,8 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                         },
                         "environment": environment,
                         "ds4_sha256": candidate_manifests[0]["ds4_sha256"],
+                        "ds4_bench_tp_sha256":
+                            candidate_manifests[0]["ds4_bench_tp_sha256"],
                     },
                 },
                 "numerical": {
