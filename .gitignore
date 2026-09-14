@@ -54,6 +54,7 @@
 /tests/test_rocm_glm5_mhc_carry
 /tests/test_rocm_glm5_kpool
 /tests/test_rocm_glm5_indexer_select
+/tests/test_rocm_glm5_indexer_score_one
 /tests/test_rocm_glm5_bf16_round
 /tests/test_rocm_glm5_nope_score
 /tests/test_rocm_glm5_nope_attention
