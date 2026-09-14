@@ -197,9 +197,9 @@ static cudaError_t cuda_launch_glm5_q8_decode_tile(
                 out0, out1, w0, w1, x, blocks, rows, stride);
     } else if (mode == 1) {
         if (w1)
-            matmul_q8_0_pair_f32_sharedx_warp_rows_w32_pack4_kernel<<<
+            glm5_q8_decode_tile_pair_kernel<<<
                 dim3((rows + 7u)/8u), 256u, blocks*32u*sizeof(float), stream>>>(
-                    out0, out1, w0, w1, x, blocks, rows, rows, stride);
+                    out0, out1, w0, w1, x, blocks, rows, stride);
         else
             glm5_q8_decode_tile_kernel<false, 16u><<<
                 dim3((rows + 15u)/16u, pairs), 512u,

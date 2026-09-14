@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
                     // The repaired tile deliberately preserves the established
                     // production arithmetic. A lost whitelist entry must still
                     // be caught by the engagement logs and timing inventory.
-                    if (M == 1 && mode == 1 && !pair) {
+                    if (M == 1 && mode == 1) {
                         double max_diff = 0.0;
                         size_t diff_count = 0;
                         for (size_t i = 0; i < got.size(); ++i) {
