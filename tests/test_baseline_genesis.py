@@ -158,6 +158,7 @@ def build_fixture(root: Path, structured: bool = False,
     quality_manifest = root / "quality.manifest"
     write_manifest(quality_manifest, {
         "model_size": model_size, "model_sample_sha256": model_sample,
+        "quality_input_sha256": "b" * 64,
         "source_commit": source_commit, "source_dirty": 0, "dspark": 0,
     })
     reviews = []
