@@ -37,6 +37,13 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def committed_digest(commit: str, relative: str) -> str:
+    content = subprocess.check_output([
+        "git", "-C", str(REPO), "cat-file", "blob", f"{commit}:{relative}",
+    ])
+    return hashlib.sha256(content).hexdigest()
+
+
 def canonical(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -195,6 +202,8 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
     workload = key["workload"]
     provider = "roce-v2"
     binary = "b" * 64
+    bench_binary = "d" * 64
+    producer_source = committed_digest(key["source_commit"], "ds4_bench.c")
     effects = [0.0020, -0.0015, -0.0020, 0.0015, 0.0010,
                -0.0005, -0.0010, 0.0005, 0.0]
     decode_effects = effects[3:] + effects[:3]
@@ -244,6 +253,8 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
                 "run_id": run_id,
                 "source_commit": key["source_commit"], "source_dirty": 0,
                 "ds4_sha256": binary, "peer_ds4_sha256": binary,
+                "ds4_bench_tp_sha256": bench_binary,
+                "ds4_bench_producer_source_sha256": producer_source,
                 "model": str(model), "model_arch": "glm5-next",
                 "model_size": key["model_size"],
                 "model_sample_sha256": key["model_sample_sha256"],
@@ -448,6 +459,7 @@ def build_fixture(root: Path, structured: bool = True,
     source_commit = subprocess.check_output(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True
     ).strip()
+    producer_source = committed_digest(source_commit, "ds4_bench.c")
     token_file = root / "frozen.tokens"
     token_file.write_text("1\n" * 300)
     token_sha = digest(token_file)
@@ -486,6 +498,8 @@ def build_fixture(root: Path, structured: bool = True,
                 "frontier": 2048, "generated_tokens": 300, "context": 4096,
                 "prefill_chunk": 2048, "dspark": 0, "rdma_profile": provider,
                 "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
+                "ds4_bench_tp_sha256": "d" * 64,
+                "ds4_bench_producer_source_sha256": producer_source,
                 "common_env": f"DS4_BENCH_RUN_ID={run_id}",
                 "worker_env": f"DS4_BENCH_RUN_ID={run_id}",
                 "coordinator_env": f"DS4_BENCH_RUN_ID={run_id}",
@@ -762,6 +776,11 @@ def main() -> int:
             lambda values: (values.__setitem__("ds4_sha256", "c" * 64),
                             values.__setitem__("peer_ds4_sha256", "c" * 64))),
         "provider runs used different binaries")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.pop("ds4_bench_producer_source_sha256")),
+        "producer binary does not match")
     expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: (
