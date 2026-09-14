@@ -344,6 +344,7 @@ struct ds4_tp {
     uint32_t big_capacity_rows; /* 0 unless DS4_TP_BIG_DIRECT=1 */
     uint64_t logits_seq;
     uint64_t timeout_sec;
+    uint64_t payload_fallback_calls;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -415,6 +416,17 @@ static int tp_select_transport(ds4_tp_transport requested,
                    local_rdma_ok ? "the peer" : "this");
         return 0;
     }
+    return 1;
+}
+
+static int tp_refuse_payload_fallback(ds4_tp *tp, const char *kind) {
+    if (!tp || tp->opt.transport != DS4_TP_TRANSPORT_RDMA)
+        return 0;
+    fprintf(stderr,
+            "ds4-tp: explicit --transport rdma cannot use TCP %s fallback; "
+            "failing closed\n",
+            kind ? kind : "payload");
+    ds4_tp_mark_failed(tp);
     return 1;
 }
 
@@ -2732,6 +2744,9 @@ int ds4_tp_create(
     fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
             tp->rank == 0 ? "worker" : "leader",
             tp->rdma_active ? "rdma" : "tcp");
+    const char *bench_run_id = getenv("DS4_BENCH_RUN_ID");
+    if (bench_run_id && bench_run_id[0])
+        fprintf(stderr, "ds4-tp: benchmark run_id=%s\n", bench_run_id);
     *out = tp;
     return 1;
 fail:
@@ -2753,6 +2768,14 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
 
 void ds4_tp_free(ds4_tp *tp) {
     if (!tp) return;
+    fprintf(stderr,
+            "ds4-tp: transport proof requested=%s active=%s "
+            "payload_fallback_calls=%llu failed=%u\n",
+            tp->opt.transport == DS4_TP_TRANSPORT_RDMA ? "rdma" :
+            tp->opt.transport == DS4_TP_TRANSPORT_TCP ? "tcp" : "auto",
+            tp->rdma_active ? "rdma" : "tcp",
+            (unsigned long long)tp->payload_fallback_calls,
+            atomic_load_explicit(&tp->failed, memory_order_acquire) ? 1u : 0u);
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
@@ -2829,6 +2852,8 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     if (tp->rdma_active)
         return tp_rdma_gate_exchange(tp, layer, gate, seq, NULL);
 #endif
+    if (tp_refuse_payload_fallback(tp, "gate payload")) return 0;
+    tp->payload_fallback_calls++;
     /* TCP: both sides write their partial then read the peer's.  16KB per
      * direction fits comfortably in the socket buffers, so the symmetric
      * write-then-read cannot deadlock.  Header and payload go out in one
@@ -2939,6 +2964,8 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 bytes, 0u, 0u, NULL, NULL);
     }
 #endif
+    if (tp_refuse_payload_fallback(tp, "batch-gate payload")) return 0;
+    tp->payload_fallback_calls++;
     struct iovec iov[2] = {
         { &h, sizeof(h) },
         { tp->slab + ds4_tp_slab_batch_out_offset(tp, layer), bytes },
@@ -3051,6 +3078,8 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         return ok;
     }
 #endif
+    if (tp_refuse_payload_fallback(tp, "big-gate payload")) return 0;
+    tp->payload_fallback_calls++;
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
@@ -3117,6 +3146,65 @@ int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
     return 0;
 #endif
 }
+
+#ifdef DS4_TP_TEST_HOOKS
+/* Exercise payload policy without live verbs. The queued peer reply lets the
+ * control header complete before explicit RDMA must refuse TCP payload bytes. */
+int ds4_tp_test_payload_fallback(ds4_tp_transport requested, int big_gate,
+                                 int *exchange_ok, int *failed,
+                                 uint64_t *tcp_payload_bytes) {
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 0;
+    float payload[8] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const uint64_t bytes = 4u * sizeof(float);
+    ds4_tp tp = {
+        .opt = {.transport = requested},
+        .data_fd = sockets[0],
+        .rdma_active = requested != DS4_TP_TRANSPORT_TCP,
+        .n_layer = 1u,
+        .vec_bytes = bytes,
+        .slab = (uint8_t *)payload,
+        .slab_bytes = sizeof(payload),
+        .batch_in_off = bytes,
+    };
+    ds4_tp_gate_header ph = {
+        DS4_TP_BATCH_MAGIC, 0u, big_gate ? 0xB16u : 1u, 1u
+    };
+    int ok = tp_write_full(sockets[1], &ph, sizeof(ph)) &&
+             tp_write_full(sockets[1], payload, bytes);
+    if (ok) {
+        const int exchanged = big_gate
+            ? ds4_tp_big_gate_exchange(&tp, 0u, 1u, payload,
+                                       payload + 4u, bytes)
+            : ds4_tp_batch_gate_exchange(&tp, 0u, 1u, 1u);
+        uint8_t received[sizeof(ph) + 4u * sizeof(float)];
+        size_t total = 0u;
+        for (;;) {
+            ssize_t got = recv(sockets[1], received,
+                               sizeof(received), MSG_DONTWAIT);
+            if (got > 0) {
+                total += (size_t)got;
+                continue;
+            }
+            if (got == 0 || (got < 0 &&
+                             (errno == EAGAIN || errno == EWOULDBLOCK)))
+                break;
+            ok = 0;
+            break;
+        }
+        if (ok) {
+            if (exchange_ok) *exchange_ok = exchanged;
+            if (failed) *failed = ds4_tp_failed(&tp) ? 1 : 0;
+            if (tcp_payload_bytes)
+                *tcp_payload_bytes = total > sizeof(ph) ?
+                    (uint64_t)(total - sizeof(ph)) : 0u;
+        }
+    }
+    close(sockets[0]);
+    close(sockets[1]);
+    return ok;
+}
+#endif
 
 /* ------------------------------------------------------------------------
  * Lockstep control plane.

@@ -77,6 +77,27 @@ static int check_transport(const char *name,
     return 1;
 }
 
+static int check_payload_fallback(const char *name,
+                                  ds4_tp_transport requested,
+                                  int big_gate, int want_exchange,
+                                  int want_failed, uint64_t want_bytes) {
+    int exchanged = -1, failed = -1;
+    uint64_t bytes = UINT64_MAX;
+    if (!ds4_tp_test_payload_fallback(requested, big_gate, &exchanged,
+                                      &failed, &bytes) ||
+        exchanged != want_exchange || failed != want_failed ||
+        bytes != want_bytes) {
+        fprintf(stderr,
+                "FAIL %s: got exchange=%d failed=%d payload=%llu "
+                "want exchange=%d failed=%d payload=%llu\n",
+                name, exchanged, failed, (unsigned long long)bytes,
+                want_exchange, want_failed, (unsigned long long)want_bytes);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 static int check_connect_timeout(const char *name, const char *value,
                                  uint64_t want) {
     if (value) {
@@ -748,6 +769,18 @@ int main(void) {
     ok &= check_transport("explicit RDMA rejects missing peer device",
                           DS4_TP_TRANSPORT_RDMA, 1, 0, 0, 0,
                           "tp: --transport rdma but the peer side has no active device");
+    ok &= check_payload_fallback("batch AUTO keeps TCP payload fallback",
+                                 DS4_TP_TRANSPORT_AUTO, 0, 1, 0, 16u);
+    ok &= check_payload_fallback("big AUTO keeps TCP payload fallback",
+                                 DS4_TP_TRANSPORT_AUTO, 1, 1, 0, 16u);
+    ok &= check_payload_fallback("batch TCP keeps TCP payload exchange",
+                                 DS4_TP_TRANSPORT_TCP, 0, 1, 0, 16u);
+    ok &= check_payload_fallback("big TCP keeps TCP payload exchange",
+                                 DS4_TP_TRANSPORT_TCP, 1, 1, 0, 16u);
+    ok &= check_payload_fallback("batch explicit RDMA refuses TCP payload",
+                                 DS4_TP_TRANSPORT_RDMA, 0, 0, 1, 0u);
+    ok &= check_payload_fallback("big explicit RDMA refuses TCP payload",
+                                 DS4_TP_TRANSPORT_RDMA, 1, 0, 1, 0u);
     ok &= check_connect_timeout("connect timeout default", NULL, 1800u);
     ok &= check_connect_timeout("connect timeout override", "2400", 2400u);
     ok &= check_connect_timeout("connect timeout rejects zero", "0", 1800u);

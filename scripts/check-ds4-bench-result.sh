@@ -11,6 +11,8 @@ REQUIRE_SEMANTIC=${6:-0}
 RDMA_PROFILE=${7:-odinlink}
 RDMA_DEVICE=${8:-}
 RDMA_GID_INDEX=${9:-}
+WORKER_RDMA_DEVICE=${10:-$RDMA_DEVICE}
+EXPECTED_RUN_ID=${11:-}
 
 for path in "$CSV" "$COORD_LOG" "$WORKER_LOG"; do
   [[ -r $path ]] || { echo "error: missing benchmark evidence: $path" >&2; exit 1; }
@@ -64,7 +66,18 @@ ACTUAL_FNV64=$(read_csv_field gen_token_fnv64) || {
 }
 
 "$(dirname -- "$0")/check-tp-rdma-logs.sh" \
-  "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$RDMA_DEVICE" "$RDMA_GID_INDEX"
+  "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$RDMA_DEVICE" \
+  "$RDMA_GID_INDEX" "$WORKER_RDMA_DEVICE" "$EXPECTED_RUN_ID"
+for log in "$COORD_LOG" "$WORKER_LOG"; do
+  grep -q 'expanded_weight_cache_bytes=0' "$log" || {
+    echo "error: benchmark lacks an exact zero expanded-weight-cache counter: $log" >&2
+    exit 1
+  }
+  if grep -Eq 'expanded_weight_cache_bytes=[1-9][0-9]*' "$log"; then
+    echo "error: benchmark allocated a persistent expanded-weight cache: $log" >&2
+    exit 1
+  fi
+done
 if [[ $REQUIRE_SEMANTIC == 1 ]]; then
   grep -q 'ds4-bench: semantic suite passed cases=2' "$COORD_LOG" || {
     echo "error: candidate did not pass the complete semantic suite; rejecting result" >&2
@@ -74,9 +87,17 @@ if [[ $REQUIRE_SEMANTIC == 1 ]]; then
     echo "error: candidate logged a failed semantic case; rejecting result" >&2
     exit 1
   fi
+  if (( EXPECTED_TOKENS >= 300 )); then
+    PRODUCER_COMPLETE_COUNT=$(grep -Fxc \
+      'ds4-bench: headline_csv_complete=1' "$COORD_LOG" || true)
+    [[ $PRODUCER_COMPLETE_COUNT == 1 ]] || {
+      echo "error: candidate lacks one producer-side complete-result attestation" >&2
+      exit 1
+    }
+  fi
 fi
 
-if [[ -n $EXPECTED_FNV64 && ${ACTUAL_FNV64,,} != ${EXPECTED_FNV64,,} ]]; then
+if [[ -n $EXPECTED_FNV64 && ${ACTUAL_FNV64,,} != "${EXPECTED_FNV64,,}" ]]; then
   echo "error: token fingerprint mismatch: expected ${EXPECTED_FNV64,,}, got ${ACTUAL_FNV64,,}; rejecting candidate" >&2
   exit 1
 fi

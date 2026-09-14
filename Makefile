@@ -20,6 +20,10 @@ CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c
 CFLAGS += $(DS4_PROFILE_CFLAGS)
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
+DS4_BENCH_PRODUCER_SOURCE_SHA256 := $(shell \
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum ds4_bench.c; \
+	else shasum -a 256 ds4_bench.c; fi | awk '{print $$1}')
+DS4_BENCH_PRODUCER_CFLAGS := '-DDS4_BENCH_PRODUCER_SOURCE_SHA256="$(DS4_BENCH_PRODUCER_SOURCE_SHA256)"'
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
@@ -85,12 +89,19 @@ endif
 .PHONY: all help clean test test-quality-gates test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
+	./tests/test_baseline_genesis.sh
 	python3 tests/test_frontier_logits_gate.py
 	python3 tests/test_compare_teacher_logits.py
 	python3 tests/test_compare_quality_scores.py
-	python3 tests/test_lane_c_oracle_gate.py
+	python3 tests/test_ds4_gate_stats.py
+	python3 tests/test_promotion_boundary_calibration.py
+	python3 tests/test_ds4_gate_controls.py
+	python3 tests/test_promotion_proof.py
+	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
 	./tests/test_glm5_prefill_proof.sh
+	./tests/test_bench_producer_identity.sh
+	./tests/test_tp_worker_supervisor.sh
 
 test-glm5-prefill-proof:
 	./tests/test_glm5_prefill_proof.sh
@@ -880,7 +891,7 @@ ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvst
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) $(DS4_BENCH_PRODUCER_CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
@@ -922,7 +933,7 @@ ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) $(DS4_BENCH_PRODUCER_CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c

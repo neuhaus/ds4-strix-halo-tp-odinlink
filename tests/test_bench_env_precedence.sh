@@ -168,8 +168,11 @@ if env -i PATH="$PATH" LANG=C.UTF-8 \
   echo 'FAIL sparse-output-with-bridge: incomplete fake model unexpectedly succeeded' >&2
   exit 1
 fi
-! grep -q 'requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1' \
-  "$test_dir/sparse-output-valid.out"
+if grep -q 'requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1' \
+    "$test_dir/sparse-output-valid.out"; then
+  echo 'FAIL sparse-output-with-bridge: valid dependency was rejected' >&2
+  exit 1
+fi
 grep -q 'unsupported routed-expert quantization' \
   "$test_dir/sparse-output-valid.out"
 echo 'PASS sparse-output-with-bridge'
@@ -277,10 +280,16 @@ if env -i PATH="$PATH" LANG=C.UTF-8 \
   echo 'FAIL sparse-attn-valid-chain: incomplete fake model unexpectedly succeeded' >&2
   exit 1
 fi
-! grep -q 'requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1' \
-  "$test_dir/sparse-attn-valid.out"
-! grep -q 'requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1' \
-  "$test_dir/sparse-attn-valid.out"
+if grep -q 'requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1' \
+    "$test_dir/sparse-attn-valid.out"; then
+  echo 'FAIL sparse-attn-valid-chain: valid prelude dependency was rejected' >&2
+  exit 1
+fi
+if grep -q 'requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1' \
+    "$test_dir/sparse-attn-valid.out"; then
+  echo 'FAIL sparse-attn-valid-chain: valid head-shared dependency was rejected' >&2
+  exit 1
+fi
 grep -q 'unsupported routed-expert quantization' \
   "$test_dir/sparse-attn-valid.out"
 echo 'PASS sparse-attn-valid-chain'

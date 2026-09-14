@@ -422,6 +422,9 @@ int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int *rdma_active,
                                  char *err,
                                  size_t errlen);
+int ds4_tp_test_payload_fallback(ds4_tp_transport requested, int big_gate,
+                                 int *exchange_ok, int *failed,
+                                 uint64_t *tcp_payload_bytes);
 int ds4_tp_test_gate_schedule_validate(
         const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
         uint32_t gates_per_token, uint32_t n_slots,

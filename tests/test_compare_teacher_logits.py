@@ -356,6 +356,101 @@ def main() -> int:
             str(reference), str(candidate),
             "--score-arm-mode", "attn-repeat")
         assert attention_repeat.returncode == 0, attention_repeat.stderr
+
+        # Contract-v2 gates semantic drift with shift-invariant distributions,
+        # an exceedance budget, and separate catastrophic/decision checks.
+        v2_reference = root / "v2-reference"
+        v2_candidate = root / "v2-candidate"
+        v2_reference.mkdir()
+        v2_candidate.mkdir()
+        (v2_reference / "manifest").write_text("fixture=reference\n")
+        (v2_candidate / "manifest").write_text("fixture=candidate\n")
+
+        def dump_series(candidate_logits: list[float],
+                        first_logits: list[float] | None = None) -> None:
+            for index in range(300):
+                ref_path = v2_reference / f"decode_{index:06d}.logits.json"
+                cand_path = v2_candidate / f"decode_{index:06d}.logits.json"
+                dump(ref_path, [0.0, 1.0, 2.0, 3.0])
+                dump(cand_path, first_logits if index == 0 and first_logits
+                     is not None else candidate_logits)
+                for path in (ref_path, cand_path):
+                    value = json.loads(path.read_text())
+                    value["decode_step"] = index
+                    value["position"] = 2048 + index
+                    path.write_text(json.dumps(value))
+
+        v2_thresholds = root / "thresholds-v2.json"
+        v2_thresholds.write_text(json.dumps({
+            "schema_version": 2,
+            "baseline_id": "synthetic-v2",
+            "min_teacher_steps": 300,
+            "allow_quality_difference": False,
+            "decision": {
+                "e_bound": 0.05,
+                "confidence_level": 0.95,
+                "max_near_tie_cluster_rate_upper": 0.13,
+            },
+            "distribution": {
+                "bootstrap_method": "bca",
+                "bootstrap_resamples": 1999,
+                "bootstrap_seed": 19,
+                "cluster_mode": "case-or-contiguous-block",
+                "block_size": 16,
+                "min_clusters": 10,
+                "max_mean_kl_upper": 0.001,
+                "max_mean_tvd_upper": 0.005,
+                "max_mean_teacher_nll_delta_upper": 0.01,
+                "min_same_top1_cluster_rate_lower": 0.87,
+                "soft_limits": {
+                    "centered_p99_abs": 0.1,
+                    "centered_nrms": 0.1,
+                    "kl": 0.001,
+                    "tvd": 0.01,
+                },
+                "max_soft_exceedance_cluster_rate_upper": 0.21,
+            },
+            "safety": {
+                "max_centered_abs": 2.0,
+                "max_centered_nrms": 2.0,
+                "max_kl": 0.5,
+                "max_tvd": 0.75,
+                "max_abs_teacher_nll_delta": 1.0,
+            },
+        }))
+
+        dump_series([0.3, 1.3, 2.3, 3.3])
+        shifted = run(str(v2_reference), str(v2_candidate),
+                      "--thresholds", str(v2_thresholds))
+        assert shifted.returncode == 0, shifted.stderr
+        shifted_summary = json.loads(shifted.stdout)
+        assert shifted_summary["passed"] is True
+        assert abs(shifted_summary["max_abs_common_logit_shift"] - 0.3) < 1e-12
+        assert shifted_summary["max_centered_abs"] < 1e-12
+
+        # One ordinary soft-tail exceedance is reported and budgeted instead
+        # of turning a historical per-position maximum into an identity rule.
+        dump_series([0.0, 1.0, 2.0, 3.0], [0.2, 1.0, 2.0, 3.0])
+        one_tail = run(str(v2_reference), str(v2_candidate),
+                       "--thresholds", str(v2_thresholds))
+        assert one_tail.returncode == 0, one_tail.stderr
+        one_tail_summary = json.loads(one_tail.stdout)
+        assert one_tail_summary["aggregate_gate"]["soft_exceedances"] == 1
+        assert one_tail_summary["aggregate_gate"]["soft_exceedance_clusters"] == 1
+        assert one_tail_summary["aggregate_gate"]["bootstrap"]["clusters"] == 19
+        assert one_tail_summary["passed"] is True
+
+        dump_series([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 3.01, 2.99])
+        v2_far = run(str(v2_reference), str(v2_candidate),
+                     "--thresholds", str(v2_thresholds))
+        assert v2_far.returncode == 1
+        assert json.loads(v2_far.stdout)["far_margin_inversions"] == 1
+
+        dump_series([0.0, 1.0, 2.0, 3.0], [20.0, 1.0, 2.0, 3.0])
+        catastrophic = run(str(v2_reference), str(v2_candidate),
+                           "--thresholds", str(v2_thresholds))
+        assert catastrophic.returncode == 1
+        assert json.loads(catastrophic.stdout)["envelope_breaches"] == 1
     print("test_compare_teacher_logits: PASS")
     return 0
 

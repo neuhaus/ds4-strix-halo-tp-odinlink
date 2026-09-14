@@ -13,6 +13,7 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$REPO/scripts/ds4-research-root.sh"
 BENCH_CONFIG=${DS4_BENCH_CONFIG:-$REPO/bench.env.local}
+# shellcheck disable=SC1090
 [[ ! -r $BENCH_CONFIG ]] || source "$BENCH_CONFIG"
 # The launched ranks run under env -i for reproducibility.  Preserve explicitly
 # set runtime switches instead of silently dropping them; command-line NAME=VALUE
@@ -203,7 +204,7 @@ CORE_BUILD_INPUTS=(
 for binary in "$REPO/ds4" "$SCORER"; do
   for source in "${CORE_BUILD_INPUTS[@]}"; do
     [[ ! -e $source || ! $source -nt $binary ]] || {
-      echo "error: $(basename "$binary") is stale relative to ${source#$REPO/}; rebuild ds4 and the quality scorer together" >&2
+      echo "error: $(basename "$binary") is stale relative to ${source#"$REPO"/}; rebuild ds4 and the quality scorer together" >&2
       exit 1
     }
   done
@@ -418,6 +419,11 @@ if [[ $TEACHER_ARM == attn-gemm-f32 || $TEACHER_ARM == attn-exact-split ]]; then
 fi
 TARGET_TOKENS=$(awk -F'\t' 'NR > 1 {sum += $3} END {print sum+0}' "$SCORES")
 printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
+EFFECTIVE_ENV=()
+for _item in "${COMMON_ENV[@]}"; do
+  [[ $_item =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] && EFFECTIVE_ENV+=("$_item")
+done
+printf -v EFFECTIVE_ENV_Q '%q ' "${EFFECTIVE_ENV[@]}"
 if [[ -n $TEACHER_LOGITS_DIR ]]; then
   ACTUAL_DUMPS=$(find "$TEACHER_LOGITS_DIR" -maxdepth 1 -type f \
     -name 'decode_*.logits.json' | wc -l)
@@ -456,6 +462,9 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
     printf 'teacher_positions=%s\n' "$TARGET_TOKENS"
     printf 'teacher_arm=%s\n' "$TEACHER_ARM"
     printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+    printf 'common_env=%s\n' "$EFFECTIVE_ENV_Q"
+    printf 'worker_env=%s\n' "$EFFECTIVE_ENV_Q"
+    printf 'coordinator_env=%s\n' "$EFFECTIVE_ENV_Q"
     printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
     printf 'coordinator_features=%s\n' "$COORD_FEATURES"
     printf 'worker_features=%s\n' "$WORKER_FEATURES"
@@ -487,6 +496,9 @@ fi
   printf 'peer_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
   printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
   printf 'dspark=0\n'
+  printf 'common_env=%s\n' "$EFFECTIVE_ENV_Q"
+  printf 'worker_env=%s\n' "$EFFECTIVE_ENV_Q"
+  printf 'coordinator_env=%s\n' "$EFFECTIVE_ENV_Q"
   printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
 } > "$SCORES_MANIFEST"
 echo "scores=$SCORES"

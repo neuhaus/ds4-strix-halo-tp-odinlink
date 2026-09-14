@@ -14,19 +14,21 @@ FIELDS = [
 ]
 
 
-def write_scores(path: Path, averages: list[float], top1: int = 9,
-                 api_count: int = 10) -> None:
+def write_scores(path: Path, averages: list[float], top1: int | list[int] = 9,
+                 api_count: int | list[int] = 10) -> None:
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS, delimiter="\t")
         writer.writeheader()
         for index, average in enumerate(averages):
+            case_top1 = top1[index] if isinstance(top1, list) else top1
+            case_count = api_count[index] if isinstance(api_count, list) else api_count
             writer.writerow({
                 "id": f"case_{index:03d}", "target_tokens": 10,
                 "nll": average * 10, "avg_nll": average,
-                "api_top1_count": api_count,
-                "api_top1_match": top1 if api_count else 0,
-                "api_pair_total": api_count,
-                "api_pair_agree": 9 if api_count else 0,
+                "api_top1_count": case_count,
+                "api_top1_match": case_top1 if case_count else 0,
+                "api_pair_total": case_count,
+                "api_pair_agree": min(9, case_count) if case_count else 0,
             })
     path.with_suffix(".manifest").write_text(
         "model=/model.gguf\nmodel_size=1\nmodel_sample_sha256=" + "a" * 64 +
@@ -90,6 +92,86 @@ def main() -> int:
         assert no_api_result["passed"] is False
         assert no_api_result["blockers"]
         assert "paired NLL screen was still reported" in no_api.stderr
+
+        v2_thresholds = root / "thresholds-v2.json"
+        v2_thresholds.write_text(json.dumps({
+            "schema_version": 2,
+            "baseline_id": "sha256:" + "2" * 64,
+            "min_cases": 20,
+            "min_target_tokens": 200,
+            "bootstrap": {
+                "method": "bca",
+                "resamples": 1999,
+                "seed": 23,
+                "nll_confidence_level": 0.95,
+                "api_confidence_level": 0.99,
+            },
+            "nll": {"max_delta_upper": 0.05, "max_case_delta": 0.2},
+            "api": {
+                "required": True,
+                "min_cases": 20,
+                "min_top1_delta_lower": -0.02,
+                "min_pair_delta_lower": -0.02,
+            },
+        }))
+        base = [0.5 + 0.01 * (index % 5) for index in range(20)]
+        write_scores(reference, base)
+        write_scores(candidate, base)
+        v2_exact = subprocess.run(
+            [str(TOOL), str(reference), str(candidate),
+             "--thresholds", str(v2_thresholds)],
+            text=True, capture_output=True, check=False)
+        assert v2_exact.returncode == 0, v2_exact.stderr
+        v2_result = json.loads(v2_exact.stdout)
+        assert v2_result["schema_version"] == 2
+        assert v2_result["metrics"]["paired_bootstrap"][
+            "weighted_nll_delta"]["one_sided_upper"] == 0.0
+
+        # A large number of correlated alternatives in one degraded case does
+        # not masquerade as a precise token-level estimate: whole cases are
+        # resampled and the one-sided paired lower bound fails.
+        large_counts = [100000] * 20
+        reference_matches = [90000] * 20
+        candidate_matches = list(reference_matches)
+        candidate_matches[0] = 0
+        write_scores(reference, base, top1=reference_matches,
+                     api_count=large_counts)
+        write_scores(candidate, base, top1=candidate_matches,
+                     api_count=large_counts)
+        clustered_drop = subprocess.run(
+            [str(TOOL), str(reference), str(candidate),
+             "--thresholds", str(v2_thresholds)],
+            text=True, capture_output=True, check=False)
+        assert clustered_drop.returncode != 0
+        clustered_result = json.loads(clustered_drop.stdout)
+        assert clustered_result["metrics"]["paired_bootstrap"][
+            "api_top1_rate_delta"]["one_sided_lower"] < -0.02
+
+        # A local loss cannot hide behind an acceptable corpus average.
+        write_scores(reference, base)
+        localized = list(base)
+        localized[0] += 0.5
+        write_scores(candidate, localized)
+        local_loss = subprocess.run(
+            [str(TOOL), str(reference), str(candidate),
+             "--thresholds", str(v2_thresholds)],
+            text=True, capture_output=True, check=False)
+        assert local_loss.returncode != 0
+        assert json.loads(local_loss.stdout)["metrics"][
+            "max_case_avg_nll_delta"] > 0.2
+
+        optional = json.loads(v2_thresholds.read_text())
+        optional["api"]["required"] = False
+        optional["api"]["min_cases"] = 0
+        v2_thresholds.write_text(json.dumps(optional))
+        write_scores(reference, base, api_count=0)
+        write_scores(candidate, [value - 0.01 for value in base], api_count=0)
+        optional_api = subprocess.run(
+            [str(TOOL), str(reference), str(candidate),
+             "--thresholds", str(v2_thresholds)],
+            text=True, capture_output=True, check=False)
+        assert optional_api.returncode == 0, optional_api.stderr
+        assert json.loads(optional_api.stdout)["api_screen_passed"] is True
     print("test_compare_quality_scores: PASS")
     return 0
 
