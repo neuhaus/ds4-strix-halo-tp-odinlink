@@ -22,78 +22,19 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| Huihui Q2_K over RoCE v2 | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | archived branch probe; exact FNV `2a44e523bf2d7947` |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run | **233.53 t/s** | **19.96 t/s** | measured on unmerged successor `9fefea6`, 2026-09-14; FNV `5e0fa38210276c41`, zero fallback |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
-| **Huihui Q4_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **314.68 t/s** | **21.12 t/s** | three-run FNV repeat; median 313.13/21.12; zero fallback; 100-case continuation quality identical to main |
-| **Huihui Q2_K 0731 over RoCE v2 (successor gate)** | clean artifact `9fefea6`, 2,048 prompt + 300 decode | **233.53 t/s** | **19.96 t/s** | two-run FNV repeat; midpoint 235.89/19.94; zero fallback; 100-case continuation quality identical to main |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-The registered-slab attention exchange is validated with both listed Q4_K
-layouts and both RDMA providers. On the affected OdinLink pair, the second
-Q4_K layout improved from 147.99 to **286.29 prefill t/s** while preserving
-**21.10 decode t/s**; its matched RoCE v2 run reached **319.05/21.22 t/s**.
-Both kept the exact token fingerprint and zero fallback. The repair reuses the
-existing communication slab, adds no cache, and replaces a separate 32 MiB
-attention-output allocation at the validated 2,048-row cap.
+These are unmerged single-run results; Huihui and Antirez use different models
+and are not directly comparable. Paired 100-case Q4/Q2 quality scores matched
+`main`; the required 8K gate is pending.
 
-The successor-gate rows use the Huihui 0731 Q2/Q4 files and the clean
-`research/glm53-flash-roce-v2-successor-20260914` artifact. Their FNV values
-are deterministic generated-token fingerprints for the complete workload and
-configuration; they are not model-file checksums. The older fingerprints above
-remain valid for their archived model/configuration checkpoints and are kept
-for reproducibility.
-
-## Quality test
-
-FNV is only the trajectory check. The independent quality test scores the
-tracked 100-case official-continuation fixture by target-token NLL and API
-top-1/pair agreement, then applies the predeclared thresholds in
-`quality-thresholds.successor.json`:
-
-```sh
-make -j3 strix-halo-quality-score
-./scripts/run-successor-quality-test.sh successor-q4 \
-  /absolute/path/DeepSeek-V4-Flash-Q4_K-0731.gguf \
-  /path/to/reference.tsv
-```
-
-The command runs the TP scorer over mandatory RoCE v2 and writes the score,
-provenance manifest, and paired comparison under `$DS4_RESEARCH_ROOT`. It
-fails closed when the 100-case/2,289-token minimum, NLL confidence bound, or
-API agreement checks are not met. `REFERENCE.tsv` must be a score from the
-approved quality anchor using the same tracked fixture.
-The build target links the scorer and worker from the same freshly built core
-objects and checks the gfx1151 ROCm toolchain; deploy that worker binary to the
-peer before running the test.
-The fixture is selected from the GGUF architecture: DeepSeek uses `flash`,
-GLM5.3 uses `glm53-flash-openrouter-zai-fp8-100`. A newly measured `main`
-reference provides a paired regression screen; it does not by itself establish
-an approved immutable quality anchor or authorize promotion.
-The DeepSeek fixture's API logprobs use `0`/`-9999` values. Its API agreement
-columns are ordering checks, not calibrated probability-error measurements;
-NLL is computed from the local model's probabilities of the official tokens.
-
-The 2026-09-14 paired run compared clean `main` (`8f75659`) with clean
-successor `8fedc37`, whose inference sources and scorer are unchanged from
-the timed `9fefea6` artifact. Each model scored 100 cases and 2,289 target
-tokens over required RoCE v2 on both ranks, with the same effective settings
-and unchanged GGUF. The complete score TSVs matched byte for byte:
-
-| DeepSeek 0731 model | Main NLL | Successor NLL | API top-1, both | API pair agreement, both |
-|---|---:|---:|---:|---:|
-| Q4_K | 0.518347917 | 0.518347917 | 84.6221% | 98.5708% |
-| Q2_K | 0.560052157 | 0.560052157 | 83.4426% | 98.4876% |
-
-Every per-case NLL delta is zero at recorded precision; both the gate's
-paired CI95 and the separate descriptive bootstrap CI99 are `[0, 0]`.
-This establishes no measured short-continuation quality regression relative
-to current main, with no evidence of positive drift. It does not establish
-the effect of every historical FNV change or replace the final 8,192+300
-quality/numerical gate, frozen-logit comparison, or immutable-anchor approval.
-The branch remains unmerged. Raw scores, clean manifests, both-rank logs,
-comparisons, bootstrap reports, build recipes and the Grok review are under
-`$DS4_RESEARCH_ROOT/candidates/successor-quality-20260914/`.
+The cache-free slab repair preserved exact fingerprints and zero fallback across
+both Q4_K layouts and RDMA providers. On the affected layout, OdinLink prefill
+improved from 147.99 to **286.29 t/s** at **21.10 decode t/s**; RoCE v2 reached
+**319.05/21.22 t/s**.
 
 ### Q4_K throughput through 10K context
 
@@ -113,25 +54,36 @@ DS4_BENCH_RDMA_PROFILE=roce-v2 \
 
 ### GLM-5.3 Flash TP=2 performance
 
-These `ds4-bench-tp` results use the diverse 4,096-token prefill plus
-300-token decode workload at batch 256. The staged GLM-5.3 Flash TP=2 path is
-included in this fork and remains isolated from DeepSeek's graph executor.
+These `ds4-bench-tp` results use 300-token decode at batch 256, with prompt
+lengths shown per row (4,096 for Q4 and 2,048 for Q2). The staged GLM-5.3
+Flash TP=2 path is included in this fork and remains isolated from
+DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256 | **95.42 t/s** | **9.95 t/s** | current source-clean run; exact FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; one run | **100.38 t/s** | **10.95 t/s** | restored research recipe, 2026-09-14; FNV `9012bd4d7c5ce422`, zero fallback; diagnostic, not promoted |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256 | **52.74 t/s** | **10.35 t/s** | current source-clean mixed IQ2_XXS/Q2_K run; exact FNV `4dabfb16bc99c81b` |
 
-The Q4_K path keeps all 4,096 prompt rows batched, adds no persistent weight
-cache, and uses 45.07 MiB of reusable scratch per rank.
+The Q4_K RoCE v2 row uses the unchanged original Antirez GGUF and reports
+steady decode (overall decode: 10.94 t/s). It restores
+`DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED=1` on frozen research executables;
+their original build provenance is incomplete, and the underlying Q8 path's
+quality gate remains open. It is not a source-bound release benchmark or a
+successor-branch measurement. Evidence and executable hashes are recorded in
+`$DS4_RESEARCH_ROOT/candidates/glm53-flash-roce-v2-20260912/prefill-recipe-repair-20260914.md`;
+the run is `bench-runs/glm53-recipe-check-4096-shared1-r3bin-r1` within that
+candidate directory. The source-clean main baseline remains 95.42 prefill /
+9.95 decode t/s. The 300 prefill / 20 decode t/s GLM target remains unmet.
+
+The main Q4_K path keeps all 4,096 prompt rows batched, adds no persistent
+weight cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
-followed by 300 generated tokens over mandatory RDMA. The existing Antirez Q4_K
-rows use the reference model listed below; the successor rows use the Huihui
-0731 files. The model does not fit one node's current 96 GiB ROCm aperture;
-TP=2 keeps one expert shard on each node. Q2_K and Q4_K run without a
-persistent expanded-weight cache.
+followed by 300 generated tokens over mandatory RDMA. Its main Q4_K rows
+use the Antirez reference model listed below. The Antirez Q4_K model does not
+fit one node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
+and Q4_K run without a persistent expanded-weight cache.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
@@ -161,8 +113,8 @@ policy, and maintainer gates are preserved locally under
 
 | Model source | Tested target files | Support |
 |---|---|---|
-| [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the existing Q4_K OdinLink and RoCE v2 rows. |
-| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Both files are used by the successor pre-main Q2/Q4 regression rows. |
+| [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Used for the September 14 research Q2_K and Q4_K runs. |
 | [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
