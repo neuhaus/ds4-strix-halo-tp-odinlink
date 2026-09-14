@@ -1015,14 +1015,22 @@ __global__ static void glm_indexer_scores_pool_batch_wave32_kernel(
         const float *qh = q_tile + h * 128u;
         const float *kh = key_tile + pool_lane * 128u;
         /* Match the scalar tree through its stride-32 level. */
-        const float p0 = qh[lane] * kh[lane];
-        const float p64 = qh[lane + 64u] * kh[lane + 64u];
-        const float p32 = qh[lane + 32u] * kh[lane + 32u];
-        const float p96 = qh[lane + 96u] * kh[lane + 96u];
-        float dot = (p0 + p64) + (p32 + p96);
-        dot = warp_sum_f32(dot);
-        if (lane == 0u && active)
-            score += fmaxf(dot * scale, 0.0f) * weight_tile[h];
+        const float p0 = glm_indexer_ordered_fma(
+            qh[lane], kh[lane], 0.0f);
+        const float p64 = glm_indexer_ordered_fma(
+            qh[lane + 64u], kh[lane + 64u], 0.0f);
+        const float p32 = glm_indexer_ordered_fma(
+            qh[lane + 32u], kh[lane + 32u], 0.0f);
+        const float p96 = glm_indexer_ordered_fma(
+            qh[lane + 96u], kh[lane + 96u], 0.0f);
+        float dot = glm_indexer_ordered_add(
+            glm_indexer_ordered_add(p0, p64),
+            glm_indexer_ordered_add(p32, p96));
+        dot = warp_sum_f32_ordered_w32(dot);
+        if (lane == 0u && active) {
+            score = glm_indexer_ordered_fma(
+                fmaxf(dot * scale, 0.0f), weight_tile[h], score);
+        }
     }
     if (lane == 0u && pool < n_pools) {
         scores[(uint64_t)token * score_stride + pool] = active

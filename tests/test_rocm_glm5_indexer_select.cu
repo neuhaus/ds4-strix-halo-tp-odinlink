@@ -302,10 +302,8 @@ bool run_score_batch_case(uint32_t pos0, uint32_t n_tokens,
             CHECK(got_scalar == expected,
                   "scalar batch score matches scalar selector and mask");
             if (visible_valid) {
-                CHECK(std::isfinite(got_wave) && got_wave != -FLT_MAX &&
-                          std::fabs(got_wave - got_scalar) <=
-                              2.0e-5f * std::max(1.0f, std::fabs(got_scalar)),
-                      "wave32 visible score matches scalar within bound");
+                CHECK(std::memcmp(&got_wave, &got_scalar, sizeof(float)) == 0,
+                      "wave32 visible score matches scalar bits");
             } else {
                 CHECK(got_wave == -FLT_MAX,
                       "wave32 invisible score uses finite-min sentinel");
