@@ -27,15 +27,14 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-These are unmerged single-run research results, not `main` release measurements.
-Huihui and Antirez use different model artifacts and are not directly
-comparable. Paired 100-case Huihui Q4/Q2 quality scores matched `main`; 8K
-validation remains pending.
+Unmerged single-run research results; Huihui and Antirez artifacts are not
+directly comparable. Paired 100-case Q4/Q2 quality scores matched `main`; 8K
+validation is pending.
 
-The cache-free slab repair passed both Q4_K layouts and RDMA providers with
-exact fingerprints and zero fallback. On the affected layout, OdinLink improved
-from 147.99 to **286.29 prefill t/s** at **21.10 decode t/s**; RoCE v2 reached
-**319.05/21.22 t/s**.
+The cache-free slab repair preserved exact token fingerprints with zero fallback
+on both Q4_K layouts and RDMA providers. On the affected layout, OdinLink
+prefill improved from 147.99 to **286.29 t/s** at **21.10 decode t/s**; RoCE v2
+reached **319.05/21.22 t/s**.
 
 ### Q4_K throughput through 10K context
 
