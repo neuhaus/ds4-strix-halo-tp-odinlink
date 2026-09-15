@@ -89,6 +89,7 @@ endif
 .PHONY: all help clean test test-quality-gates test-successor-quality-test test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
+	bash tests/test_quality_env.sh
 	python3 tests/test_glm5_tp_layout.py
 	./tests/test_baseline_genesis.sh
 	python3 tests/test_frontier_logits_gate.py

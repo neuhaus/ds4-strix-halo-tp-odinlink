@@ -9,6 +9,23 @@ shift 2
 EXTRA_ENV=("$@")
 [[ $TAG =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: invalid tag" >&2; exit 2; }
 
+normalize_quality_environment() {
+  local -n assignments=$1
+  local -A positions=()
+  local -a normalized=()
+  local assignment name
+  for assignment in "${assignments[@]}"; do
+    name=${assignment%%=*}
+    if [[ ${positions[$name]+present} ]]; then
+      normalized[${positions[$name]}]=$assignment
+    else
+      positions[$name]=${#normalized[@]}
+      normalized+=("$assignment")
+    fi
+  done
+  assignments=("${normalized[@]}")
+}
+
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "$REPO/scripts/ds4-research-root.sh"
@@ -310,6 +327,11 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     DS4_ROCM_TEMPORAL_COMPRESSOR=0
   )
 fi
+
+# Match env's last-assignment-wins behavior, then launch and record the same
+# unambiguous array. Defaults, explicit overrides and architecture requirements
+# have all been assembled by this point.
+normalize_quality_environment COMMON_ENV
 
 echo "quality_tag=$TAG"
 echo "ds4_sha256=$LOCAL_HASH"
