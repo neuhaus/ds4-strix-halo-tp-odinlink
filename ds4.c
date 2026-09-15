@@ -53877,6 +53877,10 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
 }
 
 uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
+#if defined(DS4_NO_GPU)
+    (void)e;
+    return 0u;
+#else
     if (!e) return 0u;
     uint64_t config = 0u;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
@@ -53903,6 +53907,7 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
     }
 #endif
     return config;
+#endif
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
