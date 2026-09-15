@@ -146,13 +146,100 @@ __global__ static void glm5_q8_decode_tile_pair_kernel(
     if (lane == 0u) { out0[row] = acc0; out1[row] = acc1; }
 }
 
+/* MLX qmv-style output-row reuse, translated to native Q8_0. No affine
+ * codec or persistent weight copy. Each row retains mode 1's block/lane
+ * order, explicit scale rounding and wave reduction. Preserve mode 1's
+ * eight-block load window as well: row reuse alone serializes scale/weight
+ * memory latency. Two rows use eight waves, four rows use four waves. */
+template <unsigned ROWS_PER_WAVE, unsigned ROWS_PER_CTA = 16u,
+          bool BROADCAST_SCALE_BITS = false>
+__global__ static void glm5_q8_decode_multirow_kernel(
+        float *out, const unsigned char *w, const float *x,
+        uint32_t n_blocks, uint32_t n_rows, uint64_t row_bytes) {
+    extern __shared__ float sx[];
+    for (unsigned i = threadIdx.x; i < n_blocks * 32u; i += blockDim.x)
+        sx[i] = x[i];
+    __syncthreads();
+    const unsigned lane = threadIdx.x & 31u;
+    static_assert(ROWS_PER_CTA % ROWS_PER_WAVE == 0u, "complete row groups");
+    const unsigned row0 = blockIdx.x * ROWS_PER_CTA + (threadIdx.x >> 5u) * ROWS_PER_WAVE;
+    // The leaf launcher requires complete CTA tiles. All rows in this tile
+    // exist; check once after the barrier.
+    if (row0 >= n_rows) return;
+    float acc[ROWS_PER_WAVE] = {};
+    unsigned b = 0;
+    for (; b + 8u <= n_blocks; b += 8u) {
+        float inputs[8];
+        float scales[ROWS_PER_WAVE][8];
+        int8_t weights[ROWS_PER_WAVE][8];
+#pragma unroll
+        for (unsigned u = 0; u < 8u; ++u) inputs[u] = sx[(b + u) * 32u + lane];
+        if constexpr (BROADCAST_SCALE_BITS) {
+#pragma unroll
+            for (unsigned u = 0; u < 8u; ++u) {
+                uint16_t bits[ROWS_PER_WAVE] = {};
+#pragma unroll
+                for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+                    const unsigned char *blk = w + (uint64_t)(row0 + r) * row_bytes + (b + u) * 34u;
+                    if (lane == 0u)
+                        bits[r] = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8u);
+                    weights[r][u] = ((const int8_t *)(blk + 2u))[lane];
+                }
+                // Issue each row's scale/weight pair before waiting on the
+                // broadcasts, retaining the full eight-block load window.
+#pragma unroll
+                for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                    bits[r] = __shfl(bits[r], 0, 32);
+#else
+                    bits[r] = __shfl_sync(FULL_WARP_MASK, bits[r], 0, 32);
+#endif
+                    scales[r][u] = __half2float(__ushort_as_half(bits[r]));
+                }
+            }
+        } else {
+#pragma unroll
+            for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+#pragma unroll
+                for (unsigned u = 0; u < 8u; ++u) {
+                    const unsigned char *blk = w + (uint64_t)(row0 + r) * row_bytes + (b + u) * 34u;
+                    scales[r][u] = q8_0_scale_broadcast_w32(blk);
+                    weights[r][u] = ((const int8_t *)(blk + 2u))[lane];
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+#pragma unroll
+            for (unsigned u = 0; u < 8u; ++u)
+                acc[r] += q8_exact_ordered_mul(scales[r][u], (float)weights[r][u]) * inputs[u];
+        }
+    }
+    for (; b < n_blocks; ++b) {
+        const float xv = sx[b * 32u + lane];
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+            const unsigned char *blk = w + (uint64_t)(row0 + r) * row_bytes + b * 34u;
+            const float d = q8_0_scale_broadcast_w32(blk);
+            const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+            acc[r] += q8_exact_ordered_mul(d, (float)q) * xv;
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < ROWS_PER_WAVE; ++r) {
+        acc[r] = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[row0 + r] = acc[r];
+    }
+}
+
 static int glm5_q8_decode_tile_mode(void) {
 #if defined(DS4_GFX1151_WAVE32)
     const char *value = getenv("DS4_ROCM_GLM5_Q8_DECODE_TILE");
     const char *glm = getenv("DS4_GLM5_NEXT_ENABLE_ORDINARY");
     if (!glm || strcmp(glm, "1") || !value) return 0;
     const int mode = !strcmp(value, "1") ? 1 : !strcmp(value, "2") ? 2 :
-                     !strcmp(value, "3") ? 3 : 0;
+                     !strcmp(value, "3") ? 3 : !strcmp(value, "4") ? 4 :
+                     !strcmp(value, "5") ? 5 : !strcmp(value, "6") ? 6 : 0;
     if (!mode) return 0;
     static const bool supported = []() {
         int device = 0;
@@ -173,7 +260,8 @@ static int glm5_q8_decode_tile_mode(void) {
  * schedule on the same shapes for attribution. */
 static int glm5_q8_decode_tile_shape(uint32_t blocks, uint64_t rows,
                                      uint64_t stride) {
-    if (blocks == 48u && rows == 16384u && stride == 48u*34u) return 1;
+    if (blocks == 48u && (rows == 16384u || rows == 8192u) &&
+        stride == 48u*34u) return 1;
     if (blocks == 128u && rows == 1024u && stride == 128u*34u) return 2;
     if (blocks == 256u && rows == 4096u && stride == 512u*34u) return 3;
     if (blocks == 32u && rows == 4096u && stride == 64u*34u) return 4;
@@ -191,11 +279,45 @@ static cudaError_t cuda_launch_glm5_q8_decode_tile(
         stride < (uint64_t)blocks*34u || stride % 2u ||
         ((uintptr_t)w0 & 1u) || (w1 && ((uintptr_t)w1 & 1u)))
         return cudaErrorInvalidValue;
-    if (mode == 3) {
+    if (blocks == 48u && rows == 8192u && stride == 48u * 34u) {
+        static bool owned_reported;
+        if (!owned_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 owned-head q_b tile K=1536 N=8192 mode=%d\n", mode);
+            owned_reported = true;
+        }
+    }
+    // Mode6 changes only the MLA output K slice. Other shapes and paired
+    // projections retain mode1. It does not change the meanings of modes4/5.
+    if (mode == 6 && !w1 && blocks == 256u && stride == 512u * 34u) {
+        constexpr unsigned rows_per_wave = 2u;
+        constexpr unsigned waves_per_cta = 16u;
+        constexpr unsigned rows_per_cta = rows_per_wave * waves_per_cta;
+        if (rows != 4096u || rows % rows_per_cta) return cudaErrorInvalidValue;
+        static bool reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "GLM5 Q8 multirow mode=6 "
+                    "K=8192 N=4096 rows_per_cta=32 waves=16\n");
+            reported = true;
+        }
+        glm5_q8_decode_multirow_kernel<rows_per_wave, rows_per_cta, true><<<
+            rows / rows_per_cta, waves_per_cta * 32u,
+            blocks * 32u * sizeof(float), stream>>>(
+                out0, w0, x, blocks, rows, stride);
+    } else if ((mode == 4 || mode == 5) && !w1) {
+        if (mode == 4)
+            glm5_q8_decode_multirow_kernel<2u><<<
+                (rows + 15u) / 16u, 256u, blocks * 32u * sizeof(float), stream>>>(
+                    out0, w0, x, blocks, rows, stride);
+        else
+            glm5_q8_decode_multirow_kernel<4u><<<
+                (rows + 15u) / 16u, 128u, blocks * 32u * sizeof(float), stream>>>(
+                    out0, w0, x, blocks, rows, stride);
+    } else if (mode == 3) {
         glm5_q8_decode_tile_fast_kernel<<<dim3((rows + 15u) / 16u, pairs),
             256u, blocks * 32u * sizeof(float), stream>>>(
                 out0, out1, w0, w1, x, blocks, rows, stride);
-    } else if (mode == 1) {
+    } else if (mode == 1 || mode == 4 || mode == 5 || mode == 6) {
         if (w1)
             glm5_q8_decode_tile_pair_kernel<<<
                 dim3((rows + 7u)/8u), 256u, blocks*32u*sizeof(float), stream>>>(
