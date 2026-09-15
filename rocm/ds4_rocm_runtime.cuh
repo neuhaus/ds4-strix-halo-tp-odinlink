@@ -10285,7 +10285,8 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
-            "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
+            "q8_f16_cache=%.2f GiB scratch=%.2f GiB "
+            "expanded_weight_cache_bytes=%llu",
             label ? label : "",
             (double)used_b / 1073741824.0,
             (double)free_b / 1073741824.0,
@@ -10294,7 +10295,8 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
-            (double)g_cuda_tmp_bytes / 1073741824.0);
+            (double)g_cuda_tmp_bytes / 1073741824.0,
+            (unsigned long long)g_q8_f16_bytes);
     fprintf(stderr, "\n");
 }
 

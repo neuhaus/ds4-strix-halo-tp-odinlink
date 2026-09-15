@@ -5,6 +5,23 @@
 # Copy bench.env.example to bench.env.local before the first real run.
 set -euo pipefail
 
+normalize_benchmark_environment() {
+  local -n assignments=$1
+  local -A positions=()
+  local -a normalized=()
+  local assignment name
+  for assignment in "${assignments[@]}"; do
+    name=${assignment%%=*}
+    if [[ ${positions[$name]+present} ]]; then
+      normalized[${positions[$name]}]=$assignment
+    else
+      positions[$name]=${#normalized[@]}
+      normalized+=("$assignment")
+    fi
+  done
+  assignments=("${normalized[@]}")
+}
+
 TAG="${1:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 MODEL="${2:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 shift 2
@@ -35,6 +52,8 @@ DS4_CONFIG_RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE-}
 if (( ${#DS4_INVOKING_ENV[@]} )); then
   for ds4_env_name in "${!DS4_INVOKING_ENV[@]}"; do
     printf -v "$ds4_env_name" '%s' "${DS4_INVOKING_ENV[$ds4_env_name]}"
+    # The value names the variable restored by printf -v above.
+    # shellcheck disable=SC2163
     export "$ds4_env_name"
   done
 fi
@@ -146,8 +165,12 @@ ROCPROF_RANK=${DS4_BENCH_ROCPROF_RANK:-coordinator}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
 CANDIDATE_LANE=${DS4_BENCH_LANE:-A}
+CANDIDATE_ID=${DS4_BENCH_CANDIDATE_ID:-}
 BASELINE_ID=${DS4_BENCH_BASELINE_ID:-}
 EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
+PAIR_ID=${DS4_BENCH_PAIR_ID:-}
+PAIR_ORDER=${DS4_BENCH_PAIR_ORDER:-}
+PAIR_ARM=${DS4_BENCH_PAIR_ARM:-}
 TP_TIMEOUT_SEC=${DS4_BENCH_TP_TIMEOUT_SEC:-60}
 TP_TIMEOUT_EXPLICIT=${DS4_BENCH_TP_TIMEOUT_SEC+x}
 DECODE_SELF_CHECK=${DS4_BENCH_DECODE_SELF_CHECK:-0}
@@ -238,8 +261,8 @@ if [[ $CANDIDATE == 1 ]]; then
     [[ $EXPECTED_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
       echo "error: lane A candidates require DS4_BENCH_EXPECT_FNV64" >&2; exit 2;
     }
-    [[ -z $BASELINE_ID ]] || {
-      echo "error: lane A uses the exact expected fingerprint, not DS4_BENCH_BASELINE_ID" >&2; exit 2;
+    [[ $BASELINE_ID =~ ^sha256:[0-9a-f]{64}$ ]] || {
+      echo "error: lane A candidates require the active DS4_BENCH_BASELINE_ID" >&2; exit 2;
     }
   else
     [[ $BASELINE_ID =~ ^sha256:[0-9a-f]{64}$ ]] || {
@@ -258,6 +281,25 @@ if [[ $CANDIDATE == 1 ]]; then
   if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
     echo "error: candidate timing cannot dump frontier logits" >&2
     exit 2
+  fi
+  if [[ -n $PAIR_ID || -n $PAIR_ORDER || -n $PAIR_ARM ]]; then
+    [[ $PAIR_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || {
+      echo "error: paired timing requires a valid DS4_BENCH_PAIR_ID" >&2; exit 2;
+    }
+    [[ $PAIR_ORDER == AB || $PAIR_ORDER == BA ]] || {
+      echo "error: DS4_BENCH_PAIR_ORDER must be AB or BA" >&2; exit 2;
+    }
+    [[ $PAIR_ARM == control || $PAIR_ARM == candidate ]] || {
+      echo "error: DS4_BENCH_PAIR_ARM must be control or candidate" >&2; exit 2;
+    }
+  fi
+  if [[ -n $CANDIDATE_ID ]]; then
+    [[ $CANDIDATE_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || {
+      echo "error: DS4_BENCH_CANDIDATE_ID is invalid" >&2; exit 2;
+    }
+    [[ -n $PAIR_ID && -n $PAIR_ORDER && -n $PAIR_ARM ]] || {
+      echo "error: DS4_BENCH_CANDIDATE_ID is only valid for a complete headline pair" >&2; exit 2;
+    }
   fi
 elif [[ $CANDIDATE != 0 ]]; then
   echo "error: DS4_BENCH_CANDIDATE must be 0 or 1" >&2
@@ -291,6 +333,12 @@ GLM5_BF16_WMMA_QKV_FUSED=0
 GLM5_BF16_WMMA_QKV_FUSED_SEEN=0
 GLM5_BF16_QKV_DECODE_MULTIPTR=0
 GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=0
+GLM5_BF16_QKV_SHARED_A_PREFILL=0
+GLM5_BF16_QKV_SHARED_A_PREFILL_SEEN=0
+GLM5_BF16_KDA_SIX_MULTIPTR=0
+GLM5_BF16_KDA_SIX_MULTIPTR_SEEN=0
+GLM5_BF16_KDA_SIX_PREFILL=0
+GLM5_BF16_KDA_SIX_PREFILL_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -306,6 +354,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=1
       [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 0 || $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]] || {
         echo "error: DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL=*)
+      (( GLM5_BF16_QKV_SHARED_A_PREFILL_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_QKV_SHARED_A_PREFILL=${env_kv#*=}
+      GLM5_BF16_QKV_SHARED_A_PREFILL_SEEN=1
+      [[ $GLM5_BF16_QKV_SHARED_A_PREFILL == 0 ||
+         $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -330,6 +391,30 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       GLM5_BF16_WMMA_HILO_SEEN=1
       [[ $GLM5_BF16_WMMA_HILO == 0 || $GLM5_BF16_WMMA_HILO == 1 ]] || {
         echo "error: DS4_ROCM_GLM5_BF16_WMMA_HILO must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR=*)
+      (( GLM5_BF16_KDA_SIX_MULTIPTR_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_KDA_SIX_MULTIPTR=${env_kv#*=}
+      GLM5_BF16_KDA_SIX_MULTIPTR_SEEN=1
+      [[ $GLM5_BF16_KDA_SIX_MULTIPTR == 0 || $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL=*)
+      (( GLM5_BF16_KDA_SIX_PREFILL_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_KDA_SIX_PREFILL=${env_kv#*=}
+      GLM5_BF16_KDA_SIX_PREFILL_SEEN=1
+      [[ $GLM5_BF16_KDA_SIX_PREFILL == 0 || $GLM5_BF16_KDA_SIX_PREFILL == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -500,6 +585,24 @@ if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 && $GLM5_BF16_WMMA_HILO != 1 ]]; then
   echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=1 requires DS4_ROCM_GLM5_BF16_WMMA_HILO=1" >&2
   exit 2
 fi
+if [[ $GLM5_BF16_KDA_SIX_PREFILL == 1 &&
+      $GLM5_BF16_WMMA_HILO != 1 ]]; then
+  echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL=1 requires DS4_ROCM_GLM5_BF16_WMMA_HILO=1" >&2
+  exit 2
+fi
+if [[ $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 &&
+      $GLM5_BF16_WMMA_HILO != 1 ]]; then
+  echo "error: DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL=1 requires DS4_ROCM_GLM5_BF16_WMMA_HILO=1" >&2
+  exit 2
+fi
+if [[ $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 &&
+      ( $GLM5_BF16_WMMA_QKV_FUSED == 1 ||
+        $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ||
+        $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
+        $GLM5_BF16_KDA_SIX_PREFILL == 1 ) ]]; then
+  echo "error: shared-A prefill must be tested independently of the QKV decode/six-pointer selectors" >&2
+  exit 2
+fi
 if [[ (-n $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ||
        -n $GLM5_SPARSE_ATTN_COMPARE_F16_POS) &&
       $GLM5_SPARSE_ATTN_COMPARE_F16 != 1 ]]; then
@@ -642,8 +745,16 @@ elif (( GLM5_SPARSE_ATTN_F16_GEMM_SEEN == 1 )); then
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2
   exit 2
+elif (( GLM5_BF16_QKV_SHARED_A_PREFILL_SEEN == 1 )); then
+  echo "error: DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL applies only to GLM5 benchmarks" >&2
+  exit 2
 fi
 CURRENT_OPT_ENV=()
+if [[ $CANDIDATE == 1 ]]; then
+  # Promotion proofs parse every emitted report and require this exact counter
+  # to remain zero. The report is outside the timed regions.
+  CURRENT_OPT_ENV+=(DS4_METAL_MEMORY_REPORT=1)
+fi
 if [[ $DSPARK == 1 ]]; then
   [[ $MODEL_ARCH != glm5-next ]] || {
     echo "error: GLM5.3 ordinary TP benchmark does not support DSpark/MTP" >&2
@@ -859,7 +970,9 @@ WORKER_ENV+=("${EXTRA_ENV[@]}")
 COORD_ENV+=("${EXTRA_ENV[@]}")
 
 COORD_LOG="$OUT/coordinator-$TAG.log"
+COORD_STATUS="$OUT/coordinator-$TAG.status"
 WORKER_LOG="$OUT/worker-$TAG.log"
+LOCAL_WORKER_STATUS="$OUT/worker-$TAG.status"
 REMOTE_WORKER_LOG="$PEER_OUT/worker-$TAG.log"
 CSV="$OUT/$TAG.csv"
 MANIFEST="$OUT/$TAG.manifest"
@@ -980,7 +1093,26 @@ BINARY_RUNPATH=$(LC_ALL=C readelf -d "$REPO/ds4" 2>/dev/null |
 [[ -n $BINARY_RUNPATH ]] || BINARY_RUNPATH=none
 TOOLCHAIN_ID=${DECLARED_TOOLCHAIN_ID:-elf-comment-sha256:$BINARY_TOOLCHAIN_SHA256}
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
+BENCH_PRODUCER_SOURCE_SHA256=$(sha256sum "$REPO/ds4_bench.c" | awk '{print $1}')
+if ! BENCH_BINARY_PRODUCER_SOURCE_SHA256=$(
+  "$REPO/ds4-bench-tp" --producer-source-sha256 2>/dev/null
+); then
+  echo "error: benchmark binary has no producer source identity; rebuild it" >&2
+  exit 1
+fi
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+  echo "error: benchmark binary returned an invalid producer source identity" >&2
+  exit 1
+}
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 == "$BENCH_PRODUCER_SOURCE_SHA256" ]] || {
+  echo "error: benchmark binary is stale for ds4_bench.c; rebuild it" >&2
+  exit 1
+}
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+TP_LAYOUT_FIELDS=
+if [[ $MODEL_ARCH == glm5-next && ${ROUTED_FAMILY:-} == Q4_K ]]; then
+  TP_LAYOUT_FIELDS=$(python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL")
+fi
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   FROZEN_TOKEN_HASH=$(sha256sum "$FROZEN_TOKEN_FILE" | awk '{print $1}')
@@ -994,6 +1126,14 @@ fi
 # token trajectory and the selected kernel path.
 SOURCE_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
 RUN_ID="$(date -u +%Y%m%dT%H%M%S.%NZ)-$$-${RANDOM}"
+COMMON_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
+WORKER_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
+COORD_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
+# Record the same unambiguous, last-assignment-wins environment that is launched.
+# Diagnostic overrides and explicit settings may repeat a profile default.
+for environment_array in COMMON_ENV WORKER_ENV COORD_ENV EXTRA_ENV; do
+  normalize_benchmark_environment "$environment_array"
+done
 if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
    git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
   SOURCE_DIRTY=0
@@ -1017,8 +1157,11 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
   printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
   printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
+  printf 'ds4_bench_producer_source_sha256=%s\n' \
+    "$BENCH_BINARY_PRODUCER_SOURCE_SHA256"
   printf 'model=%s\n' "$MODEL"
   printf 'model_arch=%s\n' "$MODEL_ARCH"
+  [[ -z $TP_LAYOUT_FIELDS ]] || printf '%s\n' "$TP_LAYOUT_FIELDS"
   printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
   printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
   printf 'prompt=%s\n' "$PROMPT_FILE"
@@ -1046,15 +1189,22 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'glm5_bf16_wmma_hilo=%s\n' "$GLM5_BF16_WMMA_HILO"
   printf 'glm5_bf16_wmma_qkv_fused=%s\n' "$GLM5_BF16_WMMA_QKV_FUSED"
   printf 'glm5_bf16_qkv_decode_multiptr=%s\n' "$GLM5_BF16_QKV_DECODE_MULTIPTR"
+  printf 'glm5_bf16_qkv_shared_a_prefill=%s\n' "$GLM5_BF16_QKV_SHARED_A_PREFILL"
+  printf 'glm5_bf16_kda_six_multiptr=%s\n' "$GLM5_BF16_KDA_SIX_MULTIPTR"
+  printf 'glm5_bf16_kda_six_prefill=%s\n' "$GLM5_BF16_KDA_SIX_PREFILL"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
   printf 'worker_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
   printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
   printf 'candidate=%s\n' "$CANDIDATE"
+  printf 'candidate_id=%s\n' "$CANDIDATE_ID"
   printf 'candidate_lane=%s\n' "$CANDIDATE_LANE"
   printf 'baseline_id=%s\n' "$BASELINE_ID"
   printf 'expected_fnv64=%s\n' "${EXPECTED_FNV64,,}"
+  printf 'pair_id=%s\n' "$PAIR_ID"
+  printf 'pair_order=%s\n' "$PAIR_ORDER"
+  printf 'pair_arm=%s\n' "$PAIR_ARM"
   printf 'dspark=%s\n' "$DSPARK"
   printf 'common_env=%s\n' "$COMMON_ENV_Q"
   printf 'worker_env=%s\n' "$WORKER_ENV_Q"
@@ -1072,6 +1222,7 @@ if "${PEER_SSH[@]}" "pgrep -af '[d]s4 .*--role worker.*--tensor-parallel'" >/dev
 fi
 
 WORKER_STARTED=0
+WORKER_TERMINATED_BY_LAUNCHER=0
 worker_is_running() {
   "${PEER_SSH[@]}" "test -r '$WORKER_PIDFILE' || exit 1; p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 1; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- 'tp-worker-supervisor'"
 }
@@ -1089,17 +1240,38 @@ terminate_owned_worker() {
   (( WORKER_STARTED == 1 )) || return 0
   worker_is_running || return 0
   echo "warning: worker did not exit after coordinator disconnect; sending TERM to its verified PID" >&2
-  "${PEER_SSH[@]}" "p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 0; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- 'tp-worker-supervisor' || exit 1; kill -TERM \"\$p\""
+  if ! "${PEER_SSH[@]}" "p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 1; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- 'tp-worker-supervisor' || exit 1; kill -TERM \"\$p\""; then
+    echo "error: failed to send TERM to the verified worker supervisor" >&2
+    return 1
+  fi
+  WORKER_TERMINATED_BY_LAUNCHER=1
   wait_worker 60 || {
     echo "error: owned worker ignored TERM; leaving it intact to avoid unsafe GPU/RDMA teardown" >&2
     return 1
   }
 }
 
+copy_worker_evidence() {
+  local rc=0
+  if ! "${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"; then
+    echo "error: could not copy the worker log" >&2
+    rc=1
+  fi
+  if ! "${PEER_SSH[@]}" "test -r '$WORKER_STATUSFILE'"; then
+    echo "error: worker exit-status record is missing" >&2
+    rc=1
+  elif ! "${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$LOCAL_WORKER_STATUS"; then
+    echo "error: could not copy the worker exit-status record" >&2
+    rc=1
+  fi
+  return "$rc"
+}
+
 cleanup() {
   local rc=$?
   if (( WORKER_STARTED == 1 )); then
     wait_worker 180 || terminate_owned_worker || true
+    copy_worker_evidence || true
   fi
   return "$rc"
 }
@@ -1144,6 +1316,7 @@ if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
 if [[ $ROCPROF == 1 ]]; then echo "rocprof: binary=$ROCPROF_RESOLVED rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
+echo "ds4_bench_producer_source_sha256: $BENCH_BINARY_PRODUCER_SOURCE_SHA256"
 echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
 if [[ $DSPARK == 1 ]]; then echo "mtp_sample_sha256: $LOCAL_MTP_FINGERPRINT resident_q8=1"; fi
 
@@ -1187,6 +1360,13 @@ if [[ $SUPERVISOR_HASH != "$PEER_SUPERVISOR_HASH" ]]; then
 fi
 "${PEER_SSH[@]}" ": > $WORKER_STATUSFILE_Q; cd $PEER_REPO_Q || exit 1; nohup setsid '$PEER_REPO/scripts/tp-worker-supervisor.sh' $WORKER_STATUSFILE_Q $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
 WORKER_STARTED=1
+if [[ -n $CANDIDATE_ID ]]; then
+  # Pair order, arm, and switches were frozen by begin-pair. Bind this run after
+  # the remote supervisor starts successfully but before the coordinator can
+  # begin inference or expose a timing result.
+  (cd "$REPO" && python3 scripts/candidate-gate.py record-run \
+    "$CANDIDATE_ID" "$PAIR_ID" "$PAIR_ORDER" "$PAIR_ARM" "$RUN_ID")
+fi
 
 COORD_CMD=("$REPO/ds4-bench-tp")
 if [[ $ROCPROF == 1 && $ROCPROF_RANK == coordinator ]]; then
@@ -1210,6 +1390,7 @@ elif [[ $ROCPROF != 0 && $ROCPROF != 1 ]]; then
   exit 2
 fi
 
+COORD_RC=0
 "${CLEAN_ENV[@]}" "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
   --role coordinator --tensor-parallel --listen 0.0.0.0 9000 \
   --transport rdma --rocm -m "$MODEL" --prompt-file "$PROMPT_FILE" \
@@ -1220,21 +1401,69 @@ fi
   "${PREFILL_ARGS[@]}" --gen-tokens "$TOKENS" --csv "$CSV" \
   "${CANDIDATE_ARGS[@]}" \
   "${COORD_ARGS[@]}" \
-  > "$COORD_LOG" 2>&1
+  > "$COORD_LOG" 2>&1 || COORD_RC=$?
 
+COORD_SIGNAL=0
+if (( COORD_RC >= 128 )); then
+  COORD_SIGNAL=$((COORD_RC - 128))
+fi
+printf 'exit_code=%d\nsignal=%d\n' "$COORD_RC" "$COORD_SIGNAL" > "$COORD_STATUS"
+if [[ -n $CANDIDATE_ID ]]; then
+  HEADLINE_CLASSIFY_RC=0
+  HEADLINE_CSV_COMPLETE=$(python3 "$REPO/scripts/candidate-gate.py" \
+    classify-headline-result "$CSV") || {
+      HEADLINE_CLASSIFY_RC=$?
+      HEADLINE_CSV_COMPLETE=0
+    }
+  printf 'ds4-bench-launcher: headline_csv_complete=%s\n' \
+    "$HEADLINE_CSV_COMPLETE" >> "$COORD_LOG"
+fi
+
+WORKER_WAIT_FAILED=0
 wait_worker 180 || {
   echo "error: worker did not exit gracefully after STOP" >&2
   terminate_owned_worker || true
-  exit 1
+  WORKER_WAIT_FAILED=1
 }
+if [[ -n $CANDIDATE_ID ]]; then
+  printf 'ds4-bench-launcher: worker_terminated_by_launcher=%s\n' \
+    "$WORKER_TERMINATED_BY_LAUNCHER" >> "$COORD_LOG"
+fi
 WORKER_STARTED=0
 trap - EXIT
-"${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
-if ! "${PEER_SSH[@]}" "test -r '$WORKER_STATUSFILE'"; then
-  echo "error: worker exit-status record is missing" >&2
+WORKER_EVIDENCE_RC=0
+copy_worker_evidence || WORKER_EVIDENCE_RC=$?
+RESULT_RECORD_RC=0
+if [[ -n $CANDIDATE_ID && $WORKER_EVIDENCE_RC == 0 ]]; then
+  (cd "$REPO" && python3 scripts/candidate-gate.py record-result \
+    "$CANDIDATE_ID" "$PAIR_ID" "$RUN_ID" \
+    --manifest "$MANIFEST" \
+    --coordinator-log "$COORD_LOG" \
+    --coordinator-status "$COORD_STATUS" \
+    --worker-log "$WORKER_LOG" \
+    --worker-status "$LOCAL_WORKER_STATUS") || RESULT_RECORD_RC=$?
+fi
+if (( COORD_RC != 0 )); then
+  echo "error: coordinator exited with status $COORD_RC" >&2
+  exit "$COORD_RC"
+fi
+if (( WORKER_WAIT_FAILED != 0 )); then
   exit 1
 fi
-"${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$OUT/worker-$TAG.status"
+if (( WORKER_EVIDENCE_RC != 0 )); then
+  exit "$WORKER_EVIDENCE_RC"
+fi
+if [[ -n $CANDIDATE_ID ]] && (( HEADLINE_CLASSIFY_RC != 0 )); then
+  exit "$HEADLINE_CLASSIFY_RC"
+fi
+if (( RESULT_RECORD_RC != 0 )); then
+  exit "$RESULT_RECORD_RC"
+fi
+if [[ -n $TP_LAYOUT_FIELDS ]]; then
+  python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL" \
+    --logs "$COORD_LOG" "$WORKER_LOG" >/dev/null
+  echo "validated_glm5_tp_layout=q4k-ffn-intermediate,both-ranks"
+fi
 if [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]]; then
   compare_layer_re=${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-'[0-9]+'}
   compare_pos_re=${GLM5_SPARSE_ATTN_COMPARE_F16_POS:-'[0-9]+'}
@@ -1257,21 +1486,33 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     "$GLM5_SPARSE_BATCH_BRIDGE" "$GLM5_SPARSE_BATCH_VALUE" \
     "$GLM5_SPARSE_ATTN_HEAD_SHARED" "$GLM5_SPARSE_ATTN_F16_GEMM"
 fi
-if [[ $GLM5_BF16_WMMA_HILO == 1 ]]; then
+if [[ $GLM5_BF16_WMMA_HILO == 1 ||
+      $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 ||
+      $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
+      $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
   if [[ $MODEL_ARCH == glm5-next ]]; then
-    if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 ]]; then
+    if [[ $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
+          $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
+      # The six-pointer candidate owns Q/K/V plus f_a/g_a/beta.  Its
+      # engagement is counted separately because it intentionally bypasses
+      # both the batched QKV counter and the scalar fallback projections.
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[0-9]+ k=[0-9]+ v=[0-9]+ qkv_fused=[0-9]+ kda_six_fused=[1-9][0-9]* output=[0-9]+ other=[0-9]+ not_applicable=[0-9]+ hard_failure=0'
+      wmma_decode_re='GLM5 BF16 KDA six-pointer (decode|prefill) engaged'
+    elif [[ $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 ]]; then
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* kda_six_fused=0 output=[1-9][0-9]* other=[0-9]+ not_applicable=[0-9]+ hard_failure=0'
+      wmma_decode_re='GLM5 BF16 QKV shared-A prefill engaged tokens=[0-9]+'
+    elif [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 ]]; then
       if [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]]; then
-        # The one-token multipointer kernel intentionally bypasses the
-        # batched WMMA-QKV counter. Prove both its engagement and the regular
-        # hi/lo output path instead of falsely requiring qkv_fused>0.
-        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        # Decode and prefill selectors are independent. Prove the one-token
+        # kernel separately and require the requested fused prefill path.
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* kda_six_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
         wmma_decode_re='GLM5 BF16 decode QKV multiptr engaged out_dim=[0-9]+'
       else
-        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* kda_six_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
         wmma_decode_re=
       fi
     else
-      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 kda_six_fused=0 output=[1-9][0-9]* other=[0-9]+ not_applicable=[0-9]+ hard_failure=0'
       wmma_decode_re=
     fi
     for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
@@ -1308,13 +1549,15 @@ if [[ $DECODE_SELF_CHECK == 1 ]]; then
       exit 1
     }
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" \
+    "${RDMA_GID_INDEX-}" "$PEER_RDMA_DEVICE" "$RUN_ID"
   echo "TP_DECODE_SELF_CHECK_PASSED"
   exit 0
 fi
 if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" \
+    "${RDMA_GID_INDEX-}" "$PEER_RDMA_DEVICE" "$RUN_ID"
   if [[ $RECORD_TEACHER_BASELINE == 1 ]]; then
     grep -E 'ds4-bench: teacher-force control complete .*mismatch_fnv64=[0-9a-f]{16} .*enforced=0' \
       "$COORD_LOG" || {
@@ -1334,7 +1577,8 @@ if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
 fi
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" \
+    "${RDMA_GID_INDEX-}" "$PEER_RDMA_DEVICE" "$RUN_ID"
   completion=$(grep -E 'ds4-bench: frozen teacher logits complete prefix=[0-9]+ tokens=[0-9]+ ' \
     "$COORD_LOG" | tail -1 || true)
   [[ -n $completion ]] || {
@@ -1368,6 +1612,10 @@ if [[ -n $FROZEN_TOKEN_FILE ]]; then
     printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
     printf 'file_count=%s\n' "$FROZEN_COUNT"
     printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+    printf 'common_env=%s\n' "$COMMON_ENV_Q"
+    printf 'worker_env=%s\n' "$WORKER_ENV_Q"
+    printf 'coordinator_env=%s\n' "$COORD_ENV_Q"
+    printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
     printf 'dspark=0\n'
   } > "$FROZEN_LOGITS_DIR/manifest"
   echo "frozen_logits_manifest=$FROZEN_LOGITS_DIR/manifest"
@@ -1392,6 +1640,7 @@ if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
   "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE" \
-  "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
+  "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}" "$PEER_RDMA_DEVICE" \
+  "$RUN_ID"
 cat "$CSV"
 echo RUN_DONE

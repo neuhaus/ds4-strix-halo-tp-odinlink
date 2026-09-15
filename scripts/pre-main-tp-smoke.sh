@@ -8,8 +8,10 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$REPO/scripts/ds4-research-root.sh"
 Q4_MODEL=${1:?usage: pre-main-tp-smoke.sh Q4_MODEL Q2_MODEL}
 Q2_MODEL=${2:?usage: pre-main-tp-smoke.sh Q4_MODEL Q2_MODEL}
-Q4_FNV64=${DS4_PREMAIN_Q4_FNV64:-5f8a983422299d76}
-Q2_FNV64=${DS4_PREMAIN_Q2_FNV64:-f9cb3a8a17e95c71}
+# Huihui DeepSeek-V4 Flash 0731 files used by the production regression gate.
+# Older checkpoints have different deterministic trajectories.
+Q4_FNV64=${DS4_PREMAIN_Q4_FNV64:-ee2d32f1d0e4b8f4}
+Q2_FNV64=${DS4_PREMAIN_Q2_FNV64:-5e0fa38210276c41}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BENCH_CONFIG=${DS4_BENCH_CONFIG:-$REPO/bench.env.local}
 if [[ -r $BENCH_CONFIG ]]; then

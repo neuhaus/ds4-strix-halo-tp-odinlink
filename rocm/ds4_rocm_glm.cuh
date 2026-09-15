@@ -678,6 +678,9 @@ __global__ static void glm_attention_full_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    /* Every lane must finish reading the max before red[] is reused for the
+     * sum reduction.  The block spans multiple wave32s on gfx1151. */
+    __syncthreads();
     float local_sum = 0.0f;
     for (uint32_t row = threadIdx.x; row < visible; row += blockDim.x) {
         const float w = expf(scores[row] - max_score);
@@ -786,6 +789,79 @@ __global__ static void glm_indexer_score_one_kernel(
     if (threadIdx.x == 0u) scores[row] = score;
 }
 
+/* Pin the incumbent's rounded tree under the production -ffast-math build.
+ * Its product is an FMA into +0, each LDS tree step is an add, and the head
+ * sum is a serial FMA chain. Plain register expressions may contract or
+ * reassociate across statements. The public-API differential test links the
+ * production object and checks every output bit, including signed zeros. */
+__device__ __forceinline__ static float glm_indexer_ordered_fma(
+        float a, float b, float c) {
+    float result;
+    asm volatile("v_fma_f32 %0, %1, %2, %3"
+                 : "=v"(result) : "v"(a), "v"(b), "v"(c));
+    return result;
+}
+
+__device__ __forceinline__ static float glm_indexer_ordered_add(float a, float b) {
+    float result;
+    asm volatile("v_add_f32_e32 %0, %1, %2"
+                 : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+/* One wave per head computes the scalar tree concurrently for all 32 heads.
+ * A single barrier precedes lane 0's ordered head sum. No persistent key or
+ * weight copy is created. The launch requires exactly 32 heads of width 128. */
+__global__ static void glm_indexer_score_one_warp_heads_kernel(
+        float *scores, const float *q, const float *weights,
+        const char *indexer_key_cache, uint32_t n_rows, float scale) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t head = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const float *qh = q + (uint64_t)head * 128u;
+    const float *kh = reinterpret_cast<const float *>(indexer_key_cache) +
+        (uint64_t)row * 128u;
+    const float p0 = glm_indexer_ordered_fma(qh[lane], kh[lane], 0.0f);
+    const float p64 = glm_indexer_ordered_fma(qh[lane+64u], kh[lane+64u], 0.0f);
+    const float p32 = glm_indexer_ordered_fma(qh[lane+32u], kh[lane+32u], 0.0f);
+    const float p96 = glm_indexer_ordered_fma(qh[lane+96u], kh[lane+96u], 0.0f);
+    float acc = glm_indexer_ordered_add(glm_indexer_ordered_add(p0, p64),
+                                       glm_indexer_ordered_add(p32, p96));
+    acc = warp_sum_f32_ordered_w32(acc);
+    __shared__ float head_score[32];
+    if (lane == 0u) head_score[head] = fmaxf(acc * scale, 0.0f);
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float total = 0.0f;
+        for (uint32_t h = 0u; h < 32u; ++h)
+            total = glm_indexer_ordered_fma(head_score[h], weights[h], total);
+        scores[row] = total;
+    }
+}
+
+static bool glm_indexer_warp_heads_enabled(void) {
+#if defined(DS4_GFX1151_WAVE32)
+    const char *value = getenv("DS4_ROCM_GLM5_INDEXER_SCORE_WARP32");
+    const char *ordinary = getenv("DS4_GLM5_NEXT_ENABLE_ORDINARY");
+    if (!value || strcmp(value, "1") || !ordinary || strcmp(ordinary, "1"))
+        return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int checked_device = -1;
+    static thread_local bool supported = false;
+    if (device != checked_device) {
+        cudaDeviceProp prop{};
+        supported = cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+            strncmp(prop.gcnArchName, "gfx1151", 7) == 0 && prop.warpSize == 32;
+        checked_device = device;
+    }
+    return supported;
+#else
+    return false;
+#endif
+}
+
 __global__ static void glm_indexer_scores_batch_kernel(
         float *scores,
         const float *q,
@@ -825,6 +901,141 @@ __global__ static void glm_indexer_scores_batch_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0u) *dst = score;
+}
+
+/* Pool-aware score batch.  The scalar selector scores one query against the
+ * completed pool rows, then masks invalid/future pools.  This kernel keeps the
+ * same 256-thread reduction tree and operation order, but computes every
+ * query/pool pair in one launch.  It is the portable and exact rollback for
+ * the shared-query gfx1151 kernel below. */
+__global__ static void glm_indexer_scores_pool_batch_scalar_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const char *indexer_key_cache,
+        const uint32_t *pool_valid,
+        uint32_t n_pools,
+        uint32_t score_stride,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t pool_size,
+        uint32_t n_head,
+        uint32_t head_dim,
+        float scale,
+        bool cache_f16) {
+    const uint32_t pool = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (pool >= n_pools || token >= n_tokens) return;
+    float *dst = scores + (uint64_t)token * score_stride + pool;
+    const uint64_t visible_rows = (uint64_t)pos0 + token + 1u;
+    const uint32_t visible_pools = (uint32_t)(visible_rows / pool_size);
+    if (pool >= visible_pools || pool_valid[pool] == 0u) {
+        if (threadIdx.x == 0u) *dst = -3.402823466e+38F;
+        return;
+    }
+    __shared__ float partial[256];
+    float score = 0.0f;
+    for (uint32_t h = 0u; h < n_head; ++h) {
+        const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+        float acc = 0.0f;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            acc += qh[d] * glm_rocm_cache_load(
+                indexer_key_cache, (uint64_t)pool * head_dim + d,
+                cache_f16);
+        }
+        partial[threadIdx.x] = acc;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+            if (threadIdx.x < stride)
+                partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u)
+            score += fmaxf(partial[0] * scale, 0.0f) *
+                     weights[(uint64_t)token * n_head + h];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) *dst = score;
+}
+
+/* gfx1151 fast arm: one block owns eight pool rows for one query.  The query
+ * and 32 head weights are staged once in LDS; each wave32 owns one pool row.
+ * Four products are grouped as the scalar 256-thread reduction's first two
+ * tree levels, so the remaining shuffle tree has the same association while
+ * avoiding a second weight or activation allocation. */
+__global__ static void glm_indexer_scores_pool_batch_wave32_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const char *indexer_key_cache,
+        const uint32_t *pool_valid,
+        uint32_t n_pools,
+        uint32_t score_stride,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t pool_size,
+        uint32_t n_head,
+        uint32_t head_dim,
+        float scale,
+        bool cache_f16) {
+    const uint32_t token = blockIdx.y;
+    const uint32_t pool_base = blockIdx.x * 8u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t pool_lane = tid >> 5u;
+    if (token >= n_tokens || head_dim != 128u || n_head != 32u) return;
+
+    __shared__ float q_tile[32u * 128u];
+    __shared__ float weight_tile[32u];
+    __shared__ float key_tile[8u * 128u];
+    for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
+        q_tile[i] = q[((uint64_t)token * n_head * head_dim) + i];
+    }
+    if (tid < 32u)
+        weight_tile[tid] = weights[(uint64_t)token * n_head + tid];
+    for (uint32_t i = tid; i < 8u * 128u; i += 256u) {
+        const uint32_t local_pool = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t pool = pool_base + local_pool;
+        key_tile[i] = pool < n_pools
+            ? glm_rocm_cache_load(indexer_key_cache,
+                                  (uint64_t)pool * head_dim + d,
+                                  cache_f16)
+            : 0.0f;
+    }
+    __syncthreads();
+
+    const uint64_t visible_rows = (uint64_t)pos0 + token + 1u;
+    const uint32_t visible_pools = (uint32_t)(visible_rows / pool_size);
+    const uint32_t pool = pool_base + pool_lane;
+    const bool active = pool < n_pools && pool < visible_pools &&
+                        pool_valid[pool] != 0u;
+    float score = 0.0f;
+    for (uint32_t h = 0u; h < n_head; ++h) {
+        const float *qh = q_tile + h * 128u;
+        const float *kh = key_tile + pool_lane * 128u;
+        /* Match the scalar tree through its stride-32 level. */
+        const float p0 = glm_indexer_ordered_fma(
+            qh[lane], kh[lane], 0.0f);
+        const float p64 = glm_indexer_ordered_fma(
+            qh[lane + 64u], kh[lane + 64u], 0.0f);
+        const float p32 = glm_indexer_ordered_fma(
+            qh[lane + 32u], kh[lane + 32u], 0.0f);
+        const float p96 = glm_indexer_ordered_fma(
+            qh[lane + 96u], kh[lane + 96u], 0.0f);
+        float dot = glm_indexer_ordered_add(
+            glm_indexer_ordered_add(p0, p64),
+            glm_indexer_ordered_add(p32, p96));
+        dot = warp_sum_f32_ordered_w32(dot);
+        if (lane == 0u && active) {
+            score = glm_indexer_ordered_fma(
+                fmaxf(dot * scale, 0.0f), weight_tile[h], score);
+        }
+    }
+    if (lane == 0u && pool < n_pools) {
+        scores[(uint64_t)token * score_stride + pool] = active
+            ? score : -3.402823466e+38F;
+    }
 }
 
 __global__ static void glm5_kpool4_kernel(
@@ -1560,6 +1771,7 @@ __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     float *out = partial_lora + ((uint64_t)block * n_head + head) * kv_lora_dim;
     float *ms = partial_ms + ((uint64_t)block * n_head + head) * 2u;
     if (!isfinite(max_score)) {
@@ -1802,6 +2014,7 @@ __global__ static void glm_attention_indexed_decode_split_reduce_kernel(
         __syncthreads();
     }
     const float max_m = red[0];
+    __syncthreads();
     if (!isfinite(max_m)) {
         for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
             heads[(uint64_t)head * value_dim + d] = 0.0f;
@@ -2401,6 +2614,15 @@ extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
         !glm_rocm_tensor_has_cache2(indexer_key_cache, n_rows, head_dim, elem)) {
         return 0;
     }
+    const bool warp_heads = !cache_f16 && n_rows <= 8192u && n_head == 32u &&
+        head_dim == 128u && glm_indexer_warp_heads_enabled();
+    if (warp_heads) {
+        glm_indexer_score_one_warp_heads_kernel<<<n_rows, 1024>>>(
+            (float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const char *)indexer_key_cache->ptr, n_rows, scale);
+        return cuda_ok(cudaGetLastError(), "glm indexer score warp-heads launch");
+    }
     glm_indexer_score_one_kernel<<<n_rows, 256>>>((float *)scores->ptr,
                                                   (const float *)q->ptr,
                                                   (const float *)weights->ptr,
@@ -2450,6 +2672,67 @@ extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
                                                    scale,
                                                    cache_f16);
     return cuda_ok(cudaGetLastError(), "glm indexer scores batch launch");
+}
+
+extern "C" int ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t              n_pools,
+        uint32_t              score_stride,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    uint32_t end_pos = 0u;
+    if (!scores || !q || !weights || !indexer_key_cache || !pool_valid ||
+        n_pools == 0u || score_stride < n_pools || n_tokens == 0u ||
+        pool_size == 0u || n_head == 0u ||
+        head_dim == 0u || !isfinite(scale) || scale <= 0.0f ||
+        !glm_rocm_check_token_span(pos0, n_tokens, &end_pos) ||
+        end_pos == UINT32_MAX || n_tokens > 65535u ||
+        (uint64_t)(end_pos / pool_size) > n_pools ||
+        !cuda_tensor_has_elems2(scores, n_tokens, score_stride, sizeof(float)) ||
+        !cuda_tensor_has_elems3(q, n_tokens, n_head, head_dim,
+                                sizeof(float)) ||
+        !cuda_tensor_has_elems2(weights, n_tokens, n_head, sizeof(float)) ||
+        !glm_rocm_tensor_has_cache2(indexer_key_cache, n_pools, head_dim,
+                                    cache_f16 ? sizeof(__half) : sizeof(float)) ||
+        !cuda_tensor_has_f32(pool_valid, n_pools)) {
+        return 0;
+    }
+    const bool force_scalar = getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH_SCALAR") &&
+        strcmp(getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH_SCALAR"), "1") == 0;
+    if (!force_scalar && !cache_f16 && pool_size == 4u && n_head == 32u &&
+        head_dim == 128u) {
+        const uint64_t pool_blocks = ((uint64_t)n_pools + 7u) / 8u;
+        if (pool_blocks > UINT32_MAX) return 0;
+        const dim3 grid((uint32_t)pool_blocks, n_tokens, 1u);
+        glm_indexer_scores_pool_batch_wave32_kernel<<<grid, 256>>>(
+            (float *)scores->ptr, (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const char *)indexer_key_cache->ptr,
+            (const uint32_t *)pool_valid->ptr, n_pools, score_stride,
+            n_tokens, pos0,
+            pool_size, n_head, head_dim, scale, cache_f16);
+        return cuda_ok(cudaGetLastError(),
+                       "glm indexer pool batch wave32 launch");
+    }
+    const dim3 grid(n_pools, n_tokens, 1u);
+    glm_indexer_scores_pool_batch_scalar_kernel<<<grid, 256>>>(
+        (float *)scores->ptr, (const float *)q->ptr,
+        (const float *)weights->ptr,
+        (const char *)indexer_key_cache->ptr,
+        (const uint32_t *)pool_valid->ptr, n_pools, score_stride,
+        n_tokens, pos0,
+        pool_size, n_head, head_dim, scale, cache_f16);
+    return cuda_ok(cudaGetLastError(),
+                   "glm indexer pool batch scalar launch");
 }
 
 extern "C" int ds4_gpu_glm5_kpool_tensor(
@@ -2661,6 +2944,50 @@ __global__ static void glm5_expand_pool_selection_kernel(
     selected_tokens[i] = value;
 }
 
+__global__ static void glm5_expand_pool_selection_batch_kernel(
+        int32_t *selected_tokens,
+        const uint32_t *selected_pools,
+        const int32_t *pool_indices,
+        const uint32_t *pool_valid,
+        const uint32_t *valid_keys,
+        uint32_t n_pools,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_rows,
+        uint32_t first_valid,
+        uint32_t selected_pool_count,
+        uint32_t token_budget,
+        uint32_t pool_size) {
+    const uint32_t token = blockIdx.y;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t output_width = token_budget + pool_size - 1u;
+    if (token >= n_tokens || i >= output_width) return;
+    const uint64_t raw_visible = (uint64_t)pos0 + token + 1u;
+    const uint32_t visible = raw_visible > first_valid
+        ? (uint32_t)(raw_visible - first_valid) : 0u;
+    const uint32_t tail_count = visible % pool_size;
+    const uint32_t expanded = selected_pool_count * pool_size;
+    int32_t value = -1;
+    if (i < expanded) {
+        const uint32_t slot = i / pool_size;
+        const uint32_t member = i % pool_size;
+        if (slot < selected_pool_count) {
+            const uint32_t pool = selected_pools[
+                (uint64_t)token * selected_pool_count + slot];
+            if (pool < n_pools && pool_valid[pool] != 0u)
+                value = pool_indices[(uint64_t)pool * pool_size + member];
+        }
+    } else if (i < expanded + pool_size - 1u) {
+        const uint32_t member = i - expanded;
+        const uint64_t tail_start = (uint64_t)first_valid + visible -
+            tail_count;
+        const uint64_t row = tail_start + member;
+        if (member < tail_count && row < n_rows &&
+            valid_keys[row] != 0u) value = (int32_t)row;
+    }
+    selected_tokens[(uint64_t)token * output_width + i] = value;
+}
+
 extern "C" int ds4_gpu_glm5_mask_pool_scores_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *pool_valid,
@@ -2718,6 +3045,57 @@ extern "C" int ds4_gpu_glm5_expand_pool_selection_tensor(
             selected_pool_count, n_rows, first_valid, visible_count,
             token_budget);
     return cuda_ok(cudaGetLastError(), "glm5 expand pool selection launch");
+}
+
+extern "C" int ds4_gpu_glm5_expand_pool_selection_batch_tensor(
+        ds4_gpu_tensor       *selected_tokens,
+        const ds4_gpu_tensor *selected_pools,
+        const ds4_gpu_tensor *pool_indices,
+        const ds4_gpu_tensor *pool_valid,
+        const ds4_gpu_tensor *valid_keys,
+        uint32_t              n_pools,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              first_valid,
+        uint32_t              selected_pool_count,
+        uint32_t              token_budget,
+        uint32_t              pool_size) {
+    uint32_t end_pos = 0u;
+    if (!selected_tokens || !selected_pools || !pool_indices ||
+        !pool_valid || !valid_keys || !selected_tokens->ptr ||
+        !selected_pools->ptr || !pool_indices->ptr || !pool_valid->ptr ||
+        !valid_keys->ptr || n_pools == 0u || n_tokens == 0u ||
+        n_rows == 0u || pool_size == 0u || token_budget == 0u ||
+        token_budget % pool_size != 0u ||
+        token_budget > DS4_GLM5_NEXT_INDEX_TOP_K ||
+        selected_pool_count == 0u || selected_pool_count > n_pools ||
+        selected_pool_count > token_budget / pool_size || first_valid > n_rows ||
+        !glm_rocm_check_token_span(pos0, n_tokens, &end_pos) ||
+        end_pos > n_rows || end_pos == UINT32_MAX || first_valid != 0u ||
+        (uint64_t)(end_pos / pool_size) > n_pools) {
+        return 0;
+    }
+    const uint32_t output_width = token_budget + pool_size - 1u;
+    if (!cuda_tensor_has_elems2(selected_tokens, n_tokens, output_width,
+                                sizeof(int32_t)) ||
+        !cuda_tensor_has_elems2(selected_pools, n_tokens,
+                                selected_pool_count, sizeof(uint32_t)) ||
+        !cuda_tensor_has_elems2(pool_indices, n_pools, pool_size,
+                                sizeof(int32_t)) ||
+        !cuda_tensor_has_f32(pool_valid, n_pools) ||
+        !cuda_tensor_has_f32(valid_keys, n_rows)) return 0;
+    const uint32_t threads = 256u;
+    const dim3 grid((output_width + threads - 1u) / threads, n_tokens, 1u);
+    glm5_expand_pool_selection_batch_kernel<<<grid, threads>>>(
+        (int32_t *)selected_tokens->ptr,
+        (const uint32_t *)selected_pools->ptr,
+        (const int32_t *)pool_indices->ptr,
+        (const uint32_t *)pool_valid->ptr,
+        (const uint32_t *)valid_keys->ptr, n_pools, n_tokens, pos0, n_rows,
+        first_valid, selected_pool_count, token_budget, pool_size);
+    return cuda_ok(cudaGetLastError(),
+                   "glm5 expand pool selection batch launch");
 }
 
 extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
@@ -3120,6 +3498,7 @@ __global__ static void glm_causal_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = s < visible ? expf(row[s] - max_score) : 0.0f;
@@ -3170,6 +3549,7 @@ __global__ static void glm_causal_gemm_softmax_f32_kernel(
         __syncthreads();
     }
     const float row_max = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = expf(row[s] - row_max);
@@ -3324,6 +3704,7 @@ __global__ static void glm_causal_gemm_softmax_heads_f32_kernel(
         __syncthreads();
     }
     const float row_max = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = expf(row[s] - row_max);
@@ -3504,6 +3885,7 @@ __global__ static void glm_selected_gemm_softmax_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = expf(row[s] - max_score);
@@ -3607,6 +3989,7 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
     float sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
         const float v = expf(row[s] - max_score);

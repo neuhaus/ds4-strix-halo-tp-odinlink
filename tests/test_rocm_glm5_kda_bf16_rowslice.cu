@@ -33,6 +33,36 @@ struct RuntimeGuard {
     ~RuntimeGuard() { if (active) ds4_gpu_cleanup(); }
 };
 
+struct EnvironmentGuard {
+    const char *name;
+    const bool had_value;
+    const std::string saved_value;
+    bool restored = false;
+
+    explicit EnvironmentGuard(const char *env_name)
+        : name(env_name), had_value(std::getenv(env_name) != nullptr),
+          saved_value(std::getenv(env_name) ? std::getenv(env_name) : "") {}
+
+    ~EnvironmentGuard() { restore(); }
+
+    bool set(const char *value) {
+        return ::setenv(name, value, 1) == 0;
+    }
+
+    bool clear() {
+        return ::unsetenv(name) == 0;
+    }
+
+    void restore() {
+        if (restored) return;
+        if (had_value)
+            (void)::setenv(name, saved_value.c_str(), 1);
+        else
+            (void)::unsetenv(name);
+        restored = true;
+    }
+};
+
 struct Tensors {
     std::vector<ds4_gpu_tensor *> values;
     ~Tensors() {
@@ -86,6 +116,87 @@ double cosine(const ErrorStats &stats) {
         std::max(stats.reference_sq * stats.candidate_sq,
                  (long double)1.0e-60));
     return (double)(stats.dot / denom);
+}
+
+bool run_kda_six_prefill_selector_guard() {
+    EnvironmentGuard prefill(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
+    EnvironmentGuard graph_dump("DS4_ROCM_GRAPH_DUMP_PREFIX");
+    EnvironmentGuard graph_dump_noninvasive(
+        "DS4_ROCM_GRAPH_DUMP_NONINVASIVE");
+    CHECK(prefill.set("1") && graph_dump.clear() &&
+              graph_dump_noninvasive.clear(),
+          "prepare six-prefill selector guard environment");
+
+    constexpr uint32_t tokens = 256u;
+    constexpr uint32_t in_dim = 4096u;
+    constexpr uint32_t low_dim = 128u;
+    constexpr uint32_t beta_dim = 32u;
+    const auto fake_tensor = [](uint64_t address, uint64_t bytes) {
+        ds4_gpu_tensor tensor = {};
+        tensor.ptr = reinterpret_cast<void *>((uintptr_t)address);
+        tensor.bytes = bytes;
+        tensor.device_id = -1;
+        return tensor;
+    };
+    const auto call = [&](uint32_t q_dim) {
+        const uint64_t input_bytes =
+            (uint64_t)tokens * in_dim * sizeof(float);
+        const uint64_t q_bytes =
+            (uint64_t)tokens * q_dim * sizeof(float);
+        const uint64_t low_bytes =
+            (uint64_t)tokens * low_dim * sizeof(float);
+        const uint64_t beta_bytes =
+            (uint64_t)tokens * beta_dim * sizeof(float);
+        const uint64_t base = UINT64_C(0x100000000000);
+        const uint64_t stride = UINT64_C(0x10000000000);
+        ds4_gpu_tensor input = fake_tensor(base, input_bytes);
+        ds4_gpu_tensor out_q = fake_tensor(base + stride, q_bytes);
+        ds4_gpu_tensor out_k = fake_tensor(base + 2u * stride, q_bytes);
+        ds4_gpu_tensor out_v = fake_tensor(base + 3u * stride, q_bytes);
+        ds4_gpu_tensor out_f = fake_tensor(base + 4u * stride, low_bytes);
+        ds4_gpu_tensor out_g = fake_tensor(base + 5u * stride, low_bytes);
+        ds4_gpu_tensor out_beta =
+            fake_tensor(base + 6u * stride, beta_bytes);
+        return ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+            &out_q, &out_k, &out_v, &out_f, &out_g, &out_beta,
+            reinterpret_cast<const void *>(uintptr_t(1u)), 0u,
+            0u, 0u, 0u, 0u, 0u, 0u,
+            in_dim, q_dim, low_dim, beta_dim, &input, tokens);
+    };
+
+    /* Force the runtime gate to observe the cleared graph-dump environment. */
+    ds4_gpu_set_quality(true);
+    ds4_gpu_set_quality(false);
+    const bool batch_toktile_disabled =
+        std::getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != nullptr;
+    CHECK(call(4096u) == (batch_toktile_disabled ? -1 : 0),
+          "six-prefill valid geometry reaches normal validation");
+
+    ds4_gpu_set_quality(true);
+    CHECK(call(4096u) == -1,
+          "six-prefill quality mode rolls back before launch");
+    ds4_gpu_set_quality(false);
+    CHECK(graph_dump.set("six-prefill-selector-test"),
+          "set six-prefill graph-dump guard");
+    ds4_gpu_set_quality(true);
+    ds4_gpu_set_quality(false);
+    CHECK(call(4096u) == -1,
+          "six-prefill graph dump rolls back before launch");
+
+    graph_dump.clear();
+    ds4_gpu_set_quality(true);
+    ds4_gpu_set_quality(false);
+    CHECK(call(1024u) == -1,
+          "six-prefill unsupported shape rolls back before launch");
+
+    prefill.restore();
+    graph_dump.restore();
+    graph_dump_noninvasive.restore();
+    ds4_gpu_set_quality(true);
+    ds4_gpu_set_quality(false);
+    std::fprintf(stderr, "PASS GLM5 six-prefill selector dispatch guard\n");
+    return true;
 }
 
 uint64_t fnv1a64(const void *data, uint64_t bytes) {
@@ -710,6 +821,268 @@ bool benchmark_decode_qkv_multiptr(const Glm5TestGGUF &gguf,
     return fused_ms > 0.0;
 }
 
+bool benchmark_decode_kda_six_multiptr(
+        const Glm5TestGGUF &gguf, uint64_t q_offset, uint64_t k_offset,
+        uint64_t v_offset, uint64_t f_offset, uint64_t g_offset,
+        uint64_t beta_offset) {
+    constexpr uint32_t kIn = 4096u;
+    constexpr uint32_t kQOut = 4096u;
+    constexpr uint32_t kLowOut = 128u;
+    constexpr uint32_t kBetaOut = 32u;
+    const uint64_t q_weight_bytes =
+        (uint64_t)kIn * kQOut * sizeof(uint16_t);
+    const uint64_t beta_weight_bytes =
+        (uint64_t)kIn * kBetaOut * sizeof(uint16_t);
+    std::vector<float> host_input(kIn);
+    for (uint32_t i = 0u; i < kIn; ++i) {
+        const int32_t centered =
+            (int32_t)(((uint64_t)i * 211u + 43u) % 2053u) - 1026;
+        host_input[i] = (float)centered * (1.0f / 8192.0f) +
+                        0.00390625f * std::sin((double)i * 0.023);
+    }
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(kIn);
+    const uint32_t widths[6] = {
+        kQOut, kQOut, kQOut, kLowOut, kLowOut, kBetaOut,
+    };
+    ds4_gpu_tensor *seq[6] = {};
+    ds4_gpu_tensor *fused[6] = {};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        seq[i] = tensors.f32(widths[i]);
+        fused[i] = tensors.f32(widths[i]);
+        CHECK(seq[i] && fused[i], "allocate KDA six-pointer outputs");
+    }
+    CHECK(input && ds4_gpu_tensor_write(
+                       input, 0u, host_input.data(),
+                       (uint64_t)kIn * sizeof(float)),
+          "allocate KDA six-pointer input");
+
+    const auto offsets_for_rank = [&](uint32_t rank, uint64_t offsets[6]) {
+        if (rank > 1u) return false;
+        offsets[0] = q_offset + rank * q_weight_bytes;
+        offsets[1] = k_offset + rank * q_weight_bytes;
+        offsets[2] = v_offset + rank * q_weight_bytes;
+        offsets[3] = f_offset;
+        offsets[4] = g_offset;
+        offsets[5] = beta_offset + rank * beta_weight_bytes;
+        return true;
+    };
+    const auto sequential = [&](uint32_t rank) {
+        uint64_t offsets[6] = {};
+        CHECK(offsets_for_rank(rank, offsets),
+              "resolve sequential KDA six-pointer offsets");
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            CHECK(ds4_gpu_matmul_bf16_tensor(
+                      seq[i], gguf.map, gguf.size, offsets[i], kIn,
+                      widths[i], input, 1u),
+                  "launch sequential KDA shared-input projection");
+        }
+        return true;
+    };
+    const auto multiptr = [&](uint32_t rank) {
+        uint64_t offsets[6] = {};
+        CHECK(offsets_for_rank(rank, offsets),
+              "resolve fused KDA six-pointer offsets");
+        return ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+            fused[0], fused[1], fused[2], fused[3], fused[4], fused[5],
+            gguf.map, gguf.size, offsets[0], offsets[1], offsets[2],
+            offsets[3], offsets[4], offsets[5], kIn, kQOut, kLowOut,
+            kBetaOut, input, 1u) == 1;
+    };
+    for (uint32_t rank = 0u; rank < 2u; ++rank) {
+        CHECK(sequential(rank) && multiptr(rank) && ds4_gpu_synchronize(),
+              "warm KDA six-pointer A/B");
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            std::vector<float> a(widths[i]), b(widths[i]);
+            CHECK(ds4_gpu_tensor_read(
+                      seq[i], 0u, a.data(),
+                      (uint64_t)widths[i] * sizeof(float)) &&
+                  ds4_gpu_tensor_read(
+                      fused[i], 0u, b.data(),
+                      (uint64_t)widths[i] * sizeof(float)),
+                  "read KDA six-pointer A/B");
+            CHECK(std::memcmp(a.data(), b.data(),
+                              (size_t)widths[i] * sizeof(float)) == 0,
+                  "KDA six-pointer projection bit exact");
+        }
+    }
+
+    uint64_t offsets[6] = {};
+    CHECK(offsets_for_rank(0u, offsets), "resolve KDA fail-closed offsets");
+    CHECK(ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+              fused[0], fused[1], fused[2], fused[3], fused[3], fused[5],
+              gguf.map, gguf.size, offsets[0], offsets[1], offsets[2],
+              offsets[3], offsets[4], offsets[5], kIn, kQOut, kLowOut,
+              kBetaOut, input, 1u) == 0,
+          "KDA six-pointer output alias fails closed");
+    CHECK(ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+              fused[0], fused[1], fused[2], fused[3], fused[4], fused[5],
+              gguf.map, gguf.size, offsets[0], offsets[0], offsets[2],
+              offsets[3], offsets[4], offsets[5], kIn, kQOut, kLowOut,
+              kBetaOut, input, 1u) == -1,
+          "KDA six-pointer weight alias rolls back");
+    CHECK(ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+              fused[0], fused[1], fused[2], fused[3], fused[4], fused[5],
+              gguf.map, gguf.size, offsets[0], offsets[1], offsets[2],
+              offsets[3], offsets[4], offsets[5], kIn, kQOut, kLowOut,
+              kBetaOut, input, 2u) == -1,
+          "KDA six-pointer prefill shape rolls back");
+
+    constexpr uint32_t warmup = 8u, repeats = 32u;
+    double seq_ms[2] = {}, fused_ms[2] = {};
+    const auto timed = [&](uint32_t rank, bool use_fused) -> double {
+        for (uint32_t i = 0u; i < warmup; ++i)
+            CHECK(use_fused ? multiptr(rank) : sequential(rank),
+                  "warm KDA six-pointer timing arm");
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess &&
+              hipEventRecord(begin) == hipSuccess,
+              "create KDA six-pointer timing events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(use_fused ? multiptr(rank) : sequential(rank),
+                  "launch KDA six-pointer timing arm");
+        CHECK(hipEventRecord(end) == hipSuccess &&
+              hipEventSynchronize(end) == hipSuccess,
+              "complete KDA six-pointer timing events");
+        float elapsed = 0.0f;
+        CHECK(hipEventElapsedTime(&elapsed, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess &&
+              hipEventDestroy(begin) == hipSuccess,
+              "read KDA six-pointer timing events");
+        return (double)elapsed / repeats;
+    };
+    for (uint32_t rank = 0u; rank < 2u; ++rank) {
+        seq_ms[rank] = timed(rank, false);
+        fused_ms[rank] = timed(rank, true);
+    }
+    const uint64_t total_weight_bytes =
+        3u * q_weight_bytes +
+        2u * (uint64_t)kIn * kLowOut * sizeof(uint16_t) +
+        beta_weight_bytes;
+    std::fprintf(stderr,
+        "MEASURE GLM5 BF16 KDA six-pointer M=1 "
+        "rank0_seq_ms=%.6f rank0_fused_ms=%.6f rank0_speedup=%.3fx "
+        "rank1_seq_ms=%.6f rank1_fused_ms=%.6f rank1_speedup=%.3fx "
+        "weight_gib=%.6f exact=1 repeats=%u\n",
+        seq_ms[0], fused_ms[0], seq_ms[0] / fused_ms[0],
+        seq_ms[1], fused_ms[1], seq_ms[1] / fused_ms[1],
+        (double)total_weight_bytes / (1024.0 * 1024.0 * 1024.0), repeats);
+    return fused_ms[0] > 0.0 && fused_ms[1] > 0.0;
+}
+
+bool benchmark_prefill_kda_six_multiptr(
+        const Glm5TestGGUF &gguf, uint64_t q_offset, uint64_t k_offset,
+        uint64_t v_offset, uint64_t f_offset, uint64_t g_offset,
+        uint64_t beta_offset) {
+    constexpr uint32_t kTokens = 256u;
+    constexpr uint32_t kIn = 4096u;
+    constexpr uint32_t kQOut = 4096u;
+    constexpr uint32_t kLowOut = 128u;
+    constexpr uint32_t kBetaOut = 32u;
+    const uint64_t q_weight_bytes =
+        (uint64_t)kIn * kQOut * sizeof(uint16_t);
+    const uint64_t beta_weight_bytes =
+        (uint64_t)kIn * kBetaOut * sizeof(uint16_t);
+    const uint64_t counts[6] = {
+        (uint64_t)kTokens * kQOut, (uint64_t)kTokens * kQOut,
+        (uint64_t)kTokens * kQOut, (uint64_t)kTokens * kLowOut,
+        (uint64_t)kTokens * kLowOut, (uint64_t)kTokens * kBetaOut,
+    };
+    std::vector<float> host_input((size_t)kTokens * kIn);
+    for (uint64_t i = 0u; i < host_input.size(); ++i) {
+        const int32_t centered =
+            (int32_t)((i * UINT64_C(211) + 43u) % 2053u) - 1026;
+        host_input[(size_t)i] = (float)centered * (1.0f / 8192.0f) +
+            0.00390625f * std::sin((double)(i % kIn) * 0.023);
+    }
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(host_input.size());
+    ds4_gpu_tensor *seq[6] = {};
+    ds4_gpu_tensor *fused[6] = {};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        seq[i] = tensors.f32(counts[i]);
+        fused[i] = tensors.f32(counts[i]);
+        CHECK(seq[i] && fused[i], "allocate KDA prefill six-pointer outputs");
+    }
+    CHECK(input && ds4_gpu_tensor_write(
+                       input, 0u, host_input.data(),
+                       (uint64_t)host_input.size() * sizeof(float)),
+          "upload KDA prefill six-pointer input");
+    const uint64_t offsets[6] = {
+        q_offset, k_offset, v_offset, f_offset, g_offset, beta_offset,
+    };
+    const uint32_t widths[6] = {
+        kQOut, kQOut, kQOut, kLowOut, kLowOut, kBetaOut,
+    };
+    const auto sequential = [&] {
+        for (uint32_t i = 0u; i < 6u; ++i)
+            CHECK(ds4_gpu_matmul_bf16_tensor(
+                      seq[i], gguf.map, gguf.size, offsets[i], kIn,
+                      widths[i], input, kTokens),
+                  "launch sequential KDA prefill projection");
+        return true;
+    };
+    const auto multiptr = [&] {
+        return ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+            fused[0], fused[1], fused[2], fused[3], fused[4], fused[5],
+            gguf.map, gguf.size, offsets[0], offsets[1], offsets[2],
+            offsets[3], offsets[4], offsets[5], kIn, kQOut, kLowOut,
+            kBetaOut, input, kTokens) == 1;
+    };
+    CHECK(sequential() && multiptr() && ds4_gpu_synchronize(),
+          "warm KDA prefill six-pointer A/B");
+    double max_abs[6] = {};
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        std::vector<float> a((size_t)counts[i]), b((size_t)counts[i]);
+        CHECK(ds4_gpu_tensor_read(seq[i], 0u, a.data(),
+                                  counts[i] * sizeof(float)) &&
+              ds4_gpu_tensor_read(fused[i], 0u, b.data(),
+                                  counts[i] * sizeof(float)),
+              "read KDA prefill six-pointer A/B");
+        for (size_t j = 0u; j < a.size(); ++j)
+            max_abs[i] = std::max(max_abs[i],
+                                  std::fabs((double)a[j] - b[j]));
+        CHECK(std::isfinite(max_abs[i]) && max_abs[i] <=
+                  (i < 3u ? 1.0e-4 : 5.0e-3),
+              "KDA prefill six-pointer numerical envelope");
+    }
+    constexpr uint32_t warmup = 2u, repeats = 8u;
+    const auto timed = [&](bool use_fused) -> double {
+        for (uint32_t i = 0u; i < warmup; ++i)
+            CHECK(use_fused ? multiptr() : sequential(),
+                  "warm KDA prefill six-pointer timing arm");
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess &&
+              hipEventRecord(begin) == hipSuccess,
+              "create KDA prefill six-pointer timing events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(use_fused ? multiptr() : sequential(),
+                  "launch KDA prefill six-pointer timing arm");
+        CHECK(hipEventRecord(end) == hipSuccess &&
+              hipEventSynchronize(end) == hipSuccess,
+              "complete KDA prefill six-pointer timing events");
+        float elapsed = 0.0f;
+        CHECK(hipEventElapsedTime(&elapsed, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess &&
+              hipEventDestroy(begin) == hipSuccess,
+              "read KDA prefill six-pointer timing events");
+        return (double)elapsed / repeats;
+    };
+    const double seq_ms = timed(false);
+    const double fused_ms = timed(true);
+    std::fprintf(stderr,
+        "MEASURE GLM5 BF16 KDA six-pointer M=256 "
+        "sequential_ms=%.6f fused_ms=%.6f speedup=%.3fx "
+        "max_abs_q=%.9g max_abs_k=%.9g max_abs_v=%.9g "
+        "max_abs_f=%.9g max_abs_g=%.9g max_abs_beta=%.9g repeats=%u\n",
+        seq_ms, fused_ms, seq_ms / fused_ms,
+        max_abs[0], max_abs[1], max_abs[2], max_abs[3], max_abs[4],
+        max_abs[5], repeats);
+    return fused_ms > 0.0;
+}
+
 bool benchmark_decode_qkv_stream(const Glm5TestGGUF &gguf,
                                  const std::vector<uint64_t> &offsets) {
     constexpr uint32_t kIn = 4096u;
@@ -866,13 +1239,15 @@ bool benchmark_decode_output_stream(const Glm5TestGGUF &gguf,
 }
 
 bool run_test() {
+    CHECK(run_kda_six_prefill_selector_guard(),
+          "GLM5 six-prefill selector dispatch guard");
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "DS4_GLM5_MODEL environment");
     Glm5TestGGUF gguf;
     CHECK(gguf.open_file(model), "open GLM5 GGUF");
 
     uint64_t q = 0u, k = 0u, v = 0u, output = 0u;
-    uint64_t f_b = 0u, g_b = 0u, beta = 0u;
+    uint64_t f_a = 0u, f_b = 0u, g_a = 0u, g_b = 0u, beta = 0u;
     uint64_t q_conv = 0u, k_conv = 0u, v_conv = 0u;
     uint64_t dt_bias = 0u, a_log = 0u;
     CHECK(gguf.tensor("blk.0.kda_q.weight", {4096u, 8192u}, 30u, q) &&
@@ -880,7 +1255,9 @@ bool run_test() {
           gguf.tensor("blk.0.kda_v.weight", {4096u, 8192u}, 30u, v) &&
           gguf.tensor("blk.0.kda_output.weight", {8192u, 4096u}, 30u,
                       output) &&
+          gguf.tensor("blk.0.kda_f_a.weight", {4096u, 128u}, 30u, f_a) &&
           gguf.tensor("blk.0.kda_f_b.weight", {128u, 8192u}, 30u, f_b) &&
+          gguf.tensor("blk.0.kda_g_a.weight", {4096u, 128u}, 30u, g_a) &&
           gguf.tensor("blk.0.kda_g_b.weight", {128u, 8192u}, 30u, g_b) &&
           gguf.tensor("blk.0.kda_beta.weight", {4096u, 64u}, 30u, beta) &&
           gguf.tensor("blk.0.kda_q_conv.weight", {4u, 1u, 8192u}, 0u,
@@ -969,6 +1346,12 @@ bool run_test() {
               benchmark_decode_qkv_half(gguf, "kda_k", k) &&
               benchmark_decode_qkv_half(gguf, "kda_v", v) &&
               benchmark_decode_qkv_multiptr(gguf, q, k, v) &&
+              (std::getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR") == nullptr ||
+               benchmark_decode_kda_six_multiptr(
+                   gguf, q, k, v, f_a, g_a, beta)) &&
+              (std::getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL") == nullptr ||
+               benchmark_prefill_kda_six_multiptr(
+                   gguf, q, k, v, f_a, g_a, beta)) &&
               benchmark_decode_qkv_stream(gguf, qkv_stream) &&
               benchmark_decode_output_stream(gguf, output_stream),
               "GLM5 BF16 decode projection geometry benchmark");

@@ -20,6 +20,10 @@ CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c
 CFLAGS += $(DS4_PROFILE_CFLAGS)
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
+DS4_BENCH_PRODUCER_SOURCE_SHA256 := $(shell \
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum ds4_bench.c; \
+	else shasum -a 256 ds4_bench.c; fi | awk '{print $$1}')
+DS4_BENCH_PRODUCER_CFLAGS := '-DDS4_BENCH_PRODUCER_SOURCE_SHA256="$(DS4_BENCH_PRODUCER_SOURCE_SHA256)"'
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
@@ -82,15 +86,30 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-successor-quality-test test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
+	bash tests/test_quality_env.sh
+	python3 tests/test_glm5_tp_layout.py
+	./tests/test_baseline_genesis.sh
 	python3 tests/test_frontier_logits_gate.py
 	python3 tests/test_compare_teacher_logits.py
 	python3 tests/test_compare_quality_scores.py
-	python3 tests/test_lane_c_oracle_gate.py
+	python3 tests/test_ds4_gate_stats.py
+	python3 tests/test_promotion_boundary_calibration.py
+	python3 tests/test_ds4_gate_controls.py
+	python3 tests/test_promotion_proof.py
+	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
+	./tests/run-clean-gate-python.sh tests/test_baseline_control_journal.py
+	python3 tests/test_control_anchor_env.py
 	./tests/test_glm5_prefill_proof.sh
+	./tests/test_bench_producer_identity.sh
+	./tests/test_tp_worker_supervisor.sh
+
+test-successor-quality-test:
+	@bash -n scripts/run-successor-quality-test.sh
+	@python3 -m json.tool quality-thresholds.successor.json >/dev/null
 
 test-glm5-prefill-proof:
 	./tests/test_glm5_prefill_proof.sh
@@ -139,7 +158,7 @@ tests/test_rocm_glm53_expert_window: tests/test_rocm_glm53_expert_window.o tests
 test-rocm-glm53-expert-window: tests/test_rocm_glm53_expert_window
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm53_expert_window
 
-tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_q4k_pair_probe.hpp tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o ds4_glm5_next_runtime.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
@@ -211,6 +230,17 @@ tests/ds4_rocm_compat_glm5_hooks.o: ds4_rocm_compat.cu ds4_glm5_kda.h ds4_gpu.h 
 
 tests/test_rocm_glm5_kda_layer: tests/test_rocm_glm5_kda_layer.o tests/ds4_glm5_kda_hooks.o tests/ds4_rocm_compat_glm5_hooks.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_qkv_dispatch.o: tests/test_rocm_glm5_qkv_dispatch.cu ds4_glm5_kda.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_qkv_dispatch: tests/test_rocm_glm5_qkv_dispatch.o tests/ds4_glm5_kda_hooks.o tests/ds4_rocm_compat_glm5_hooks.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-glm5-qkv-dispatch
+test-rocm-glm5-qkv-dispatch: tests/test_rocm_glm5_qkv_dispatch
+	./tests/test_rocm_glm5_qkv_dispatch 0
+	./tests/test_rocm_glm5_qkv_dispatch 1
 
 test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
@@ -364,6 +394,16 @@ test-rocm-glm5-kpool: tests/test_rocm_glm5_kpool
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kpool
 
 .PHONY: test-rocm-glm5-indexer-select
+tests/test_rocm_glm5_indexer_score_one.o: tests/test_rocm_glm5_indexer_score_one.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_indexer_score_one: tests/test_rocm_glm5_indexer_score_one.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-glm5-indexer-score-one
+test-rocm-glm5-indexer-score-one: tests/test_rocm_glm5_indexer_score_one
+	./tests/test_rocm_glm5_indexer_score_one
+
 tests/test_rocm_glm5_indexer_select.o: tests/test_rocm_glm5_indexer_select.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
@@ -458,6 +498,27 @@ tests/glm5_q8_sharedx_prefetch_bench: tests/glm5_q8_sharedx_prefetch_bench.o tes
 bench-rocm-glm5-q8-sharedx-prefetch: tests/glm5_q8_sharedx_prefetch_bench
 	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/glm5_q8_sharedx_prefetch_bench
+
+.PHONY: bench-rocm-glm5-q8-shapes
+.PHONY: test-rocm-glm5-mla-output-wmma
+tests/test_rocm_glm5_mla_output_wmma.o: tests/test_rocm_glm5_mla_output_wmma.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_output_wmma: tests/test_rocm_glm5_mla_output_wmma.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-mla-output-wmma: tests/test_rocm_glm5_mla_output_wmma
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_mla_output_wmma
+
+tests/glm5_q8_shape_bench.o: scripts/glm5_q8_shape_bench.cu tests/glm5_gguf_test.hpp ds4_gpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/glm5_q8_shape_bench: tests/glm5_q8_shape_bench.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+bench-rocm-glm5-q8-shapes: tests/glm5_q8_shape_bench
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/glm5_q8_shape_bench
 
 .PHONY: test-rocm-glm5-mla-compose
 tests/test_rocm_glm5_mla_compose.o: tests/test_rocm_glm5_mla_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
@@ -794,8 +855,8 @@ strix-halo: check-rocm-strix
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
-strix-halo-quality-score:
-	$(MAKE) -B gguf-tools/quality-testing/score_official \
+strix-halo-quality-score: check-rocm-strix
+	$(MAKE) -B ds4 gguf-tools/quality-testing/score_official \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
@@ -880,7 +941,7 @@ ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvst
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) $(DS4_BENCH_PRODUCER_CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
@@ -922,7 +983,7 @@ ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) $(DS4_BENCH_PRODUCER_CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
@@ -1236,6 +1297,13 @@ test-rocm-q4k-device-repack: tests/test_rocm_q4k_device_repack
 	./tests/test_rocm_q4k_device_repack
 
 .PHONY: test-rocm-bf16-batch-gemm
+.PHONY: test-rocm-glm5-bf16-panel
+tests/test_rocm_glm5_bf16_panel: scripts/glm5_bf16_panel_bench.cu scripts/glm5_bf16_panel_kernels.cuh tests/glm5_gguf_test.hpp rocm/ds4_rocm_bf16_toktile.cuh
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -o $@ $<
+
+test-rocm-glm5-bf16-panel: tests/test_rocm_glm5_bf16_panel
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_bf16_panel
+
 tests/test_rocm_bf16_batch_gemm: tests/test_rocm_bf16_batch_gemm.cu rocm/ds4_rocm_bf16_toktile.cuh
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $< $(ROCM_LDLIBS)
 

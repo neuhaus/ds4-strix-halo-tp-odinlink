@@ -5651,12 +5651,13 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         uint32_t xq_blocks,
         uint32_t nrows,
         uint32_t n_expert,
-        uint32_t wmma_min_count) {
+        uint32_t wmma_min_count,
+        uint32_t skip_tile4) {
     const uint32_t tile = (uint32_t)blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t expert = tile_experts[tile];
     const uint32_t count = counts[expert];
-    if (count >= wmma_min_count) return;
+    if (count >= wmma_min_count || (skip_tile4 && count <= 4u)) return;
 
     const uint32_t lane = (uint32_t)threadIdx.x & 7u;
     const uint32_t row = (uint32_t)blockIdx.x * 32u +
@@ -5730,6 +5731,81 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
             }
         }
         __syncthreads();
+    }
+}
+
+/* Count-1..4 cold complement. The incumbent cold kernel is deliberately
+ * eight-pointer so it can consume a full 16-row routing tile. Very small
+ * experts pay that pointer/register shape even though only one four-pointer
+ * group is present. Keep the same Q4_K arithmetic and route ordering, but
+ * specialize the bounded group and leave count 5+ on tile16. */
+__global__ static void moe_gate_up_q4K_cold_tile4_kernel(
+        float *gate_out,
+        float *up_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t nrows,
+        uint32_t n_expert,
+        uint32_t wmma_min_count) {
+    const uint32_t tile = (uint32_t)blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t count = counts[expert];
+    if (count == 0u || count > 4u || count >= wmma_min_count) return;
+
+    const uint32_t lane = (uint32_t)threadIdx.x & 7u;
+    const uint32_t row = (uint32_t)blockIdx.x * 32u +
+                         ((uint32_t)threadIdx.x >> 3u);
+    const uint32_t start = tile_starts[tile];
+    uint32_t pair[4] = {};
+    const cuda_block_q8_K *xqb[4] = {};
+    for (uint32_t p = 0; p < count; ++p) {
+        pair[p] = sorted_pairs[offsets[expert] + start + p];
+        const uint32_t token = pair[p] / n_expert;
+        xqb[p] = xq + (uint64_t)token * xq_blocks;
+    }
+    if (row >= nrows) return;
+
+    const cuda_block_q4_K *gr =
+        (const cuda_block_q4_K *)(gate_base +
+            (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *ur =
+        (const cuda_block_q4_K *)(up_base +
+            (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+    float gate[4] = {};
+    float up[4] = {};
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        dev_dot_q4_K_q8_K_block4(
+            gr + b, xqb[0] ? xqb[0] + b : NULL,
+            xqb[1] ? xqb[1] + b : NULL,
+            xqb[2] ? xqb[2] + b : NULL,
+            xqb[3] ? xqb[3] + b : NULL, count, gate);
+        dev_dot_q4_K_q8_K_block4(
+            ur + b, xqb[0] ? xqb[0] + b : NULL,
+            xqb[1] ? xqb[1] + b : NULL,
+            xqb[2] ? xqb[2] + b : NULL,
+            xqb[3] ? xqb[3] + b : NULL, count, up);
+    }
+    for (uint32_t p = 0; p < count; ++p) {
+        gate[p] = quarter_warp_sum_f32(gate[p], lane);
+        up[p] = quarter_warp_sum_f32(up[p], lane);
+        if (lane == 0u) {
+            const uint64_t off = (uint64_t)pair[p] * nrows + row;
+            gate_out[off] = gate[p];
+            up_out[off] = up[p];
+        }
     }
 }
 

@@ -24,6 +24,20 @@ extern "C" int ds4_rocm_model_range_view_tensor(
         uint64_t bytes,
         const char *label);
 
+extern "C" int ds4_rocm_glm5_bf16_qkv_panel_tensor(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        const void *, uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, const ds4_gpu_tensor *, uint64_t,
+        ds4_gpu_tensor *);
+extern "C" int ds4_rocm_glm5_bf16_qkv_panel_ready_tensor(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        const void *, uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, const ds4_gpu_tensor *, uint64_t,
+        ds4_gpu_tensor *);
+extern "C" int ds4_gpu_rms_norm_weight_rows_panel_tensor(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        const void *, uint64_t, uint64_t, uint32_t, uint32_t, float);
+
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
@@ -218,6 +232,7 @@ static int rocm_glm5_workspace_fits(
            w->k && w->k->bytes >= kda_bytes &&
            w->v && w->v->bytes >= kda_bytes &&
            w->f_low && w->f_low->bytes >= low_bytes &&
+           w->g_low && w->g_low->bytes >= low_bytes &&
            w->forget && w->forget->bytes >= kda_bytes &&
            w->beta && w->beta->bytes >= beta_bytes;
 }
@@ -233,6 +248,7 @@ typedef struct {
     uint64_t k;
     uint64_t v;
     uint64_t qkv_fused;
+    uint64_t kda_six_fused;
     uint64_t output;
     uint64_t other;
     uint64_t not_applicable;
@@ -247,11 +263,13 @@ static void rocm_glm5_bf16_wmma_hilo_report(void) {
         &g_glm5_bf16_wmma_hilo_stats;
     fprintf(stderr,
             "ds4: GLM5 BF16 WMMA hi/lo summary "
-            "q=%llu k=%llu v=%llu qkv_fused=%llu output=%llu other=%llu "
+            "q=%llu k=%llu v=%llu qkv_fused=%llu kda_six_fused=%llu "
+            "output=%llu other=%llu "
             "not_applicable=%llu hard_failure=%llu\n",
             (unsigned long long)s->q, (unsigned long long)s->k,
             (unsigned long long)s->v,
             (unsigned long long)s->qkv_fused,
+            (unsigned long long)s->kda_six_fused,
             (unsigned long long)s->output,
             (unsigned long long)s->other,
             (unsigned long long)s->not_applicable,
@@ -342,6 +360,85 @@ static int rocm_glm5_kda_matmul_typed(
         in_dim, out_dim, input, args->n_tokens);
 }
 
+/* Decode-only six-pointer KDA candidate.  The selector is intentionally
+ * independent from the older QKV switches: enabling it cannot silently alter
+ * a production path that has not opted into the extra g_low workspace and its
+ * numerical gate.  Unsupported types/shapes return -1 so the caller executes
+ * the established separate projections. */
+static int rocm_glm5_kda_six_multiptr(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, ds4_gpu_tensor *out_f,
+        ds4_gpu_tensor *out_g, ds4_gpu_tensor *out_beta,
+        const ds4_glm5_kda_device_args *args,
+        uint32_t head_start, uint32_t n_heads,
+        const ds4_gpu_tensor *input) {
+    const char *decode_selector =
+        getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *prefill_selector =
+        getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
+    const int prefill = args && args->n_tokens != 1u;
+    const char *selector = prefill ? prefill_selector : decode_selector;
+    if (!selector || strcmp(selector, "0") == 0) return -1;
+    if (strcmp(selector, "1") != 0) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 BF16 KDA six-pointer selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    if (!args || !args->weights || !input ||
+        (args->n_tokens == 1u ? !decode_selector ||
+             strcmp(decode_selector, "1") != 0 :
+         args->n_tokens < 256u || (args->n_tokens % 256u) != 0u) ||
+        /* A shared low-rank buffer is the ordinary fallback layout; the
+         * fused arm needs distinct destinations for f_a and g_a. */
+        out_f == out_g ||
+        (n_heads != 32u && n_heads != 64u) ||
+        head_start > 64u - n_heads ||
+        (head_start % n_heads) != 0u) return -1;
+    const ds4_glm5_kda_weight_offsets *weights = args->weights;
+    const uint32_t bf16_or_legacy[] = {
+        weights->q_type, weights->k_type, weights->v_type,
+        weights->f_a_type, weights->g_a_type, weights->beta_type,
+    };
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        if (bf16_or_legacy[i] != 0u && bf16_or_legacy[i] != 30u)
+            return -1;
+    }
+    constexpr uint64_t q_row_bytes = 4096u * sizeof(uint16_t);
+    uint64_t q_row_start = (uint64_t)head_start *
+                           DS4_GLM5_KDA_HEAD_DIM;
+    uint64_t q_delta = 0u;
+    uint64_t beta_delta = 0u;
+    if (q_row_start > UINT64_MAX / q_row_bytes) return 0;
+    q_delta = q_row_start * q_row_bytes;
+    beta_delta = (uint64_t)head_start * q_row_bytes;
+    uint64_t q_offset = 0u, k_offset = 0u, v_offset = 0u,
+             beta_offset = 0u;
+    if (weights->q > UINT64_MAX - q_delta ||
+        weights->k > UINT64_MAX - q_delta ||
+        weights->v > UINT64_MAX - q_delta ||
+        weights->beta > UINT64_MAX - beta_delta) return 0;
+    q_offset = weights->q + q_delta;
+    k_offset = weights->k + q_delta;
+    v_offset = weights->v + q_delta;
+    beta_offset = weights->beta + beta_delta;
+    const int candidate = ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+        out_q, out_k, out_v, out_f, out_g, out_beta,
+        args->model_map, args->model_size,
+        q_offset, k_offset, v_offset, weights->f_a,
+        weights->g_a, beta_offset, 4096u,
+        (uint64_t)n_heads * DS4_GLM5_KDA_HEAD_DIM,
+        128u, n_heads, input, args->n_tokens);
+    rocm_glm5_bf16_wmma_hilo_register_report();
+    if (candidate > 0u) g_glm5_bf16_wmma_hilo_stats.kda_six_fused++;
+    else if (candidate == 0) g_glm5_bf16_wmma_hilo_stats.hard_failure++;
+    else g_glm5_bf16_wmma_hilo_stats.not_applicable++;
+    return candidate;
+}
+
 /* One-launch Q/K/V candidate. Return -1 for selector/shape/type rollback,
  * 0 for a hard validation or launch failure, and 1 after a successful launch.
  * The three physical GGUF tensors remain independent. */
@@ -350,6 +447,12 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         ds4_gpu_tensor *out_v, const ds4_glm5_kda_device_args *args,
         uint64_t row_start, uint64_t out_dim,
         const ds4_gpu_tensor *input) {
+    const char *panel_value = getenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    const bool panel_enabled = panel_value && strcmp(panel_value, "1") == 0;
+    if (panel_value && !panel_enabled && strcmp(panel_value, "0") != 0) {
+        fprintf(stderr, "ds4: invalid GLM5 QKV activation panel selector\n");
+        return 0;
+    }
     const char *decode_selector =
         getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR");
     const int decode_enabled = decode_selector != NULL &&
@@ -380,9 +483,39 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         }
         return 0;
     }
-    if (!selector_enabled && !decode_enabled) return -1;
     const char *hilo = getenv("DS4_ROCM_GLM5_BF16_WMMA_HILO");
-    if (!decode_enabled && (!hilo || strcmp(hilo, "1") != 0)) {
+    if (panel_enabled && args && args->n_tokens == 256u &&
+        (!selector_enabled || !hilo || strcmp(hilo, "1") != 0)) {
+        fprintf(stderr, "ds4: GLM5 QKV activation panel requires fused hi/lo WMMA\n");
+        return 0;
+    }
+
+    /* The true shared-A QKV prefill kernel is a separate research arm.  It
+     * must not be selected by the older launch-collapse switch, and it is
+     * only meaningful for the batched hi/lo WMMA route. */
+    const char *shared_a_value =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_SHARED_A_PREFILL");
+    const int shared_a_enabled = shared_a_value != NULL &&
+        strcmp(shared_a_value, "1") == 0;
+    if (panel_enabled && shared_a_enabled && args && args->n_tokens == 256u) {
+        fprintf(stderr, "ds4: GLM5 QKV activation panel conflicts with shared-A arm\n");
+        return 0;
+    }
+    if (shared_a_value && !shared_a_enabled &&
+        strcmp(shared_a_value, "0") != 0) {
+        static int invalid_shared_a_reported;
+        if (!invalid_shared_a_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 BF16 QKV shared-A selector\n");
+            invalid_shared_a_reported = 1;
+        }
+        return 0;
+    }
+    // The decode selector chooses only one-token calls. It must not impose
+    // one-token geometry on the independently requested prefill route.
+    const int decode_active = decode_enabled && args && args->n_tokens == 1u;
+    if (!selector_enabled && !decode_active && !shared_a_enabled) return -1;
+    if (!decode_active && (!hilo || strcmp(hilo, "1") != 0)) {
         static int dependency_reported;
         if (!dependency_reported) {
             fprintf(stderr,
@@ -391,11 +524,12 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         }
         return 0;
     }
+    const int shared_a_shape = shared_a_enabled && out_dim == 8192u;
     if (!out_q || !out_k || !out_v || !args || !args->weights || !input ||
-        ((!decode_enabled && out_dim != 4096u) ||
-         (decode_enabled && (args->n_tokens != 1u || out_dim == 0u ||
+        ((!decode_active && out_dim != 4096u && !shared_a_shape) ||
+         (decode_active && (args->n_tokens != 1u || out_dim == 0u ||
                              out_dim > 4096u || (out_dim & 7u) != 0u))) ||
-        (!decode_enabled && args->n_tokens == 0u) ||
+        (!decode_active && args->n_tokens == 0u) ||
         !((args->weights->q_type == 0u || args->weights->q_type == 30u) &&
           (args->weights->k_type == 0u || args->weights->k_type == 30u) &&
           (args->weights->v_type == 0u || args->weights->v_type == 30u)))
@@ -412,6 +546,26 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         if (bases[i] > UINT64_MAX - row_offset) return 0;
         offsets[i] = bases[i] + row_offset;
     }
+    if (shared_a_enabled && args && args->n_tokens != 1u) {
+        if (!hilo || strcmp(hilo, "1") != 0) {
+            static int shared_a_dependency_reported;
+            if (!shared_a_dependency_reported) {
+                fprintf(stderr,
+                        "ds4: GLM5 QKV shared-A requires hi/lo WMMA selector\n");
+                shared_a_dependency_reported = 1;
+            }
+            return 0;
+        }
+        const int shared_a = ds4_gpu_matmul_bf16_wmma_hilo_qkv_shared_a_tensor(
+            out_q, out_k, out_v, args->model_map, args->model_size,
+            offsets[0], offsets[1], offsets[2], in_dim, out_dim, input,
+            args->n_tokens);
+        if (shared_a >= 0) {
+            if (shared_a > 0) g_glm5_bf16_wmma_hilo_stats.qkv_fused++;
+            else g_glm5_bf16_wmma_hilo_stats.hard_failure++;
+            return shared_a;
+        }
+    }
     if (args->n_tokens == 1u) {
         const int decode_multiptr =
             ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
@@ -421,6 +575,29 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         if (decode_multiptr >= 0) return decode_multiptr;
     }
     rocm_glm5_bf16_wmma_hilo_register_report();
+    if (panel_enabled && args->n_tokens == 256u) {
+        if (!args->workspace || !args->workspace->qkv_activation_panel) return 0;
+        const bool panel_ready = args->workspace->qkv_activation_panel_valid;
+        const int result = (panel_ready ?
+            ds4_rocm_glm5_bf16_qkv_panel_ready_tensor :
+            ds4_rocm_glm5_bf16_qkv_panel_tensor)(
+            out_q, out_k, out_v, args->model_map, args->model_size,
+            offsets[0], offsets[1], offsets[2], in_dim, out_dim,
+            input, args->n_tokens, args->workspace->qkv_activation_panel);
+        args->workspace->qkv_activation_panel_valid = false;
+        if (result >= 0) {
+            if (result > 0) {
+                g_glm5_bf16_wmma_hilo_stats.qkv_fused++;
+                static int reported;
+                if (!reported) {
+                    fprintf(stderr, "ds4: GLM5 QKV activation panel active rows=256 "
+                            "bytes=4194304 layout=row-major\n");
+                    reported = 1;
+                }
+            } else g_glm5_bf16_wmma_hilo_stats.hard_failure++;
+            return result;
+        }
+    }
     const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
         out_q, out_k, out_v, args->model_map, args->model_size,
         offsets[0], offsets[1], offsets[2], in_dim, out_dim,
@@ -430,6 +607,16 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
     else g_glm5_bf16_wmma_hilo_stats.not_applicable++;
     return candidate;
 }
+
+#ifdef DS4_GLM5_KDA_TEST_HOOKS
+extern "C" int ds4_rocm_glm5_qkv_dispatch_test(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        const ds4_glm5_kda_device_args *args, uint64_t row_start,
+        uint64_t out_dim, const ds4_gpu_tensor *input) {
+    return rocm_glm5_kda_qkv_wmma_multiptr(
+        q, k, v, args, row_start, out_dim, input);
+}
+#endif
 
 extern "C" int ds4_rocm_glm5_kda_layer_begin(
         const ds4_glm5_kda_device_args *args) {
@@ -454,12 +641,36 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
     const uint64_t channel_start =
         (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM;
 
-    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+    w->qkv_activation_panel_valid = false;
+    const char *panel_value = getenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
+    const bool panel_enabled = panel_value && strcmp(panel_value, "1") == 0;
+    const char *fused_panel_value = getenv(
+        "DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL_FUSED_NORM");
+    const bool fused_panel_enabled = fused_panel_value &&
+        strcmp(fused_panel_value, "1") == 0;
+    bool norm_ready = false;
+    if (panel_enabled && fused_panel_enabled && tokens == 256u &&
+        w->qkv_activation_panel) {
+        norm_ready = ds4_gpu_rms_norm_weight_rows_panel_tensor(
+            w->norm, w->qkv_activation_panel, args->input,
+            args->model_map, args->model_size, weights->attn_norm,
+            4096u, tokens, 1.0e-5f) != 0;
+        if (norm_ready) w->qkv_activation_panel_valid = true;
+        if (getenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL_VERBOSE"))
+            fprintf(stderr, "ds4: GLM5 fused RMSNorm/panel producer %s\n",
+                    norm_ready ? "active" : "declined; using two-pass fallback");
+    }
+    if ((!norm_ready && !ds4_gpu_rms_norm_weight_rows_tensor(
             w->norm, args->input, args->model_map, args->model_size,
-            weights->attn_norm, 4096u, tokens, 1.0e-5f) ||
+            weights->attn_norm, 4096u, tokens, 1.0e-5f)) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_INPUT_NORM)) return 0;
-    const int qkv_fused = rocm_glm5_kda_qkv_wmma_multiptr(
-        w->q, w->k, w->v, args, channel_start, channels, w->norm);
+    const int six_fused = rocm_glm5_kda_six_multiptr(
+        w->q, w->k, w->v, w->f_low, w->g_low, w->beta,
+        args, head_start, heads, w->norm);
+    if (six_fused == 0) return 0;
+    const int qkv_fused = six_fused > 0 ? 1 :
+        rocm_glm5_kda_qkv_wmma_multiptr(
+            w->q, w->k, w->v, args, channel_start, channels, w->norm);
     if (qkv_fused == 0) return 0;
     if (qkv_fused < 0) {
         if (!rocm_glm5_kda_matmul_typed(
@@ -506,16 +717,19 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
 
     ds4_glm5_kda_qk_norm_kernel<<<tokens * heads, 128u>>>(
         (float *)w->q->ptr, (float *)w->k->ptr, tokens, heads);
+    /* A negative selector result means the candidate is not applicable; the
+     * established projections must still run in that case. */
     if (hipGetLastError() != hipSuccess ||
-        !rocm_glm5_kda_matmul_typed(
+        (six_fused <= 0 && !rocm_glm5_kda_matmul_typed(
             w->f_low, args, weights->f_a, weights->f_a_type,
-            4096u, 0u, 128u, w->norm) ||
+            4096u, 0u, 128u, w->norm)) ||
         !rocm_glm5_kda_matmul_typed(
             w->forget, args, weights->f_b, weights->f_b_type,
             128u, channel_start, channels, w->f_low) ||
-        !rocm_glm5_kda_matmul_typed(
+        (six_fused <= 0 && !rocm_glm5_kda_matmul_typed(
             w->beta, args, weights->beta, weights->beta_type,
-            4096u, head_start, heads, w->norm)) return 0;
+            4096u, head_start, heads, w->norm)))
+        return 0;
 
     ds4_gpu_tensor dt_bias = {}, a_log = {};
     if (!rocm_glm5_model_view_init(
@@ -547,12 +761,13 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
             tokens, heads, DS4_GLM5_KDA_HEAD_DIM) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_RECURRENCE)) return 0;
 
-    if (!rocm_glm5_kda_matmul_typed(
+    if ((six_fused <= 0 && !rocm_glm5_kda_matmul_typed(
             w->f_low, args, weights->g_a, weights->g_a_type,
-            4096u, 0u, 128u, w->norm) ||
+            4096u, 0u, 128u, w->norm)) ||
         !rocm_glm5_kda_matmul_typed(
             w->forget, args, weights->g_b, weights->g_b_type,
-            128u, channel_start, channels, w->f_low)) return 0;
+            128u, channel_start, channels,
+            six_fused > 0 ? w->g_low : w->f_low)) return 0;
 
     ds4_gpu_tensor o_norm = {};
     if (!rocm_glm5_model_view_init(

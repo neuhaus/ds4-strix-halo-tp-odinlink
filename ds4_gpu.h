@@ -1301,6 +1301,25 @@ int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
         const ds4_gpu_tensor *x,
         uint64_t              n_tok);
 
+/* Default-off GLM-KDA prefill experiment.  Unlike the launch-collapse entry
+ * above, one workgroup owns matching Q/K/V output tiles and stages the BF16
+ * high/residual activation tile once for all three independent weight
+ * pointers.  Return -1 when the explicit shape/selector gate is not
+ * applicable, 0 on validation/launch failure, and 1 after a launch. */
+int ds4_gpu_matmul_bf16_wmma_hilo_qkv_shared_a_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 /* Default-off decode experiment: computes three independent BF16 Q/K/V
  * projections while staging the shared activation vector once. */
 int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
@@ -1314,6 +1333,34 @@ int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
         uint64_t              weight_v_offset,
         uint64_t              in_dim,
         uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+/* Default-off decode experiment: compute the six independent BF16 GLM-KDA
+ * projections that consume the same normalized input in one launch.  Weight
+ * offsets are physical GGUF row starts (already adjusted for TP ownership),
+ * and no concatenated or expanded weight storage is created.  Return -1 when
+ * the explicit candidate selector or shape/type contract is not applicable,
+ * 0 on a validated launch/range failure, and 1 after a successful launch. */
+int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        ds4_gpu_tensor       *out_f,
+        ds4_gpu_tensor       *out_g,
+        ds4_gpu_tensor       *out_beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              weight_f_offset,
+        uint64_t              weight_g_offset,
+        uint64_t              weight_beta_offset,
+        uint64_t              in_dim,
+        uint64_t              q_out_dim,
+        uint64_t              low_out_dim,
+        uint64_t              beta_out_dim,
         const ds4_gpu_tensor *x,
         uint64_t              n_tok);
 
@@ -1827,6 +1874,30 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
         float                 scale,
         bool                  cache_f16);
 
+/* Batch the GLM-5.3 pooled indexer score over a query tile.  The score matrix
+ * is row-major [token][pool].  Unlike the generic token-causal helper, a
+ * query at position pos0+token can see only complete pool_size rows:
+ * floor((pos0 + token + 1) / pool_size).  Invisible future pools are written
+ * as the finite minimum sentinel used by the GLM pool selector. `n_pools` is
+ * the compact pool-row count, not the raw-token context length. `score_stride`
+ * is the physical number of F32 columns in each score row and may exceed
+ * `n_pools` for a full-context tile workspace. */
+int ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t              n_pools,
+        uint32_t              score_stride,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16);
+
 /* GLM-5.3 NoPE indexer learned pool-4 compression.  On the target ROCm path,
  * inputs are interpreted at the upstream BF16 key/gate boundary. Softmax uses
  * the production F32 exp/div implementation and is numerically gated against
@@ -1908,6 +1979,24 @@ int ds4_gpu_glm5_expand_pool_selection_tensor(
         uint32_t              n_rows,
         uint32_t              first_valid,
         uint32_t              visible_count,
+        uint32_t              token_budget,
+        uint32_t              pool_size);
+
+/* Expand a fixed pool top-k for every query in a sparse prefill tile.  The
+ * selected pool count is fixed because this entry point is restricted to the
+ * sparse regime where every query has reached the pool budget. */
+int ds4_gpu_glm5_expand_pool_selection_batch_tensor(
+        ds4_gpu_tensor       *selected_tokens,
+        const ds4_gpu_tensor *selected_pools,
+        const ds4_gpu_tensor *pool_indices,
+        const ds4_gpu_tensor *pool_valid,
+        const ds4_gpu_tensor *valid_keys,
+        uint32_t              n_pools,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              first_valid,
+        uint32_t              selected_pool_count,
         uint32_t              token_budget,
         uint32_t              pool_size);
 

@@ -17,7 +17,9 @@
  * sequence.
  * Inside each decoded token, partial block outputs are exchanged through a
  * registered memory slab: two-sided RDMA SEND/RECV when RDMA over
- * Thunderbolt is available, or a full-duplex TCP exchange as fallback.
+ * Thunderbolt is available, or a full-duplex TCP exchange as an AUTO-only
+ * fallback. An explicit RDMA request fails closed if a payload cannot use
+ * verbs.
  *
  * Layering: ds4.c calls the session-mirroring and slab entry points;
  * ds4_metal.m only ever sees ds4_tp_gate_exchange() through a callback
@@ -44,6 +46,12 @@ enum {
     /* This records the request, not provider-dependent availability.  The
      * latter is checked fail-closed after the RDMA endpoint is bound. */
     DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT = UINT64_C(1) << 34,
+    /* Batch GLM-5.3 sparse-indexer pool scoring across a prompt tile.  This
+     * changes when complete pools are published, so both ranks must select it
+     * before either enters the layer-major prompt graph. */
+    DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
+    /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
+    DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
 };
 
 static inline uint64_t ds4_tp_prefill_config_encode(
@@ -410,6 +418,7 @@ bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
 bool ds4_tp_requires_host_slab(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp);
+uint64_t ds4_tp_prefill_config(const ds4_tp *tp);
 uint64_t ds4_tp_vec_bytes(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
@@ -422,6 +431,9 @@ int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int *rdma_active,
                                  char *err,
                                  size_t errlen);
+int ds4_tp_test_payload_fallback(ds4_tp_transport requested, int big_gate,
+                                  int *exchange_ok, int *failed,
+                                  uint64_t *tcp_payload_bytes);
 int ds4_tp_test_gate_schedule_validate(
         const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
         uint32_t gates_per_token, uint32_t n_slots,
@@ -493,13 +505,16 @@ int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
 
 /* Verify-block batch gate: exchange `rows` row partials for one layer in one
- * bulk RDMA transfer, with a symmetric TCP transfer as fallback. Called from
- * the GPU gate service thread. */
+ * bulk RDMA transfer, with a symmetric TCP transfer as an AUTO-only fallback.
+ * Explicit RDMA requests fail closed when bulk capability is unavailable.
+ * Called from the GPU gate service thread. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
- * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
+ * RDMA, with interleaved 2MB TCP rounds as an AUTO-only fallback (see
+ * ds4_tp.c). Explicit RDMA requests fail closed when bulk capability is
+ * unavailable. */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
 typedef void (*ds4_tp_big_wave_ready_fn)(void *ud, uint32_t wave);

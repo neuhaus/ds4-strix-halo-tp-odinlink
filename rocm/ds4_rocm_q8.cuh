@@ -633,10 +633,30 @@ __global__ static void matmul_q8_0_f32_sharedx_exact_prefetch_warp_rows_w32_kern
     if (lane == 0u) out[row] = acc;
 }
 
+static int glm5_q8_decode_tile_mode(void);
+static int glm5_q8_decode_tile_shape(uint32_t, uint64_t, uint64_t);
+static cudaError_t cuda_launch_glm5_q8_decode_tile(int, float *, float *,
+    const unsigned char *, const unsigned char *, const float *, uint32_t,
+    uint32_t, uint64_t, cudaStream_t);
+
 static cudaError_t cuda_launch_q8_sharedx_glm5_candidate(
         float *out, const unsigned char *weight, const float *x,
         uint32_t n_blocks, uint64_t out_dim, uint64_t row_bytes,
         cudaStream_t stream = 0) {
+    const int tile_mode = glm5_q8_decode_tile_mode();
+    const int shape = glm5_q8_decode_tile_shape(n_blocks, out_dim, row_bytes);
+    if (tile_mode && shape) {
+        static unsigned reported;
+        if (!(reported & (1u << shape))) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "GLM5 Q8 decode tile engaged "
+                    "mode=%d K=%u N=%llu row_bytes=%llu\n", tile_mode,
+                    n_blocks*32u, (unsigned long long)out_dim,
+                    (unsigned long long)row_bytes);
+            reported |= 1u << shape;
+        }
+        return cuda_launch_glm5_q8_decode_tile(tile_mode, out, nullptr,
+            weight, nullptr, x, n_blocks, (uint32_t)out_dim, row_bytes, stream);
+    }
     static const char *prefetch_value =
         getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
     static const char *nontemporal_value =
@@ -740,6 +760,8 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel(
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
 }
+
+#include "ds4_rocm_glm5_q8_decode_tile.cuh"
 
 /* TP=2 Q-B projection owned by one head per workgroup. The 32 waves compute
  * the head's 512 exact Q8 rows into transient LDS, after which the first 256
@@ -1034,7 +1056,7 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-template <uint32_t M_TILE, uint32_t K_STAGE = 32u>
+template <uint32_t M_TILE, uint32_t K_STAGE = 32u, bool StridedX = false>
 __launch_bounds__(2u * M_TILE, M_TILE == 64u ? 2u : 1u)
 __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         float *out,
@@ -1043,7 +1065,8 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         uint32_t n_tokens,
         uint32_t in_dim,
         uint32_t out_dim,
-        uint64_t row_bytes) {
+        uint64_t row_bytes,
+        uint32_t x_token_stride = 0u) {
     static_assert(M_TILE == 64u || M_TILE == 128u || M_TILE == 256u,
                   "validated Q8 WMMA output-row tiles");
     static_assert(K_STAGE == 32u || K_STAGE == 128u,
@@ -1085,7 +1108,8 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
             const uint32_t tok = block_n + nt;
             float xv = 0.0f;
             if (tok < n_tokens && stage_bi * K_TILE + kk < in_dim) {
-                xv = x[(uint64_t)tok * in_dim + stage_bi * K_TILE + kk];
+                xv = x[(uint64_t)tok * (StridedX ? x_token_stride : in_dim) +
+                       stage_bi * K_TILE + kk];
             }
             lds_x[nt * LDS_STRIDE + kk] = (_Float16)xv;
         }
@@ -1146,6 +1170,157 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t row = warp_m + 2u * j + (lane >> 4u);
             if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[j];
+        }
+    }
+}
+
+/* Cache-free paired gate/up WMMA candidate.  The activation tile is staged
+ * once per block, while gate and up retain independent pointers into the
+ * original Q8_0 GGUF ranges.  This is intentionally separate from the
+ * single-output WMMA kernel: both accumulators must survive until the
+ * SwiGLU epilogue, and no concatenated weight image is permitted. */
+template <uint32_t M_TILE, uint32_t K_STAGE = 128u>
+__launch_bounds__(2u * M_TILE, M_TILE == 128u ? 1u : 1u)
+__global__ static void shared_gate_up_swiglu_q8_0_batch_wmma_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes,
+        int store_gate_up,
+        float clamp) {
+    static_assert(M_TILE == 128u || M_TILE == 256u,
+                  "paired WMMA uses 128 or 256 output rows");
+    static_assert(K_STAGE == 32u || K_STAGE == 128u,
+                  "paired WMMA uses the audited K stages");
+    constexpr uint32_t N_TILE = 64u;
+    constexpr uint32_t K_TILE = 32u;
+    constexpr uint32_t BLOCKS_PER_STAGE = K_STAGE / K_TILE;
+    constexpr uint32_t LDS_STRIDE = K_STAGE == 128u ? 136u : K_STAGE;
+    constexpr uint32_t WARPS = M_TILE / 16u;
+    constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
+    constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
+
+    const uint32_t block_m = (uint32_t)blockIdx.x * M_TILE;
+    const uint32_t block_n = (uint32_t)blockIdx.y * N_TILE;
+    if (block_m >= out_dim || block_n >= n_tokens) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t warp_m = block_m + warp_id * M_PER_WARP;
+    const uint32_t my_row = warp_m + lane16;
+    const uint32_t safe_row = my_row < out_dim ? my_row : (out_dim - 1u);
+    const unsigned char *gate_row = wg + (uint64_t)safe_row * row_bytes;
+    const unsigned char *up_row = wu + (uint64_t)safe_row * row_bytes;
+    const uint32_t n_blocks = in_dim >> 5u;
+
+    ds4_q8_float8_t gate_acc0 = {0.0f, 0.0f, 0.0f, 0.0f,
+                                 0.0f, 0.0f, 0.0f, 0.0f};
+    ds4_q8_float8_t gate_acc1 = gate_acc0;
+    ds4_q8_float8_t gate_acc2 = gate_acc0;
+    ds4_q8_float8_t gate_acc3 = gate_acc0;
+    ds4_q8_float8_t up_acc0 = gate_acc0;
+    ds4_q8_float8_t up_acc1 = gate_acc0;
+    ds4_q8_float8_t up_acc2 = gate_acc0;
+    ds4_q8_float8_t up_acc3 = gate_acc0;
+
+    __shared__ _Float16 lds_x[N_TILE * LDS_STRIDE];
+    for (uint32_t stage_bi = 0u; stage_bi < n_blocks;
+         stage_bi += BLOCKS_PER_STAGE) {
+        for (uint32_t j = tid; j < N_TILE * K_STAGE; j += blockDim.x) {
+            const uint32_t nt = j / K_STAGE;
+            const uint32_t kk = j % K_STAGE;
+            const uint32_t tok = block_n + nt;
+            float xv = 0.0f;
+            if (tok < n_tokens && stage_bi * K_TILE + kk < in_dim)
+                xv = x[(uint64_t)tok * in_dim + stage_bi * K_TILE + kk];
+            lds_x[nt * LDS_STRIDE + kk] = (_Float16)xv;
+        }
+        __syncthreads();
+
+        for (uint32_t sb = 0u;
+             sb < BLOCKS_PER_STAGE && stage_bi + sb < n_blocks; ++sb) {
+            const uint64_t block_offset = (uint64_t)(stage_bi + sb) * 34u;
+            const unsigned char *bg = gate_row + block_offset;
+            const unsigned char *bu = up_row + block_offset;
+            _Float16 sg, su;
+            uint16_t gate_bits, up_bits;
+            __builtin_memcpy(&gate_bits, bg, 2u);
+            __builtin_memcpy(&up_bits, bu, 2u);
+            __builtin_memcpy(&sg, &gate_bits, 2u);
+            __builtin_memcpy(&su, &up_bits, 2u);
+            const int8_t *g0 = (const int8_t *)(bg + 2u);
+            const int8_t *g1 = (const int8_t *)(bg + 18u);
+            const int8_t *u0 = (const int8_t *)(bu + 2u);
+            const int8_t *u1 = (const int8_t *)(bu + 18u);
+            ds4_q8_half16_t ag0, ag1, au0, au1;
+#pragma unroll
+            for (uint32_t i = 0u; i < 16u; ++i) {
+                ag0[i] = sg * (_Float16)(float)(int)g0[i];
+                ag1[i] = sg * (_Float16)(float)(int)g1[i];
+                au0[i] = su * (_Float16)(float)(int)u0[i];
+                au1[i] = su * (_Float16)(float)(int)u1[i];
+            }
+#pragma unroll
+            for (uint32_t ntile = 0u; ntile < N_TILES_PER_WARP; ++ntile) {
+                const uint32_t nt = ntile * 16u + lane16;
+                const _Float16 *xb = lds_x + nt * LDS_STRIDE + sb * K_TILE;
+                const ds4_q8_half16_t b0 =
+                    *(const ds4_q8_half16_t *)(xb);
+                const ds4_q8_half16_t b1 =
+                    *(const ds4_q8_half16_t *)(xb + 16u);
+                ds4_q8_float8_t *ga = ntile == 0u ? &gate_acc0 :
+                    (ntile == 1u ? &gate_acc1 :
+                     (ntile == 2u ? &gate_acc2 : &gate_acc3));
+                ds4_q8_float8_t *ua = ntile == 0u ? &up_acc0 :
+                    (ntile == 1u ? &up_acc1 :
+                     (ntile == 2u ? &up_acc2 : &up_acc3));
+                *ga = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    ag0, b0, *ga);
+                *ga = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    ag1, b1, *ga);
+                *ua = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    au0, b0, *ua);
+                *ua = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    au1, b1, *ua);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t ntile = 0u; ntile < N_TILES_PER_WARP; ++ntile) {
+        const uint32_t tok = block_n + ntile * 16u + lane16;
+        if (tok >= n_tokens) continue;
+        const ds4_q8_float8_t ga = ntile == 0u ? gate_acc0 :
+            (ntile == 1u ? gate_acc1 :
+             (ntile == 2u ? gate_acc2 : gate_acc3));
+        const ds4_q8_float8_t ua = ntile == 0u ? up_acc0 :
+            (ntile == 1u ? up_acc1 :
+             (ntile == 2u ? up_acc2 : up_acc3));
+#pragma unroll
+        for (uint32_t j = 0u; j < 8u; ++j) {
+            const uint32_t row = warp_m + 2u * j + (lane >> 4u);
+            if (row < out_dim) {
+                const float gv = ga[j];
+                const float uv = ua[j];
+                const uint64_t out_index = (uint64_t)tok * out_dim + row;
+                if (store_gate_up) {
+                    gate[out_index] = gv;
+                    up[out_index] = uv;
+                }
+                const float sg = clamp > 1.0e-6f ? fminf(gv, clamp) : gv;
+                const float su = clamp > 1.0e-6f ?
+                    fminf(fmaxf(uv, -clamp), clamp) : uv;
+                mid[out_index] = (sg / (1.0f + expf(-sg))) * su;
+            }
         }
     }
 }
@@ -1311,6 +1486,124 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) {
         if (row < out0_dim) out0[row] = acc0;
         if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+/* One activation tile, but only one live accumulator at a time.  This is a
+ * repair variant for pair projections whose dual accumulators reduce
+ * occupancy on gfx1151.  The two reductions retain the incumbent Q8_0
+ * arithmetic and write the same separate output tensors. */
+__global__ static void matmul_q8_0_pair_f32_sharedx_serial_rows_w32_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    if (wr0) {
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const float xv = shx[(b << 5u) + lane];
+            const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+            acc += q8_0_scale_broadcast_w32(blk) *
+                   (float)((const int8_t *)(blk + 2u))[lane] * xv;
+        }
+        acc = warp_sum_f32(acc);
+        if (lane == 0u) out0[row] = acc;
+    }
+    if (wr1) {
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const float xv = shx[(b << 5u) + lane];
+            const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+            acc += q8_0_scale_broadcast_w32(blk) *
+                   (float)((const int8_t *)(blk + 2u))[lane] * xv;
+        }
+        acc = warp_sum_f32(acc);
+        if (lane == 0u) out1[row] = acc;
+    }
+}
+
+template <uint32_t PREFETCH, bool NONTEMPORAL>
+__global__ static void matmul_q8_0_pair_f32_sharedx_exact_prefetch_kernel(
+        float *out0, float *out1, const unsigned char *w0,
+        const unsigned char *w1, const float *x, uint32_t n_blocks,
+        uint64_t out0_dim, uint64_t out1_dim, uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    uint32_t b = 0u;
+    for (; b + PREFETCH <= n_blocks; b += PREFETCH) {
+        float scales[PREFETCH], inputs[PREFETCH];
+        int8_t weights0[PREFETCH], weights1[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const unsigned char *blk0 = wr0 + (uint64_t)(b + u) * 34u;
+            const unsigned char *blk1 = wr1 + (uint64_t)(b + u) * 34u;
+            uint16_t bits = 0u;
+            if (lane == 0u && wr0) bits = q8_exact_load<uint16_t, NONTEMPORAL>(
+                reinterpret_cast<const uint16_t *>(blk0));
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+            bits = __shfl(bits, 0, 32);
+#else
+            bits = __shfl_sync(FULL_WARP_MASK, bits, 0, 32);
+#endif
+            scales[u] = __half2float(__ushort_as_half(bits));
+            weights0[u] = wr0 ? q8_exact_load<int8_t, NONTEMPORAL>(
+                reinterpret_cast<const int8_t *>(blk0 + 2u) + lane) : 0;
+            weights1[u] = wr1 ? q8_exact_load<int8_t, NONTEMPORAL>(
+                reinterpret_cast<const int8_t *>(blk1 + 2u) + lane) : 0;
+            inputs[u] = shx[((b + u) << 5u) + lane];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            if (wr0) acc0 += q8_exact_ordered_mul(scales[u], (float)weights0[u]) * inputs[u];
+            if (wr1) acc1 += q8_exact_ordered_mul(scales[u], (float)weights1[u]) * inputs[u];
+        }
+    }
+    for (; b < n_blocks; ++b) {
+        const float xv = shx[(b << 5u) + lane];
+        if (wr0) {
+            const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+            acc0 += q8_exact_ordered_mul(q8_0_scale_broadcast_w32(blk),
+                                         (float)((const int8_t *)(blk + 2u))[lane]) * xv;
+        }
+        if (wr1) {
+            const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+            acc1 += q8_exact_ordered_mul(q8_0_scale_broadcast_w32(blk),
+                                         (float)((const int8_t *)(blk + 2u))[lane]) * xv;
+        }
+    }
+    acc0 = warp_sum_f32(acc0); acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        if (wr0) out0[row] = acc0;
+        if (wr1) out1[row] = acc1;
     }
 }
 

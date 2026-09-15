@@ -84,6 +84,14 @@ def main():
                 if got != want:
                     raise AssertionError(f"Q4_K KDA block {block} mismatch")
                 checked.extend(got)
+        elif q_type == 8:
+            for block in range(4):
+                offset = data_start + q_rel + block * 34
+                got = probe.q8_0_block(blob, offset)
+                want = llama_q8_0(blob, offset)
+                if got != want:
+                    raise AssertionError(f"Q8_0 KDA Q block {block} mismatch")
+                checked.extend(got)
         elif q_type != 30:
             raise AssertionError(f"unexpected KDA q type {q_type}")
         if v_type == 8:

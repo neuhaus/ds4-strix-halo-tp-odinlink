@@ -44,6 +44,47 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+/* M256 research producer: retain the ordinary F32 RMSNorm result for the
+ * skinny KDA consumers while emitting the exact BF16 high/residual pair that
+ * the QKV WMMA panel consumes.  The reduction and final arithmetic intentionally
+ * match rms_norm_weight_kernel; only the second representation is added to the
+ * same final element loop. */
+__global__ static void rms_norm_weight_panel_kernel(
+        float *__restrict__ out, uint32_t *__restrict__ panel,
+        const float *__restrict__ x, const float *__restrict__ w,
+        uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    uint32_t *prow = panel + (uint64_t)row * n;
+    float sum = 0.0f;
+    /* Keep the conversion loop rolled: each element carries two rounded
+     * terms, and unrolling it raises VGPR pressure on gfx1151. */
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = __ldg(xr + i);
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float y = __ldg(xr + i) * scale * __ldg(w + i);
+        orow[i] = y;
+        const uint16_t hi = ds4_bf16_rne_bits(y);
+        const float hi_f = __uint_as_float((uint32_t)hi << 16u);
+        const uint16_t lo = ds4_bf16_rne_bits(y - hi_f);
+        prow[i] = (uint32_t)hi | ((uint32_t)lo << 16u);
+    }
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -446,6 +487,40 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+extern "C" int ds4_gpu_rms_norm_weight_rows_panel_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *panel, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps) {
+    uint64_t weight_bytes = 0, values = 0, panel_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_u64_mul_checked(n, rows, &values) ||
+        !cuda_u64_mul_checked(values, sizeof(uint32_t), &panel_bytes) ||
+        !cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(panel, n, rows, sizeof(uint32_t)) ||
+        !out || !x || !panel || !out->ptr || !x->ptr || !panel->ptr ||
+        out->device_id != x->device_id || panel->device_id != x->device_id ||
+        cuda_u64_ranges_overlap((uint64_t)(uintptr_t)out->ptr,
+                                panel_bytes,
+                                (uint64_t)(uintptr_t)x->ptr, panel_bytes) ||
+        cuda_u64_ranges_overlap((uint64_t)(uintptr_t)panel->ptr,
+                                panel_bytes,
+                                (uint64_t)(uintptr_t)x->ptr, panel_bytes) ||
+        cuda_u64_ranges_overlap((uint64_t)(uintptr_t)out->ptr,
+                                panel_bytes,
+                                (uint64_t)(uintptr_t)panel->ptr, panel_bytes))
+        return 0;
+    if (n == 0u || rows == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "rms_weight_panel");
+    if (!wptr) return 0;
+    rms_norm_weight_panel_kernel<<<rows, 256>>>(
+            (float *)out->ptr, (uint32_t *)panel->ptr, (const float *)x->ptr,
+            (const float *)wptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight_panel launch");
 }
 
 extern "C" int ds4_gpu_add_rms_norm_weight_tensor(

@@ -1,0 +1,31 @@
+{
+  "boundary": 2.52,
+  "crossing_probability": 0.04901843,
+  "crossings": 4901843,
+  "design": {
+    "crossing_rule": "any-statistic-greater-than-or-equal-boundary",
+    "looks": [
+      5,
+      7,
+      9
+    ],
+    "null_model": "iid-standard-normal",
+    "statistic": "sqrt(n)*mean(x[0:n])/sample_stddev(x[0:n])"
+  },
+  "familywise_alpha": 0.05,
+  "kind": "ds4-repeated-student-boundary-calibration",
+  "monte_carlo": {
+    "confidence_level": 0.9995,
+    "crossing_probability_upper": 0.049213377460352044,
+    "method": "hoeffding-one-sided-upper"
+  },
+  "passed": true,
+  "paths": 100000000,
+  "rng": {
+    "generator": "PCG64",
+    "library": "numpy",
+    "seed": 13978195,
+    "version": "2.5.1"
+  },
+  "schema_version": 1
+}

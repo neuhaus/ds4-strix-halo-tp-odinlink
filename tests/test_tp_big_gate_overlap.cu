@@ -28,7 +28,10 @@ extern "C" {
 #include <thread>
 #include <vector>
 
-static constexpr uint32_t kRows = 2048u;
+/* Match the GLM5 prefill FFN payload: 256 rows x 4096 float values = 4 MiB.
+ * Four 1 MiB waves fit in one 32 x 128 KiB bulk round, which is the case that
+ * previously hid the delayed-ready bug. */
+static constexpr uint32_t kRows = 256u;
 static constexpr uint32_t kWidth = 4096u;
 static constexpr uint64_t kValues = (uint64_t)kRows * kWidth;
 static constexpr uint64_t kBytes = kValues * sizeof(float);
@@ -257,7 +260,7 @@ static double production_wave_pipeline(
         ds4_tp *tp, ds4_gpu_tensor *slab, float *dst,
         const float *send_device, const float *recv_device,
         uint32_t chunks, uint64_t chunk_bytes,
-        uint32_t rank, uint32_t work_iters) {
+        uint32_t rank, uint32_t work_iters, double *release_span_ms) {
     const uint64_t chunk_values = chunk_bytes / sizeof(float);
     const uint64_t send_base = ds4_tp_slab_big_out_offset(tp);
     const uint64_t recv_base = ds4_tp_slab_big_in_offset(tp);
@@ -274,12 +277,17 @@ static double production_wave_pipeline(
         std::fprintf(stderr, "FAIL production wave kick\n");
         std::exit(1);
     }
+    double first_release_ms = -1.0;
+    double last_release_ms = -1.0;
     for (uint32_t i = 0; i < chunks; ++i) {
         if (!ds4_gpu_tp_big_gate_wait(first_seq + i)) {
             std::fprintf(stderr,
                          "FAIL production wave wait chunk=%u\n", i);
             std::exit(1);
         }
+        const double release_ms = now_ms();
+        if (first_release_ms < 0.0) first_release_ms = release_ms;
+        last_release_ms = release_ms;
         std::atomic_thread_fence(std::memory_order_acquire);
         launch_chunk(dst, send_device, recv_device,
                      (uint64_t)i * chunk_values, chunk_values,
@@ -288,13 +296,14 @@ static double production_wave_pipeline(
     fail_hip(hipDeviceSynchronize(), "production wave synchronize");
     ds4_gpu_tensor_free(recv);
     ds4_gpu_tensor_free(send);
+    *release_span_ms = last_release_ms - first_release_ms;
     return now_ms() - begin;
 }
 
 static void usage(const char *argv0) {
     std::fprintf(stderr,
         "usage: %s <leader|worker> <leader-host> <port> <rdma-device> "
-        "<gid-index> [chunks=8] [work-iters=4096]\n", argv0);
+        "<gid-index> [chunks=4] [work-iters=8192]\n", argv0);
 }
 
 int main(int argc, char **argv) {
@@ -312,8 +321,8 @@ int main(int argc, char **argv) {
     const int port = std::atoi(argv[3]);
     const char *device = argv[4];
     const int gid = std::atoi(argv[5]);
-    const uint32_t chunks = argc > 6 ? (uint32_t)std::strtoul(argv[6], nullptr, 10) : 8u;
-    const uint32_t work_iters = argc > 7 ? (uint32_t)std::strtoul(argv[7], nullptr, 10) : 4096u;
+    const uint32_t chunks = argc > 6 ? (uint32_t)std::strtoul(argv[6], nullptr, 10) : 4u;
+    const uint32_t work_iters = argc > 7 ? (uint32_t)std::strtoul(argv[7], nullptr, 10) : 8192u;
     if (port <= 0 || gid < 0 || chunks < 2u || chunks > 32u ||
         kRows % chunks != 0u || work_iters == 0u) {
         usage(argv[0]);
@@ -503,9 +512,10 @@ int main(int argc, char **argv) {
         chunks, chunk_bytes, rank, work_iters);
     ds4_gpu_tensor_free(full_recv);
     ds4_gpu_tensor_free(full_send);
+    double wave_release_span_ms = 0.0;
     const double production_ms = production_wave_pipeline(
         tp, &slab_tensor, production_out, send_device, recv_device,
-        chunks, chunk_bytes, rank, work_iters);
+        chunks, chunk_bytes, rank, work_iters, &wave_release_span_ms);
 
     std::vector<float> serial_host(kValues), pipeline_host(kValues);
     std::vector<float> production_single_host(kValues);
@@ -538,12 +548,13 @@ int main(int argc, char **argv) {
         "TP_BIG_GATE_OVERLAP rank=%u provider=%s bytes=%llu chunks=%u "
         "work_iters=%u wire_ms=%.3f compute_ms=%.3f serial_ms=%.3f "
         "pipeline_ms=%.3f production_single_ms=%.3f production_ms=%.3f hidden_ms=%.3f "
-        "hidden_wire_fraction=%.3f mismatches=%llu "
+        "hidden_wire_fraction=%.3f wave_release_span_ms=%.3f mismatches=%llu "
         "production_single_mismatches=%llu production_mismatches=%llu\n",
         rank, device, (unsigned long long)kBytes, chunks, work_iters,
         wire_ms, compute_ms, serial_ms, pipeline_ms, production_single_ms,
         production_ms,
-        hidden_ms, hidden_wire_fraction, (unsigned long long)mismatches,
+        hidden_ms, hidden_wire_fraction, wave_release_span_ms,
+        (unsigned long long)mismatches,
         (unsigned long long)production_single_mismatches,
         (unsigned long long)production_mismatches);
 
@@ -554,13 +565,15 @@ int main(int argc, char **argv) {
                       production_single_mismatches == 0u &&
                       production_mismatches == 0u &&
                       balanced && hidden_wire_fraction >= 0.50 &&
-                      pipeline_ms < serial_ms && production_faster;
+                      pipeline_ms < serial_ms && production_faster &&
+                      wave_release_span_ms >= wire_ms * 0.10;
     std::printf("%s exact=%d production_single_exact=%d production_exact=%d balanced=%d "
-                "hide_ge_50pct=%d production_faster=%d\n",
+                "hide_ge_50pct=%d production_faster=%d release_span_ge_10pct=%d\n",
                 pass ? "PASS" : "FAIL",
                 mismatches == 0u, production_single_mismatches == 0u,
                 production_mismatches == 0u, balanced,
-                hidden_wire_fraction >= 0.50, production_faster);
+                hidden_wire_fraction >= 0.50, production_faster,
+                wave_release_span_ms >= wire_ms * 0.10);
 
     ds4_gpu_tp_shutdown();
     (void)hipFree(production_out);

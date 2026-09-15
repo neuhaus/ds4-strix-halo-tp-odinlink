@@ -172,6 +172,24 @@ static int test_contract(void) {
     make_valid(&model);
     CHECK(ds4_glm5_next_model_offsets_validate(&model),
           "valid 45-layer trunk plus one nextn block");
+    model.token_embd_type = model.output_type = 8u;
+    for (uint32_t il = 0u; il < model.trunk_count; ++il) {
+        if (ds4_glm5_next_layer_is_mla(il)) continue;
+        ds4_glm5_kda_weight_offsets *kda = &model.layer[il].kda;
+        kda->q_type = kda->k_type = kda->v_type = kda->output_type = 8u;
+        kda->f_a_type = kda->f_b_type = kda->g_a_type = kda->g_b_type = 8u;
+        kda->beta_type = 8u;
+    }
+    CHECK(ds4_glm5_next_model_offsets_validate(&model),
+          "compact Q8 KDA and vocabulary layout accepted");
+    model.layer[0].kda.q_type = 1u;
+    CHECK(!ds4_glm5_next_model_offsets_validate(&model),
+          "unsupported F16 KDA Q still rejected");
+    model.layer[0].kda.q_type = 8u;
+    model.layer[0].kda.k_type = 15u;
+    CHECK(!ds4_glm5_next_model_offsets_validate(&model),
+          "unsupported Q8_K KDA K still rejected");
+    make_valid(&model);
     model.rms_norm_eps = 0.0f;
     CHECK(!ds4_glm5_next_model_offsets_validate(&model),
           "missing model RMS epsilon rejected");

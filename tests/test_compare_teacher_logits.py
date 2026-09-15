@@ -49,7 +49,9 @@ def score_manifest(path: Path, *, arm: str,
                    attention_f32_gemm: bool = False,
                    attention_repair: str | None = None,
                    attention_repairs: tuple[str, ...] = (),
-                   attention_exact_split: str | None = None) -> None:
+                   attention_exact_split: str | None = None,
+                   q8_decode_tile: str | None = None,
+                   extra_env: str = "") -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
@@ -87,7 +89,9 @@ def score_manifest(path: Path, *, arm: str,
                       (f"{attention_repair}=1 " if attention_repair else "") +
                       "".join(f"{repair}=1 " for repair in attention_repairs) +
                       (f"DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT={attention_exact_split} "
-                       if attention_exact_split is not None else "")),
+                       if attention_exact_split is not None else "") +
+                      (f"DS4_ROCM_GLM5_Q8_DECODE_TILE={q8_decode_tile} "
+                       if q8_decode_tile is not None else "") + extra_env),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -216,6 +220,42 @@ def main() -> int:
                              "--score-arm-mode", "kda-kslice")
         assert score_mismatch.returncode == 1
         assert "manifest model_sample_sha256" in score_mismatch.stderr
+
+        tile_args = (str(reference), str(candidate), "--score-arm-mode", "q8-decode-tile")
+        score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile="0")
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1")
+        tile = run(*tile_args)
+        assert tile.returncode == 0, tile.stderr
+        assert json.loads(tile.stdout)["mode"] == "diagnostic"
+        assert run(*tile_args, "--allow-quality-difference").returncode == 1
+        for ref_tile, cand_tile in ((None, "1"), ("0", None), ("1", "0"),
+                                    ("0", "0"), ("0", "2")):
+            score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile=ref_tile)
+            score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile=cand_tile)
+            invalid_tile = run(*tile_args)
+            assert invalid_tile.returncode == 1
+            assert "explicit TILE=0 versus TILE=1" in invalid_tile.stderr
+        score_manifest(reference / "manifest", arm="kda-tp", q8_decode_tile="0")
+        score_manifest(candidate / "manifest", arm="kda-kslice", q8_decode_tile="1")
+        assert "score arm relationship" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                       extra_env="DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1")
+        assert "outside the declared selectors" in run(*tile_args).stderr
+        for extra in ("DS4_ROCM_GLM5_Q8_DECODE_TILE=1", "=bad", "BAD-KEY=1"):
+            score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                           extra_env=extra)
+            assert "duplicate or invalid extra_env key" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1",
+                       model_hash="wrong-model")
+        assert "manifest model_sample_sha256" in run(*tile_args).stderr
+        score_manifest(candidate / "manifest", arm="kda-tp", q8_decode_tile="1")
+        # A later QUALITY=1 dump must fail too: that dispatch bypasses the pair tile.
+        for directory in (reference, candidate):
+            dump(directory / "decode_000001.logits.json", [0.0, 1.0, 2.0, 3.0],
+                 quality=True, source="ds4-score-official-frozen-teacher")
+        assert "requires quality=false" in run(*tile_args).stderr
+        for directory in (reference, candidate):
+            (directory / "decode_000001.logits.json").unlink()
 
         score_manifest(reference / "manifest", arm="kda-tp")
         score_manifest(candidate / "manifest", arm="kda-tp",
@@ -356,6 +396,101 @@ def main() -> int:
             str(reference), str(candidate),
             "--score-arm-mode", "attn-repeat")
         assert attention_repeat.returncode == 0, attention_repeat.stderr
+
+        # Contract-v2 gates semantic drift with shift-invariant distributions,
+        # an exceedance budget, and separate catastrophic/decision checks.
+        v2_reference = root / "v2-reference"
+        v2_candidate = root / "v2-candidate"
+        v2_reference.mkdir()
+        v2_candidate.mkdir()
+        (v2_reference / "manifest").write_text("fixture=reference\n")
+        (v2_candidate / "manifest").write_text("fixture=candidate\n")
+
+        def dump_series(candidate_logits: list[float],
+                        first_logits: list[float] | None = None) -> None:
+            for index in range(300):
+                ref_path = v2_reference / f"decode_{index:06d}.logits.json"
+                cand_path = v2_candidate / f"decode_{index:06d}.logits.json"
+                dump(ref_path, [0.0, 1.0, 2.0, 3.0])
+                dump(cand_path, first_logits if index == 0 and first_logits
+                     is not None else candidate_logits)
+                for path in (ref_path, cand_path):
+                    value = json.loads(path.read_text())
+                    value["decode_step"] = index
+                    value["position"] = 2048 + index
+                    path.write_text(json.dumps(value))
+
+        v2_thresholds = root / "thresholds-v2.json"
+        v2_thresholds.write_text(json.dumps({
+            "schema_version": 2,
+            "baseline_id": "synthetic-v2",
+            "min_teacher_steps": 300,
+            "allow_quality_difference": False,
+            "decision": {
+                "e_bound": 0.05,
+                "confidence_level": 0.95,
+                "max_near_tie_cluster_rate_upper": 0.13,
+            },
+            "distribution": {
+                "bootstrap_method": "bca",
+                "bootstrap_resamples": 1999,
+                "bootstrap_seed": 19,
+                "cluster_mode": "case-or-contiguous-block",
+                "block_size": 16,
+                "min_clusters": 10,
+                "max_mean_kl_upper": 0.001,
+                "max_mean_tvd_upper": 0.005,
+                "max_mean_teacher_nll_delta_upper": 0.01,
+                "min_same_top1_cluster_rate_lower": 0.87,
+                "soft_limits": {
+                    "centered_p99_abs": 0.1,
+                    "centered_nrms": 0.1,
+                    "kl": 0.001,
+                    "tvd": 0.01,
+                },
+                "max_soft_exceedance_cluster_rate_upper": 0.21,
+            },
+            "safety": {
+                "max_centered_abs": 2.0,
+                "max_centered_nrms": 2.0,
+                "max_kl": 0.5,
+                "max_tvd": 0.75,
+                "max_abs_teacher_nll_delta": 1.0,
+            },
+        }))
+
+        dump_series([0.3, 1.3, 2.3, 3.3])
+        shifted = run(str(v2_reference), str(v2_candidate),
+                      "--thresholds", str(v2_thresholds))
+        assert shifted.returncode == 0, shifted.stderr
+        shifted_summary = json.loads(shifted.stdout)
+        assert shifted_summary["passed"] is True
+        assert abs(shifted_summary["max_abs_common_logit_shift"] - 0.3) < 1e-12
+        assert shifted_summary["max_centered_abs"] < 1e-12
+
+        # One ordinary soft-tail exceedance is reported and budgeted instead
+        # of turning a historical per-position maximum into an identity rule.
+        dump_series([0.0, 1.0, 2.0, 3.0], [0.2, 1.0, 2.0, 3.0])
+        one_tail = run(str(v2_reference), str(v2_candidate),
+                       "--thresholds", str(v2_thresholds))
+        assert one_tail.returncode == 0, one_tail.stderr
+        one_tail_summary = json.loads(one_tail.stdout)
+        assert one_tail_summary["aggregate_gate"]["soft_exceedances"] == 1
+        assert one_tail_summary["aggregate_gate"]["soft_exceedance_clusters"] == 1
+        assert one_tail_summary["aggregate_gate"]["bootstrap"]["clusters"] == 19
+        assert one_tail_summary["passed"] is True
+
+        dump_series([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 3.01, 2.99])
+        v2_far = run(str(v2_reference), str(v2_candidate),
+                     "--thresholds", str(v2_thresholds))
+        assert v2_far.returncode == 1
+        assert json.loads(v2_far.stdout)["far_margin_inversions"] == 1
+
+        dump_series([0.0, 1.0, 2.0, 3.0], [20.0, 1.0, 2.0, 3.0])
+        catastrophic = run(str(v2_reference), str(v2_candidate),
+                           "--thresholds", str(v2_thresholds))
+        assert catastrophic.returncode == 1
+        assert json.loads(catastrophic.stdout)["envelope_breaches"] == 1
     print("test_compare_teacher_logits: PASS")
     return 0
 

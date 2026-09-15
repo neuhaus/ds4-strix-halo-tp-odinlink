@@ -86,9 +86,9 @@ int ds4_glm5_next_build_tp_gate_mask(
 }
 
 static int kda_complete(const ds4_glm5_kda_weight_offsets *w) {
-    const int q_type = w->q_type == 0u || w->q_type == 12u ||
+    const int q_type = w->q_type == 0u || w->q_type == 8u || w->q_type == 12u ||
                        w->q_type == 30u;
-    const int k_type = w->k_type == 0u || w->k_type == 12u ||
+    const int k_type = w->k_type == 0u || w->k_type == 8u || w->k_type == 12u ||
                        w->k_type == 30u;
     const int v_type = w->v_type == 0u || w->v_type == 8u ||
                        w->v_type == 30u;

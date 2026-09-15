@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ds4_gate_stats import StatsError, bca_interval, wilson_one_sided
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -106,6 +108,100 @@ def load_thresholds(path: Path | None) -> dict | None:
         return None
     with path.open("r", encoding="utf-8") as handle:
         value = json.load(handle)
+    if value.get("schema_version") == 2:
+        required = {
+            "schema_version", "baseline_id", "min_teacher_steps",
+            "allow_quality_difference", "decision", "distribution", "safety",
+        }
+        if set(value) != required:
+            raise ValueError(f"{path}: invalid v2 threshold fields")
+        if not isinstance(value["baseline_id"], str) or not value["baseline_id"]:
+            raise ValueError(f"{path}: baseline_id must be a non-empty string")
+        if (not isinstance(value["min_teacher_steps"], int) or
+                value["min_teacher_steps"] < 300):
+            raise ValueError(f"{path}: min_teacher_steps must be at least 300")
+        if type(value["allow_quality_difference"]) is not bool:
+            raise ValueError(f"{path}: allow_quality_difference must be boolean")
+        decision = value["decision"]
+        distribution_limits = value["distribution"]
+        safety = value["safety"]
+        if not all(isinstance(item, dict)
+                   for item in (decision, distribution_limits, safety)):
+            raise ValueError(f"{path}: v2 threshold sections must be objects")
+        if set(decision) != {
+                "e_bound", "confidence_level",
+                "max_near_tie_cluster_rate_upper"}:
+            raise ValueError(f"{path}: invalid decision threshold fields")
+        if set(distribution_limits) != {
+                "bootstrap_method", "bootstrap_resamples", "bootstrap_seed",
+                "cluster_mode", "block_size", "min_clusters",
+                "max_mean_kl_upper", "max_mean_tvd_upper",
+                "max_mean_teacher_nll_delta_upper",
+                "min_same_top1_cluster_rate_lower", "soft_limits",
+                "max_soft_exceedance_cluster_rate_upper"}:
+            raise ValueError(f"{path}: invalid distribution threshold fields")
+        if distribution_limits.get("bootstrap_method") != "bca":
+            raise ValueError(f"{path}: bootstrap_method must be bca")
+        if distribution_limits.get("cluster_mode") != "case-or-contiguous-block":
+            raise ValueError(f"{path}: cluster_mode must be case-or-contiguous-block")
+        if (not isinstance(distribution_limits["bootstrap_resamples"], int) or
+                distribution_limits["bootstrap_resamples"] < 1000 or
+                not isinstance(distribution_limits["bootstrap_seed"], int) or
+                isinstance(distribution_limits["bootstrap_seed"], bool) or
+                distribution_limits["bootstrap_seed"] < 0):
+            raise ValueError(f"{path}: invalid deterministic bootstrap settings")
+        if (not isinstance(distribution_limits["block_size"], int) or
+                isinstance(distribution_limits["block_size"], bool) or
+                distribution_limits["block_size"] < 4 or
+                not isinstance(distribution_limits["min_clusters"], int) or
+                isinstance(distribution_limits["min_clusters"], bool) or
+                distribution_limits["min_clusters"] < 2):
+            raise ValueError(f"{path}: invalid cluster coverage settings")
+        soft = distribution_limits["soft_limits"]
+        if not isinstance(soft, dict) or set(soft) != {
+                "centered_p99_abs", "centered_nrms", "kl", "tvd"}:
+            raise ValueError(f"{path}: invalid soft-limit fields")
+        if set(safety) != {
+                "max_centered_abs", "max_centered_nrms", "max_kl", "max_tvd",
+                "max_abs_teacher_nll_delta"}:
+            raise ValueError(f"{path}: invalid hard-safety fields")
+        scalar_limits = {
+            "e_bound": decision["e_bound"],
+            "max_near_tie_cluster_rate_upper":
+                decision["max_near_tie_cluster_rate_upper"],
+            "confidence_level": decision["confidence_level"],
+            "max_mean_kl_upper": distribution_limits["max_mean_kl_upper"],
+            "max_mean_tvd_upper": distribution_limits["max_mean_tvd_upper"],
+            "max_mean_teacher_nll_delta_upper":
+                distribution_limits["max_mean_teacher_nll_delta_upper"],
+            "min_same_top1_cluster_rate_lower":
+                distribution_limits["min_same_top1_cluster_rate_lower"],
+            "max_soft_exceedance_cluster_rate_upper":
+                distribution_limits["max_soft_exceedance_cluster_rate_upper"],
+            **{f"soft.{key}": item for key, item in soft.items()},
+            **{f"safety.{key}": item for key, item in safety.items()},
+        }
+        for key, item in scalar_limits.items():
+            if not isinstance(item, (int, float)) or not math.isfinite(item):
+                raise ValueError(f"{path}: {key} must be finite")
+        for key in (
+                "e_bound", "max_near_tie_cluster_rate_upper",
+                "max_mean_kl_upper", "max_mean_tvd_upper",
+                "max_soft_exceedance_cluster_rate_upper",
+                *[f"soft.{key}" for key in soft],
+                *[f"safety.{key}" for key in safety]):
+            if scalar_limits[key] < 0:
+                raise ValueError(f"{path}: {key} must be nonnegative")
+        for key in ("confidence_level", "min_same_top1_cluster_rate_lower",
+                    "max_near_tie_cluster_rate_upper",
+                    "max_soft_exceedance_cluster_rate_upper"):
+            item = scalar_limits[key]
+            if not 0 <= item <= 1:
+                raise ValueError(f"{path}: {key} must be between zero and one")
+        if not 0.5 < decision["confidence_level"] < 1.0:
+            raise ValueError(f"{path}: confidence_level must be between 0.5 and 1")
+        return value
+
     required = {
         "baseline_id", "e_bound", "max_abs", "p99_abs", "nmse", "tvd", "kl",
         "min_top5_overlap", "min_top20_overlap",
@@ -126,7 +222,10 @@ def load_thresholds(path: Path | None) -> dict | None:
 
 
 def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
-                 allow_quality_difference: bool = False) -> dict:
+                 allow_quality_difference: bool = False,
+                 require_production_quality: bool = False) -> dict:
+    if require_production_quality and (reference["quality"] or candidate["quality"]):
+        raise ValueError("Q8 decode tile comparison requires quality=false in both arms")
     for field in ("vocab", "prefix_tokens", "decode_step", "position",
                   "teacher_token", "quant_bits", "quality", "dspark",
                   "dspark_strict"):
@@ -146,6 +245,17 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
     ref = np.asarray(ref_values, dtype=np.float64)
     cand = np.asarray(cand_values, dtype=np.float64)
     differences = np.abs(ref - cand)
+    signed_difference = cand - ref
+    common_shift = float(signed_difference.mean(dtype=np.float64))
+    centered_difference = signed_difference - common_shift
+    centered_absolute = np.abs(centered_difference)
+    centered_reference = ref - float(ref.mean(dtype=np.float64))
+    centered_reference_rms = math.sqrt(float(np.mean(
+        centered_reference * centered_reference, dtype=np.float64)))
+    centered_error_rms = math.sqrt(float(np.mean(
+        centered_difference * centered_difference, dtype=np.float64)))
+    centered_nrms = (centered_error_rms / max(centered_reference_rms, 1.0e-30)
+                     if centered_error_rms else 0.0)
     sum_diff_sq = float(np.dot(differences, differences))
     sum_ref_sq = float(np.dot(ref, ref))
     ref_top20 = top_ids(ref_values, min(20, len(ref_values)))
@@ -179,6 +289,11 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
         "reference_teacher_nll": reference_teacher_nll,
         "candidate_teacher_nll": candidate_teacher_nll,
         "teacher_nll_delta": candidate_teacher_nll - reference_teacher_nll,
+        "common_logit_shift": common_shift,
+        "centered_max_abs": float(centered_absolute.max()),
+        "centered_p99_abs": float(np.quantile(
+            centered_absolute, 0.99, method="higher")),
+        "centered_nrms": centered_nrms,
     }
     if reference.get("source") == "ds4-score-official-frozen-teacher":
         result["case_id"] = reference["case_id"]
@@ -186,6 +301,29 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
     if thresholds is None:
         result["envelope_pass"] = None
         result["far_margin_inversion"] = None
+        result["hard_safety_pass"] = None
+        result["soft_exceedance"] = None
+    elif thresholds.get("schema_version") == 2:
+        decision = thresholds["decision"]
+        soft = thresholds["distribution"]["soft_limits"]
+        safety = thresholds["safety"]
+        result["far_margin_inversion"] = bool(
+            not result["argmax_equal"] and
+            ref_margin > 2.0 * decision["e_bound"])
+        result["hard_safety_pass"] = bool(
+            result["centered_max_abs"] <= safety["max_centered_abs"] and
+            result["centered_nrms"] <= safety["max_centered_nrms"] and
+            result["kl"] <= safety["max_kl"] and
+            result["tvd"] <= safety["max_tvd"] and
+            abs(result["teacher_nll_delta"]) <=
+                safety["max_abs_teacher_nll_delta"])
+        result["soft_exceedance"] = bool(
+            result["centered_p99_abs"] > soft["centered_p99_abs"] or
+            result["centered_nrms"] > soft["centered_nrms"] or
+            result["kl"] > soft["kl"] or result["tvd"] > soft["tvd"])
+        result["envelope_pass"] = bool(
+            not result["far_margin_inversion"] and
+            result["hard_safety_pass"])
     else:
         result["far_margin_inversion"] = bool(
             not result["argmax_equal"] and ref_margin > 2.0 * thresholds["e_bound"])
@@ -198,7 +336,53 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
             result["kl"] <= thresholds["kl"] and
             result["top5_overlap"] >= thresholds["min_top5_overlap"] and
             result["top20_overlap"] >= thresholds["min_top20_overlap"])
+        result["hard_safety_pass"] = result["envelope_pass"]
+        result["soft_exceedance"] = None
     return result
+
+
+def cluster_step_indices(steps: list[dict], block_size: int) -> tuple[list[np.ndarray], str]:
+    """Group dependent teacher positions before statistical inference.
+
+    score_official dumps provide a real case boundary. A single teacher stream
+    does not, so it is split into deterministic contiguous blocks. Individual
+    positions remain diagnostics, never independent trials.
+    """
+    have_case = ["case_id" in item for item in steps]
+    if any(have_case) and not all(have_case):
+        raise ValueError("teacher dumps mix case-clustered and unclustered positions")
+    groups: list[np.ndarray] = []
+    if all(have_case):
+        case_ids = list(dict.fromkeys(str(item["case_id"]) for item in steps))
+        for case_id in case_ids:
+            groups.append(np.asarray([
+                index for index, item in enumerate(steps)
+                if str(item["case_id"]) == case_id
+            ], dtype=np.int64))
+        unit = "case"
+    else:
+        groups = [
+            np.arange(start, min(start + block_size, len(steps)), dtype=np.int64)
+            for start in range(0, len(steps), block_size)
+        ]
+        unit = "contiguous-block"
+    if len(groups) < 2 or any(group.size == 0 for group in groups):
+        raise ValueError("teacher comparison has fewer than two dependency clusters")
+    return groups, unit
+
+
+def clustered_mean_interval(values: list[float], groups: list[np.ndarray], *,
+                            confidence_level: float, n_resamples: int,
+                            seed: int) -> dict[str, float]:
+    sample = np.asarray(values, dtype=np.float64)
+
+    def statistic(cluster_indices: np.ndarray) -> float:
+        positions = np.concatenate([groups[int(index)] for index in cluster_indices])
+        return float(sample[positions].mean(dtype=np.float64))
+
+    return bca_interval(
+        len(groups), statistic, confidence_level=confidence_level,
+        n_resamples=n_resamples, seed=seed)
 
 
 def main() -> int:
@@ -213,7 +397,7 @@ def main() -> int:
                         help="explicitly compare an unfused quality oracle with an optimized path")
     parser.add_argument(
         "--score-arm-mode", choices=(
-            "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
+            "kda-tp", "kda-kslice", "repeat", "q8-decode-tile", "full-split-order-null",
             "null-vs-kslice", "fallback-vs-kslice",
             "attn-scalar-vs-f32-gemm",
             "attn-scalar-vs-f32-gemm-sync",
@@ -228,6 +412,8 @@ def main() -> int:
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
+        if args.score_arm_mode == "q8-decode-tile" and args.allow_quality_difference:
+            raise ValueError("Q8 decode tile comparison forbids --allow-quality-difference")
         thresholds = load_thresholds(args.thresholds)
         reference_files = sorted(args.reference_dir.glob("decode_*.logits.json"))
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
@@ -275,6 +461,7 @@ def main() -> int:
                 "kda-tp": ("kda-off", "kda-tp"),
                 "kda-kslice": ("kda-tp", "kda-kslice"),
                 "repeat": ("kda-kslice", "kda-kslice"),
+                "q8-decode-tile": ("kda-tp", "kda-tp"),
                 "full-split-order-null": ("kda-tp", "kda-tp"),
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
                 "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
@@ -307,13 +494,20 @@ def main() -> int:
                     if "=" not in item:
                         raise ValueError(f"malformed extra_env item {item!r}")
                     key, value = item.split("=", 1)
+                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+                        raise ValueError(f"duplicate or invalid extra_env key {key!r}")
                     values[key] = value
                 return values
 
             ref_env = parse_env(reference_manifest.get("extra_env", ""))
             cand_env = parse_env(candidate_manifest.get("extra_env", ""))
             selectors = {"DS4_GLM5_KDA_TP", "DS4_GLM5_KDA_OUTPUT_KSLICE"}
-            if args.score_arm_mode == "full-split-order-null":
+            if args.score_arm_mode == "q8-decode-tile":
+                tile_key = "DS4_ROCM_GLM5_Q8_DECODE_TILE"
+                if (ref_env.get(tile_key), cand_env.get(tile_key)) != ("0", "1"):
+                    raise ValueError("Q8 decode tile comparison requires explicit TILE=0 versus TILE=1")
+                selectors.add(tile_key)
+            elif args.score_arm_mode == "full-split-order-null":
                 null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
                 if null_key in ref_env or cand_env.get(null_key) != "1":
                     raise ValueError(
@@ -450,7 +644,7 @@ def main() -> int:
                     selectors.add(diagnostic)
             if ({k: v for k, v in ref_env.items() if k not in selectors} !=
                     {k: v for k, v in cand_env.items() if k not in selectors}):
-                raise ValueError("score arms differ outside the KDA selectors")
+                raise ValueError("score arms differ outside the declared selectors")
             selector_expectations = {
                 "kda-off": ("0", "0"),
                 "kda-tp": ("1", "0"),
@@ -477,15 +671,18 @@ def main() -> int:
             raise ValueError("--score-arm-mode applies only to score_official dumps")
 
         steps = [compare_pair(first_pair[0], first_pair[1], thresholds,
-                              args.allow_quality_difference)]
+                              args.allow_quality_difference,
+                              args.score_arm_mode == "q8-decode-tile")]
         for ref_path, cand_path in zip(reference_files[1:], candidate_files[1:]):
             steps.append(compare_pair(load(ref_path, reference=True),
                                       load(cand_path), thresholds,
-                                      args.allow_quality_difference))
+                                      args.allow_quality_difference,
+                                      args.score_arm_mode == "q8-decode-tile"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
         return 1
 
+    v2 = thresholds is not None and thresholds.get("schema_version") == 2
     mismatches = [item for item in steps if not item["argmax_equal"]]
     breaches = ([item for item in steps if not item["envelope_pass"]]
                 if thresholds is not None else [])
@@ -493,6 +690,11 @@ def main() -> int:
                   if thresholds is not None else [])
     mismatch_reference_margins = [
         float(item["reference_margin"]) for item in mismatches]
+    soft_exceedances = ([item for item in steps if item["soft_exceedance"]]
+                        if v2 else [])
+    hard_safety_breaches = ([item for item in steps
+                             if item["hard_safety_pass"] is False]
+                            if v2 else [])
     distributions = {
         key: distribution([float(item[key]) for item in steps])
         for key in (
@@ -500,9 +702,109 @@ def main() -> int:
             "reference_margin", "candidate_margin", "top5_overlap",
             "top20_overlap", "mean_signed_error", "positive_error_fraction",
             "reference_teacher_nll", "candidate_teacher_nll",
-            "teacher_nll_delta",
+            "teacher_nll_delta", "common_logit_shift", "centered_max_abs",
+            "centered_p99_abs", "centered_nrms",
         )
     }
+    aggregate_gate = None
+    aggregate_passed = True
+    if v2:
+        decision = thresholds["decision"]
+        limits = thresholds["distribution"]
+        confidence = float(decision["confidence_level"])
+        try:
+            clusters, cluster_unit = cluster_step_indices(
+                steps, limits["block_size"])
+        except ValueError as error:
+            print(f"teacher-logits: FAIL invalid dependency clustering: {error}",
+                  file=sys.stderr)
+            return 1
+        bootstrap = {
+            "confidence_level": confidence,
+            "method": limits["bootstrap_method"],
+            "resamples": limits["bootstrap_resamples"],
+            "seed": limits["bootstrap_seed"],
+            "cluster_mode": limits["cluster_mode"],
+            "cluster_unit": cluster_unit,
+            "block_size": limits["block_size"],
+            "clusters": len(clusters),
+        }
+        try:
+            mean_kl = clustered_mean_interval(
+                [item["kl"] for item in steps],
+                clusters,
+                confidence_level=confidence,
+                n_resamples=limits["bootstrap_resamples"],
+                seed=limits["bootstrap_seed"],
+            )
+            mean_tvd = clustered_mean_interval(
+                [item["tvd"] for item in steps],
+                clusters,
+                confidence_level=confidence,
+                n_resamples=limits["bootstrap_resamples"],
+                seed=limits["bootstrap_seed"] + 1,
+            )
+            mean_teacher_nll_delta = clustered_mean_interval(
+                [item["teacher_nll_delta"] for item in steps],
+                clusters,
+                confidence_level=confidence,
+                n_resamples=limits["bootstrap_resamples"],
+                seed=limits["bootstrap_seed"] + 2,
+            )
+            same_top_clusters = sum(
+                all(steps[int(index)]["argmax_equal"] for index in group)
+                for group in clusters)
+            near_tie_clusters = sum(
+                any(not steps[int(index)]["argmax_equal"] and
+                    not steps[int(index)]["far_margin_inversion"]
+                    for index in group)
+                for group in clusters)
+            soft_clusters = sum(
+                any(steps[int(index)]["soft_exceedance"] for index in group)
+                for group in clusters)
+            same_top = wilson_one_sided(
+                same_top_clusters, len(clusters), confidence)
+            near_tie = wilson_one_sided(
+                near_tie_clusters, len(clusters), confidence)
+            soft_rate = wilson_one_sided(
+                soft_clusters, len(clusters), confidence)
+        except StatsError as error:
+            print(f"teacher-logits: FAIL invalid statistical gate: {error}",
+                  file=sys.stderr)
+            return 1
+        checks = {
+            "teacher_coverage": len(steps) >= thresholds["min_teacher_steps"],
+            "cluster_coverage": len(clusters) >= limits["min_clusters"],
+            "mean_kl": mean_kl["one_sided_upper"] <=
+                limits["max_mean_kl_upper"],
+            "mean_tvd": mean_tvd["one_sided_upper"] <=
+                limits["max_mean_tvd_upper"],
+            "mean_teacher_nll_delta":
+                mean_teacher_nll_delta["one_sided_upper"] <=
+                limits["max_mean_teacher_nll_delta_upper"],
+            "same_top1_cluster_rate": same_top["one_sided_lower"] >=
+                limits["min_same_top1_cluster_rate_lower"],
+            "near_tie_cluster_rate": near_tie["one_sided_upper"] <=
+                decision["max_near_tie_cluster_rate_upper"],
+            "soft_exceedance_cluster_rate": soft_rate["one_sided_upper"] <=
+                limits["max_soft_exceedance_cluster_rate_upper"],
+        }
+        aggregate_passed = all(checks.values())
+        aggregate_gate = {
+            "bootstrap": bootstrap,
+            "mean_kl": mean_kl,
+            "mean_tvd": mean_tvd,
+            "mean_teacher_nll_delta": mean_teacher_nll_delta,
+            "same_top1_cluster_rate": same_top,
+            "same_top1_clusters": same_top_clusters,
+            "near_tie_cluster_rate": near_tie,
+            "near_tie_clusters": near_tie_clusters,
+            "soft_exceedance_cluster_rate": soft_rate,
+            "soft_exceedance_clusters": soft_clusters,
+            "soft_exceedances": len(soft_exceedances),
+            "checks": checks,
+            "passed": aggregate_passed,
+        }
     case_summaries = []
     if all("case_id" in item for item in steps):
         case_ids = list(dict.fromkeys(item["case_id"] for item in steps))
@@ -543,7 +845,9 @@ def main() -> int:
             max(mismatch_reference_margins)
             if mismatch_reference_margins else None),
         "envelope_breaches": len(breaches) if thresholds else None,
+        "hard_safety_breaches": len(hard_safety_breaches) if v2 else None,
         "first_envelope_breach": breaches[0] if breaches else None,
+        "aggregate_gate": aggregate_gate,
         "max_abs": max(item["max_abs"] for item in steps),
         "max_p99_abs": max(item["p99_abs"] for item in steps),
         "max_nmse": max(item["nmse"] for item in steps),
@@ -553,6 +857,12 @@ def main() -> int:
         "min_top20_overlap": min(item["top20_overlap"] for item in steps),
         "max_abs_mean_signed_error": max(
             abs(item["mean_signed_error"]) for item in steps),
+        "max_abs_common_logit_shift": max(
+            abs(item["common_logit_shift"]) for item in steps),
+        "max_centered_abs": max(item["centered_max_abs"] for item in steps),
+        "max_centered_p99_abs": max(
+            item["centered_p99_abs"] for item in steps),
+        "max_centered_nrms": max(item["centered_nrms"] for item in steps),
         "positive_error_fraction_range": [
             min(item["positive_error_fraction"] for item in steps),
             max(item["positive_error_fraction"] for item in steps),
@@ -578,9 +888,11 @@ def main() -> int:
         "thresholds_sha256": sha256(args.thresholds) if args.thresholds else None,
         "worst_steps": {
             key: max(steps, key=lambda item: item[key])
-            for key in ("max_abs", "p99_abs", "nmse", "tvd", "kl")
+            for key in ("max_abs", "p99_abs", "nmse", "tvd", "kl",
+                        "centered_max_abs", "centered_p99_abs", "centered_nrms")
         },
-        "passed": not breaches and not far_margin if thresholds is not None else None,
+        "passed": (not breaches and not far_margin and aggregate_passed
+                   if thresholds is not None else None),
     }
     encoded = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     if args.output:
@@ -590,7 +902,7 @@ def main() -> int:
             for item in steps:
                 handle.write(json.dumps(item, sort_keys=True) + "\n")
     sys.stdout.write(encoded)
-    if thresholds is not None and breaches:
+    if thresholds is not None and not summary["passed"]:
         print("teacher-logits: FAIL versioned lane-B envelope", file=sys.stderr)
         return 1
     return 0

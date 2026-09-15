@@ -9,6 +9,8 @@ extern "C" {
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define CHECK(expr, message) do {                                           \
@@ -167,6 +169,165 @@ bool run_case(const Case &test_case) {
     return true;
 }
 
+bool run_score_batch_case(uint32_t pos0, uint32_t n_tokens,
+                          uint32_t n_pools, uint32_t score_stride = 0u,
+                          bool tied_scores = false) {
+    constexpr uint32_t kHeads = 32u;
+    constexpr uint32_t kDim = 128u;
+    constexpr uint32_t kPool = 4u;
+    constexpr uint32_t kTopK = 16u;
+    if (score_stride == 0u) score_stride = n_pools;
+    CHECK(score_stride >= n_pools, "score stride covers compact pool rows");
+    const size_t q_count = (size_t)n_tokens * kHeads * kDim;
+    const size_t weight_count = (size_t)n_tokens * kHeads;
+    const size_t key_count = (size_t)n_pools * kDim;
+    std::vector<float> q(q_count), weights(weight_count), keys(key_count);
+    std::vector<uint32_t> pool_valid(n_pools, 1u);
+    for (size_t i = 0; i < q.size(); ++i)
+        q[i] = tied_scores ? 0.125f
+                           : std::sin((float)(i % 97u) * 0.071f) * 0.25f;
+    for (size_t i = 0; i < weights.size(); ++i)
+        weights[i] = tied_scores ? 0.5f
+                                 : 0.2f + std::cos((float)(i % 53u) * 0.113f) * 0.1f;
+    for (size_t i = 0; i < keys.size(); ++i)
+        keys[i] = tied_scores ? 0.25f
+                              : std::cos((float)(i % 131u) * 0.037f) * 0.3f;
+    /* Include invalid rows in both the ordinary and final partial blocks. */
+    if (n_pools > 7u) pool_valid[7u] = 0u;
+    pool_valid[n_pools - 1u] = 0u;
+
+    ds4_gpu_tensor *d_q = ds4_gpu_tensor_alloc(q.size() * sizeof(float));
+    ds4_gpu_tensor *d_weights =
+        ds4_gpu_tensor_alloc(weights.size() * sizeof(float));
+    ds4_gpu_tensor *d_keys = ds4_gpu_tensor_alloc(keys.size() * sizeof(float));
+    ds4_gpu_tensor *d_valid =
+        ds4_gpu_tensor_alloc(pool_valid.size() * sizeof(uint32_t));
+    const size_t score_count = (size_t)n_tokens * score_stride;
+    /* The extra words make a final partial eight-pool block observable if the
+     * wave32 arm stores past its declared compact-pool width. */
+    ds4_gpu_tensor *d_wave = ds4_gpu_tensor_alloc(
+        (score_count + 64u) * sizeof(float));
+    ds4_gpu_tensor *d_scalar = ds4_gpu_tensor_alloc(
+        score_count * sizeof(float));
+    ds4_gpu_tensor *d_one = ds4_gpu_tensor_alloc(n_pools * sizeof(float));
+    ds4_gpu_tensor *d_wave_top = ds4_gpu_tensor_alloc(kTopK * sizeof(uint32_t));
+    ds4_gpu_tensor *d_scalar_top =
+        ds4_gpu_tensor_alloc(kTopK * sizeof(uint32_t));
+    CHECK(d_q && d_weights && d_keys && d_valid && d_wave && d_scalar &&
+          d_one && d_wave_top && d_scalar_top &&
+          ds4_gpu_tensor_write(d_q, 0u, q.data(), q.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_weights, 0u, weights.data(),
+                               weights.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_keys, 0u, keys.data(),
+                               keys.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_valid, 0u, pool_valid.data(),
+                               pool_valid.size() * sizeof(uint32_t)),
+          "allocate GLM5 pooled score oracle tensors");
+
+    const float guard = 12345.0f;
+    std::vector<float> wave_init(score_count + 64u, guard);
+    CHECK(ds4_gpu_tensor_write(d_wave, 0u, wave_init.data(),
+                               wave_init.size() * sizeof(float)) &&
+          unsetenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH_SCALAR") == 0 &&
+          ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+              d_wave, d_q, d_weights, d_keys, d_valid, n_pools, score_stride,
+              n_tokens,
+              pos0, kPool, kHeads, kDim, 0.015625f, false) &&
+          ds4_gpu_synchronize(),
+          "run GLM5 wave32 pooled score batch");
+    std::vector<float> wave(score_count + 64u);
+    CHECK(ds4_gpu_tensor_read(d_wave, 0u, wave.data(),
+                              wave.size() * sizeof(float)),
+          "read GLM5 wave32 pooled scores");
+    for (size_t i = score_count; i < wave.size(); ++i)
+        CHECK(wave[i] == guard, "wave32 final partial pool stays in bounds");
+    for (uint32_t token = 0u; token < n_tokens; ++token)
+        for (uint32_t pool = n_pools; pool < score_stride; ++pool)
+            CHECK(wave[(size_t)token * score_stride + pool] == guard,
+                  "wave32 score row padding stays untouched");
+
+    CHECK(setenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH_SCALAR", "1", 1) == 0 &&
+          ds4_gpu_tensor_write(d_scalar, 0u, wave_init.data(),
+                               score_count * sizeof(float)) &&
+          ds4_gpu_glm_indexer_scores_pool_batch_tensor(
+              d_scalar, d_q, d_weights, d_keys, d_valid, n_pools, score_stride,
+              n_tokens,
+              pos0, kPool, kHeads, kDim, 0.015625f, false) &&
+          ds4_gpu_synchronize(),
+          "run GLM5 scalar pooled score batch");
+    unsetenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH_SCALAR");
+    std::vector<float> scalar(score_count);
+    CHECK(ds4_gpu_tensor_read(d_scalar, 0u, scalar.data(),
+                              scalar.size() * sizeof(float)),
+          "read GLM5 scalar pooled scores");
+
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        const uint32_t visible = (pos0 + token + 1u) / kPool;
+        ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
+            d_q, (uint64_t)token * kHeads * kDim * sizeof(float),
+            (uint64_t)kHeads * kDim * sizeof(float));
+        ds4_gpu_tensor *weight_row = ds4_gpu_tensor_view(
+            d_weights, (uint64_t)token * kHeads * sizeof(float),
+            (uint64_t)kHeads * sizeof(float));
+        ds4_gpu_tensor *score_row = ds4_gpu_tensor_view(
+            d_scalar, (uint64_t)token * score_stride * sizeof(float),
+            (uint64_t)n_pools * sizeof(float));
+        ds4_gpu_tensor *wave_row = ds4_gpu_tensor_view(
+            d_wave, (uint64_t)token * score_stride * sizeof(float),
+            (uint64_t)n_pools * sizeof(float));
+        CHECK(q_row && weight_row && score_row && wave_row &&
+              ds4_gpu_glm_indexer_score_one_tensor(
+                  d_one, q_row, weight_row, d_keys, n_pools, kHeads, kDim,
+                  0.015625f, false) &&
+              ds4_gpu_indexer_topk_tensor(
+                  d_scalar_top, score_row, visible, 1u, kTopK) &&
+              ds4_gpu_indexer_topk_tensor(
+                  d_wave_top, wave_row, visible, 1u, kTopK) &&
+              ds4_gpu_synchronize(),
+              "compare per-query pooled score rows");
+        std::vector<float> one(n_pools);
+        std::vector<uint32_t> wave_top(kTopK), scalar_top(kTopK);
+        CHECK(ds4_gpu_tensor_read(d_one, 0u, one.data(),
+                                  one.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(d_scalar_top, 0u, scalar_top.data(),
+                                  scalar_top.size() * sizeof(uint32_t)) &&
+              ds4_gpu_tensor_read(d_wave_top, 0u, wave_top.data(),
+                                  wave_top.size() * sizeof(uint32_t)),
+              "read pooled score row oracle");
+        for (uint32_t pool = 0u; pool < n_pools; ++pool) {
+            const bool visible_valid = pool < visible && pool_valid[pool] != 0u;
+            const float expected = visible_valid ? one[pool] : -FLT_MAX;
+            const float got_scalar = scalar[(size_t)token * score_stride + pool];
+            const float got_wave = wave[(size_t)token * score_stride + pool];
+            CHECK(got_scalar == expected,
+                  "scalar batch score matches scalar selector and mask");
+            if (visible_valid) {
+                CHECK(std::memcmp(&got_wave, &got_scalar, sizeof(float)) == 0,
+                      "wave32 visible score matches scalar bits");
+            } else {
+                CHECK(got_wave == -FLT_MAX,
+                      "wave32 invisible score uses finite-min sentinel");
+            }
+        }
+        CHECK(wave_top == scalar_top,
+              "wave32 and scalar pooled score top-k IDs match");
+        ds4_gpu_tensor_free(wave_row);
+        ds4_gpu_tensor_free(score_row);
+        ds4_gpu_tensor_free(weight_row);
+        ds4_gpu_tensor_free(q_row);
+    }
+    ds4_gpu_tensor_free(d_scalar_top);
+    ds4_gpu_tensor_free(d_wave_top);
+    ds4_gpu_tensor_free(d_one);
+    ds4_gpu_tensor_free(d_scalar);
+    ds4_gpu_tensor_free(d_wave);
+    ds4_gpu_tensor_free(d_valid);
+    ds4_gpu_tensor_free(d_keys);
+    ds4_gpu_tensor_free(d_weights);
+    ds4_gpu_tensor_free(d_q);
+    return true;
+}
+
 bool run_test() {
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
@@ -198,6 +359,12 @@ bool run_test() {
           "GLM5 selection masks an invalid pool on the large top-k path");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "GLM5 indexer selection invokes no TP exchange API");
+    CHECK(run_score_batch_case(2048u, 9u, 521u, 529u) &&
+          run_score_batch_case(2050u, 7u, 523u, 531u) &&
+          run_score_batch_case(2049u, 8u, 520u, 527u, true),
+          "GLM5 pooled score batch matches scalar, stride, ties and causal tails");
+    CHECK(run_score_batch_case(2048u, 256u, 576u, 640u),
+          "GLM5 production-shaped pooled score batch at 2048 frontier");
     ds4_gpu_cleanup();
     std::fprintf(stderr,
                  "PASS GLM5 pool score/top-k/raw-tail selection gate\n");

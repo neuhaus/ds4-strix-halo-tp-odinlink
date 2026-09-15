@@ -82,6 +82,15 @@ static uint32_t routed_moe_q4k_wmma_min_count(void) {
     return value;
 }
 
+static int routed_moe_q4k_cold_tile4_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_COLD_TILE4");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int routed_moe_q4k_wmma_pair_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -285,12 +294,13 @@ extern "C" void ds4_gpu_set_tp_runtime_features(uint32_t rank,
             "down=%d kshard=%d kda_tp=%d kda_output_kslice=%d "
             "sorted_min_tokens=%u gate_up_threshold=%u "
             "down_threshold=1 fused_active=%d iq2_i8=%d quality=%d "
-            "kill_switch=%d\n",
+            "pair_active=%d kill_switch=%d\n",
             rank, features, q4k, q4k, q4k, q4k_kshard,
             glm5_kda_tp, glm5_kda_output_kslice,
             routed_moe_q4k_sorted_min_tokens(),
             routed_moe_q4k_wmma_min_count(), q4k_fused_mid,
-            iq2_i8, g_quality_mode, cfg->disabled);
+            iq2_i8, g_quality_mode,
+            routed_moe_q4k_wmma_pair_enabled(), cfg->disabled);
 }
 
 extern "C" uint32_t ds4_gpu_get_tp_runtime_features(void) {
@@ -1257,6 +1267,19 @@ static int routed_moe_mxfp4_launch(
  * every production entry point. */
 static thread_local uint32_t g_q4k_direct_control_active;
 static thread_local uint32_t g_q4k_direct_control_observed;
+// Diagnostic stage contract: sorted=1, WMMA=2, fused-mid=4, paired=8.
+// Existing composition tests still require the complete paired/fused path.
+static thread_local uint32_t g_q4k_direct_control_expected = 15u;
+
+extern "C" int ds4_gpu_q4k_direct_control_expect(uint32_t stages) {
+    if (stages != 3u && stages != 11u && stages != 15u) return 0;
+    g_q4k_direct_control_expected = stages;
+    return 1;
+}
+
+extern "C" uint32_t ds4_gpu_q4k_direct_control_last_stages(void) {
+    return g_q4k_direct_control_observed;
+}
 
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
@@ -1615,10 +1638,7 @@ static int routed_moe_launch(
             routed_moe_q4k_wmma_fuse_mid_requested() &&
             q4k_fused_feature_active && !q4k_layer_log && !write_gate_up;
         if (g_q4k_direct_control_active) {
-            g_q4k_direct_control_observed =
-                (use_sorted_pairs ? 1u : 0u) |
-                (use_q4k_wmma ? 2u : 0u) |
-                (q4k_fused_active ? 4u : 0u);
+            g_q4k_direct_control_observed = 0u;
         }
         const uint32_t use_p2_sorted = 0u;
         const char *tp_prefill_skip_env =
@@ -2179,12 +2199,27 @@ static int routed_moe_launch(
                         if (ok) {
                             dim3 cold_grid((expert_mid_dim + 31u) / 32u,
                                            tile_capacity, 1);
-                            moe_gate_up_q4K_cold_tile16_kernel<<<cold_grid, 256>>>(
-                                (float *)gate->ptr, (float *)up->ptr,
-                                gate_w, up_w, xq, sorted_pairs, sorted_offsets,
-                                sorted_counts, tile_total, tile_experts, tile_starts,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks,
-                                expert_mid_dim, n_expert, wmma_min_count);
+                            const uint32_t cold_tile4 =
+                                routed_moe_q4k_cold_tile4_enabled() ? 1u : 0u;
+                            if (cold_tile4) {
+                                moe_gate_up_q4K_cold_tile4_kernel<<<cold_grid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr,
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets,
+                                    sorted_counts, tile_total, tile_experts, tile_starts,
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                    expert_mid_dim, n_expert, wmma_min_count);
+                                ok = cuda_ok(cudaGetLastError(),
+                                             "routed_moe Q4_K DP4A cold tile4 launch");
+                            }
+                            if (ok) {
+                                moe_gate_up_q4K_cold_tile16_kernel<<<cold_grid, 256>>>(
+                                    (float *)gate->ptr, (float *)up->ptr,
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets,
+                                    sorted_counts, tile_total, tile_experts, tile_starts,
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                    expert_mid_dim, n_expert, wmma_min_count,
+                                    cold_tile4);
+                            }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K DP4A cold launch");
                             if (ok && q4k_decode_event_profile) {
@@ -2245,6 +2280,17 @@ static int routed_moe_launch(
                             }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K WMMA epilogue launch");
+                        }
+                        if (g_q4k_direct_control_active) {
+                            // This assignment follows the actual WMMA kernel
+                            // launch selection, rather than merely reflecting
+                            // the requested environment flags. The return
+                            // path still rejects launch errors below.
+                            g_q4k_direct_control_observed =
+                                (use_sorted_pairs ? 1u : 0u) |
+                                2u |
+                                (q4k_fused_active ? 4u : 0u) |
+                                (q4k_wmma_pair_active ? 8u : 0u);
                         }
                     } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
@@ -4522,14 +4568,15 @@ extern "C" int ds4_gpu_routed_moe_batch_q4k_direct_control(
      * The timing oracle also uses this control for its explicitly separate
      * one-token legacy tail, where sorted WMMA is intentionally inapplicable. */
     const int path_ok = n_tokens == 1u ||
-                        g_q4k_direct_control_observed == 7u;
+        g_q4k_direct_control_observed == g_q4k_direct_control_expected;
     const int rc = launch_rc && path_ok;
     if (launch_rc && !path_ok) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "Q4_K direct control rejected non-WMMA path: "
-                "tokens=%u mid=%u observed=0x%x expected=0x7\n",
+                "Q4_K direct control rejected unexpected stages: "
+                "tokens=%u mid=%u observed=0x%x expected=0x%x\n",
                 n_tokens, expert_mid_dim,
-                g_q4k_direct_control_observed);
+                g_q4k_direct_control_observed,
+                g_q4k_direct_control_expected);
     }
     if (!rc) {
         const hipError_t error = hipGetLastError();
