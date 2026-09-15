@@ -13,7 +13,9 @@ if [[ ${DS4_GATE_CLEAN_TEST:-0} != 1 ]]; then
   trap 'rm -r -- "$clean_fixture"' EXIT
   git clone -q --no-local "$repo" "$clean_fixture/repo"
   if [[ -n $(git -C "$repo" status --porcelain=v1 -uall) ]]; then
-    git -C "$repo" diff --binary HEAD | git -C "$clean_fixture/repo" apply
+    if ! git -C "$repo" diff --quiet HEAD; then
+      git -C "$repo" diff --binary HEAD | git -C "$clean_fixture/repo" apply
+    fi
     while IFS= read -r -d '' path; do
       mkdir -p "$clean_fixture/repo/$(dirname -- "$path")"
       cp -a -- "$repo/$path" "$clean_fixture/repo/$path"

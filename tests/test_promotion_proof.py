@@ -22,6 +22,7 @@ SOURCE = subprocess.check_output(
     ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
 CONTROL_SOURCE = subprocess.check_output(
     ["git", "-C", str(REPO), "rev-parse", "HEAD^"], text=True).strip()
+BENCH_BINARY_SHA256 = "e" * 64
 
 
 def digest_bytes(value: bytes) -> str:
@@ -30,11 +31,23 @@ def digest_bytes(value: bytes) -> str:
 
 def committed_source_digest(commit: str) -> str:
     return digest_bytes(subprocess.check_output(
-        ["git", "-C", str(REPO), "show", f"{commit}:ds4_bench.c"]))
+        ["git", "-C", str(REPO), "cat-file", "blob",
+         f"{commit}:ds4_bench.c"]))
 
 
 SOURCE_PRODUCER_SHA256 = committed_source_digest(SOURCE)
 CONTROL_PRODUCER_SHA256 = committed_source_digest(CONTROL_SOURCE)
+
+
+def different_producer_source() -> tuple[str, str]:
+    commits = subprocess.check_output(
+        ["git", "-C", str(REPO), "rev-list", "HEAD", "--", "ds4_bench.c"],
+        text=True).splitlines()
+    for commit in commits:
+        digest = committed_source_digest(commit)
+        if digest != SOURCE_PRODUCER_SHA256:
+            return commit, digest
+    raise AssertionError("fixture history has no differing ds4_bench.c producer")
 
 
 def sample_digest(path: Path) -> str:
@@ -83,6 +96,7 @@ def make_run(root: Path, name: str, pair_id: str, order: str, arm: str, *,
         "tag": name, "run_id": run_id, "source_commit": SOURCE,
         "source_dirty": 0, "bench_config_sha256": "c" * 64,
         "ds4_sha256": "d" * 64, "peer_ds4_sha256": "d" * 64,
+        "ds4_bench_tp_sha256": BENCH_BINARY_SHA256,
         "ds4_bench_producer_source_sha256": SOURCE_PRODUCER_SHA256,
         "model": str(model or (root / "glm.gguf")), "model_arch": "glm5-next",
         "model_size": model_size,
@@ -115,12 +129,14 @@ def make_run(root: Path, name: str, pair_id: str, order: str, arm: str, *,
         "payload_fallback_calls=0 failed=0\n"
     )
     coordinator.write_text(
+        "ds4: GLM5 compact Q4_K K-shard active: rank=0 layers=42 rows=0:1024 down-bytes=0:576\n"
         "ds4-tp: worker connected, transport=rdma\n"
         "ds4-tp: rdma device mlx5_0 (port state 4)\n" + common +
         "ds4-bench: headline_csv_complete=1\n"
         "ds4-bench-launcher: headline_csv_complete=1\n"
         "ds4-bench-launcher: worker_terminated_by_launcher=0\n")
     worker.write_text(
+        "ds4: GLM5 compact Q4_K K-shard active: rank=1 layers=42 rows=1024:2048 down-bytes=576:1152\n"
         "ds4-tp: leader connected, transport=rdma\n"
         "ds4-tp: rdma device mlx5_1 (port state 4)\n" + common)
     coordinator_status = root / f"coordinator-{name}.status"
@@ -505,6 +521,60 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+        spec = build_spec(root)
+        value = json.loads(spec.read_text())
+        pair = value["headline_pairs"][0]
+        pair["allowed_fields"].append("ds4_bench_tp_sha256")
+        candidate_manifest = Path(pair["candidate"]["manifest"])
+        fields = dict(line.split("=", 1) for line in
+                      candidate_manifest.read_text().splitlines())
+        fields["ds4_bench_tp_sha256"] = "unverified"
+        manifest(candidate_manifest, fields)
+        spec.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        result, _ = create(root, spec)
+        assert result.returncode == 1
+        assert "benchmark executable identity" in result.stderr
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = build_spec(root)
+        value = json.loads(spec.read_text())
+        pair = value["headline_pairs"][0]
+        pair["allowed_fields"].append("ds4_bench_tp_sha256")
+        candidate_manifest = Path(pair["candidate"]["manifest"])
+        fields = dict(line.split("=", 1) for line in
+                      candidate_manifest.read_text().splitlines())
+        fields["ds4_bench_tp_sha256"] = "f" * 64
+        manifest(candidate_manifest, fields)
+        spec.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        result, _ = create(root, spec)
+        assert result.returncode == 1
+        assert "one benchmark executable" in result.stderr
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = build_spec(root)
+        value = json.loads(spec.read_text())
+        control_source, control_producer = different_producer_source()
+        value["source_commits"]["control"] = control_source
+        pairs = [*value["headline_pairs"], value["diverse_screen"]["pair"]]
+        for pair in pairs:
+            pair["allowed_fields"].extend([
+                "source_commit", "ds4_bench_producer_source_sha256",
+            ])
+            control_manifest = Path(pair["control"]["manifest"])
+            fields = dict(line.split("=", 1) for line in
+                          control_manifest.read_text().splitlines())
+            fields["source_commit"] = control_source
+            fields["ds4_bench_producer_source_sha256"] = control_producer
+            manifest(control_manifest, fields)
+        spec.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        result, _ = create(root, spec)
+        assert result.returncode == 1
+        assert "benchmark producer source differs" in result.stderr
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
         spec = build_spec(root, pair_count=5)
         value = json.loads(spec.read_text())
         value["long_context_screen"]["pair"] = make_pair(
@@ -526,8 +596,6 @@ def main() -> int:
                      *(item["screen"]["pair"] for item in
                        value["ordinary_regressions"])]:
             pair["allowed_fields"].append("source_commit")
-            pair["allowed_fields"].append(
-                "ds4_bench_producer_source_sha256")
             control_manifest = Path(pair["control"]["manifest"])
             fields = dict(line.split("=", 1) for line in
                           control_manifest.read_text().splitlines())

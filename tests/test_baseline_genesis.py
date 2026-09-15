@@ -16,6 +16,10 @@ from copy import deepcopy
 from pathlib import Path
 
 
+if os.environ.get("DS4_GATE_CLEAN_TEST") != "1":
+    raise SystemExit("run via tests/test_baseline_genesis.sh")
+
+
 REPO = Path(__file__).resolve().parents[1]
 GATE = REPO / "scripts" / "candidate-gate.py"
 sys.path.insert(0, str(REPO / "scripts"))
@@ -288,10 +292,12 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
             coordinator = root / f"coordinator-{name}.log"
             worker = root / f"worker-{name}.log"
             coordinator.write_text(
+                "ds4: GLM5 compact Q4_K K-shard active: rank=0 layers=42 rows=0:1024 down-bytes=0:576\n"
                 "ds4-tp: worker connected, transport=rdma\n"
                 "ds4-tp: rdma device mlx5_0 (port state 4)\n"
                 f"ds4-tp: benchmark run_id={run_id}\n" + common_log)
             worker.write_text(
+                "ds4: GLM5 compact Q4_K K-shard active: rank=1 layers=42 rows=1024:2048 down-bytes=576:1152\n"
                 "ds4-tp: leader connected, transport=rdma\n"
                 "ds4-tp: rdma device mlx5_1 (port state 4)\n"
                 f"ds4-tp: benchmark run_id={run_id}\n" + common_log)
@@ -791,6 +797,12 @@ def main() -> int:
         lambda _root, genesis: mutate_benchmark_manifest(
             genesis, 0,
             lambda values: values.pop("ds4_bench_tp_sha256")),
+        "no valid benchmark binary identity")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__(
+                "ds4_bench_tp_sha256", "unverified")),
         "no valid benchmark binary identity")
     expect_failure(
         lambda _root, genesis: mutate_benchmark_manifest(

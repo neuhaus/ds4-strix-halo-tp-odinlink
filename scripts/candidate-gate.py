@@ -3174,6 +3174,14 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
                              str(next(iter(candidate_binary_hashes), "")))):
         raise GateError("headline candidate runs used different binaries")
     candidate_binary_sha256 = next(iter(candidate_binary_hashes))
+    candidate_bench_hashes = {
+        manifest.get("ds4_bench_tp_sha256") for manifest in benchmark_manifests
+    }
+    if (len(candidate_bench_hashes) != 1 or
+            not re.fullmatch(r"[0-9a-f]{64}",
+                             str(next(iter(candidate_bench_hashes), "")))):
+        raise GateError(
+            "headline candidate runs used different benchmark executables")
     candidate_switches = value["promotion_intent"]["candidate_switches"]
     expected_switches = {
         name: arms["candidate"] for name, arms in candidate_switches.items()
@@ -3250,6 +3258,7 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         "headline_invalidation_count": invalidation_count,
         "prior_formal_candidates": prior_candidates,
         "candidate_binary_sha256": candidate_binary_sha256,
+        "candidate_bench_sha256": next(iter(candidate_bench_hashes)),
     }
 
 
@@ -3307,7 +3316,7 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                         "environment": environment,
                         "ds4_sha256": candidate_manifests[0]["ds4_sha256"],
                         "ds4_bench_tp_sha256":
-                            candidate_manifests[0]["ds4_bench_tp_sha256"],
+                            derived["candidate_bench_sha256"],
                     },
                 },
                 "numerical": {

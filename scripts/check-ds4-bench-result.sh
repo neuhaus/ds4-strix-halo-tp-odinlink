@@ -68,6 +68,11 @@ ACTUAL_FNV64=$(read_csv_field gen_token_fnv64) || {
 "$(dirname -- "$0")/check-tp-rdma-logs.sh" \
   "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$RDMA_DEVICE" \
   "$RDMA_GID_INDEX" "$WORKER_RDMA_DEVICE" "$EXPECTED_RUN_ID"
+if [[ -r ${CSV%.csv}.manifest ]] &&
+   grep -qx 'tp_weight_layout=q4k-ffn-intermediate' "${CSV%.csv}.manifest"; then
+  python3 "$(dirname -- "$0")/glm5_tp_layout.py" \
+    --logs "$COORD_LOG" "$WORKER_LOG"
+fi
 for log in "$COORD_LOG" "$WORKER_LOG"; do
   grep -q 'expanded_weight_cache_bytes=0' "$log" || {
     echo "error: benchmark lacks an exact zero expanded-weight-cache counter: $log" >&2

@@ -1028,6 +1028,10 @@ fi
   exit 1
 }
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+TP_LAYOUT_FIELDS=
+if [[ $MODEL_ARCH == glm5-next && ${ROUTED_FAMILY:-} == Q4_K ]]; then
+  TP_LAYOUT_FIELDS=$(python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL")
+fi
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   FROZEN_TOKEN_HASH=$(sha256sum "$FROZEN_TOKEN_FILE" | awk '{print $1}')
@@ -1071,6 +1075,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
     "$BENCH_BINARY_PRODUCER_SOURCE_SHA256"
   printf 'model=%s\n' "$MODEL"
   printf 'model_arch=%s\n' "$MODEL_ARCH"
+  [[ -z $TP_LAYOUT_FIELDS ]] || printf '%s\n' "$TP_LAYOUT_FIELDS"
   printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
   printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
   printf 'prompt=%s\n' "$PROMPT_FILE"
@@ -1364,6 +1369,11 @@ if [[ -n $CANDIDATE_ID ]] && (( HEADLINE_CLASSIFY_RC != 0 )); then
 fi
 if (( RESULT_RECORD_RC != 0 )); then
   exit "$RESULT_RECORD_RC"
+fi
+if [[ -n $TP_LAYOUT_FIELDS ]]; then
+  python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL" \
+    --logs "$COORD_LOG" "$WORKER_LOG" >/dev/null
+  echo "validated_glm5_tp_layout=q4k-ffn-intermediate,both-ranks"
 fi
 if [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]]; then
   compare_layer_re=${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-'[0-9]+'}

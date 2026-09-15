@@ -14,6 +14,10 @@ from copy import deepcopy
 from pathlib import Path
 
 
+if os.environ.get("DS4_GATE_CLEAN_TEST") != "1":
+    raise SystemExit("run via tests/test_lane_c_oracle_gate.sh")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "candidate_gate", ROOT / "scripts" / "candidate-gate.py")

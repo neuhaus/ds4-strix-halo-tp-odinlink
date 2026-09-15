@@ -45,6 +45,8 @@ VERIFIER_FILES = {
     "worker_supervisor": "scripts/tp-worker-supervisor.sh",
     "research_root": "scripts/ds4-research-root.sh",
     "gguf_tensor_types": "scripts/gguf_tensor_types.py",
+    "glm5_tp_layout": "scripts/glm5_tp_layout.py",
+    "glm5_gguf_reader": "scripts/check-glm5-next-gguf.py",
     "performance_design": "scripts/promotion-boundary-repeated-student-v1.json",
     "performance_calibrator": "scripts/calibrate-promotion-boundary.py",
 }
