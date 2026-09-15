@@ -191,6 +191,10 @@ def _timing_noise_run(repo: Path, root: Path, value: object, *,
             manifest.get("ds4_sha256") != anchor["ds4_sha256"] or
             manifest.get("peer_ds4_sha256") != anchor["ds4_sha256"]):
         raise GateError("timing-noise run differs from the baseline scope")
+    bench_binary = verify_benchmark_producer(
+        repo, manifest, key["source_commit"], "timing-noise benchmark")
+    if bench_binary != anchor.get("ds4_bench_tp_sha256"):
+        raise GateError("timing-noise run used a different benchmark binary")
     environment = normalized_manifest_environment(
         manifest, "timing-noise manifest")
     if environment != anchor["environment"]:
@@ -525,6 +529,30 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def committed_source_sha256(repo: Path, commit: str, relative: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{relative}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise GateError(
+            f"cannot resolve {relative} from benchmark source commit {commit}")
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def verify_benchmark_producer(repo: Path, manifest: dict[str, str],
+                              source_commit: str, label: str) -> str:
+    bench_binary = manifest.get("ds4_bench_tp_sha256", "")
+    producer_source = manifest.get("ds4_bench_producer_source_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", bench_binary):
+        raise GateError(f"{label} has no valid benchmark binary identity")
+    if (not re.fullmatch(r"[0-9a-f]{64}", producer_source) or
+            producer_source != committed_source_sha256(
+                repo, source_commit, "ds4_bench.c")):
+        raise GateError(
+            f"{label} producer binary does not match committed ds4_bench.c")
+    return bench_binary
 
 
 def canonical_sha256(value: object) -> str:
@@ -1029,7 +1057,7 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
         for provider, anchor in performance.items():
             if (not isinstance(anchor, dict) or
                     set(anchor) != {"runs", "geometric_mean_tps", "environment",
-                                    "ds4_sha256"} or
+                                    "ds4_sha256", "ds4_bench_tp_sha256"} or
                     not isinstance(anchor["runs"], int) or anchor["runs"] < 3 or
                     not isinstance(anchor["geometric_mean_tps"], dict) or
                     set(anchor["geometric_mean_tps"]) != {"prefill", "decode"} or
@@ -1041,7 +1069,9 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
                     any(not isinstance(item, str)
                         for item in anchor["environment"].values()) or
                     not re.fullmatch(r"[0-9a-f]{64}",
-                                     str(anchor["ds4_sha256"]))):
+                                     str(anchor["ds4_sha256"])) or
+                    not re.fullmatch(r"[0-9a-f]{64}",
+                                     str(anchor["ds4_bench_tp_sha256"]))):
                 raise GateError(
                     f"production baseline has invalid {provider} performance anchor: {path}")
     if (value["schema_version"] == 2 and
@@ -1363,8 +1393,10 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
         provider: {"prefill": [], "decode": []} for provider in providers}
     provider_environments: dict[str, dict[str, str]] = {}
     provider_binaries: dict[str, str] = {}
+    provider_bench_binaries: dict[str, str] = {}
     run_ids = set()
     binary_hashes = set()
+    bench_binary_hashes = set()
     for item in benchmark_items:
         if (not isinstance(item, dict) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) or
@@ -1412,8 +1444,34 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 manifest.get("toolchain_id") != key.get("toolchain_id") or
                 manifest.get("dspark") != "0"):
             raise GateError("baseline genesis benchmark identity mismatch")
+        bench_binary = verify_benchmark_producer(
+            repo, manifest, key["source_commit"], "baseline genesis benchmark")
         verify_tp_layout_manifest(manifest, layout,
                                   "baseline genesis benchmark layout")
+        rank_paths = {}
+        for rank in ("coordinator", "worker"):
+            for suffix in ("log", "status"):
+                name = f"{rank}_{suffix}"
+                path = _bound_timing_artifact(
+                    item.get(name), root, f"baseline genesis {name}")
+                expected = csv_path.parent / f"{rank}-{manifest.get('tag', '')}.{suffix}"
+                if path != expected:
+                    raise GateError(f"baseline genesis {name} is not adjacent to its CSV")
+                rank_paths[name] = path
+            status = read_manifest(rank_paths[f"{rank}_status"])
+            if status.get("exit_code") != "0" or status.get("signal") != "0":
+                raise GateError(f"baseline genesis {rank} did not exit cleanly")
+        checked = subprocess.run([
+            str(repo / "scripts/check-ds4-bench-result.sh"), str(csv_path),
+            str(rank_paths["coordinator_log"]), str(rank_paths["worker_log"]),
+            fnv, str(workload["generated_tokens"]), "0", provider,
+            manifest.get("coordinator_rdma_device", ""),
+            manifest.get("rdma_gid_index", ""),
+            manifest.get("worker_rdma_device", ""), manifest.get("run_id", ""),
+        ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if checked.returncode != 0:
+            raise GateError("baseline genesis runtime validation failed: " +
+                            (checked.stderr.strip() or checked.stdout.strip()))
         for field in workload_manifest_fields(workload):
             if manifest.get(field) != str(workload.get(field, "")):
                 raise GateError(f"baseline genesis benchmark differs in {field}")
@@ -1427,10 +1485,18 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             raise GateError("baseline genesis provider runs used different binaries")
         provider_binaries[provider] = local_binary
         binary_hashes.add(local_binary)
+        if (provider in provider_bench_binaries and
+                provider_bench_binaries[provider] != bench_binary):
+            raise GateError(
+                "baseline genesis provider runs used different benchmark binaries")
+        provider_bench_binaries[provider] = bench_binary
+        bench_binary_hashes.add(bench_binary)
     if any(count < 3 for count in provider_counts.values()):
         raise GateError("baseline genesis requires three runs per RDMA provider")
     if len(binary_hashes) != 1:
         raise GateError("baseline genesis benchmarks used different binaries")
+    if len(bench_binary_hashes) != 1:
+        raise GateError("baseline genesis benchmarks used different benchmark binaries")
     reference["performance"] = {
         provider: {
             "runs": provider_counts[provider],
@@ -1440,6 +1506,7 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             },
             "environment": provider_environments[provider],
             "ds4_sha256": provider_binaries[provider],
+            "ds4_bench_tp_sha256": provider_bench_binaries[provider],
         }
         for provider in providers
     }
@@ -3131,6 +3198,14 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
                              str(next(iter(candidate_binary_hashes), "")))):
         raise GateError("headline candidate runs used different binaries")
     candidate_binary_sha256 = next(iter(candidate_binary_hashes))
+    candidate_bench_hashes = {
+        manifest.get("ds4_bench_tp_sha256") for manifest in benchmark_manifests
+    }
+    if (len(candidate_bench_hashes) != 1 or
+            not re.fullmatch(r"[0-9a-f]{64}",
+                             str(next(iter(candidate_bench_hashes), "")))):
+        raise GateError(
+            "headline candidate runs used different benchmark executables")
     candidate_switches = value["promotion_intent"]["candidate_switches"]
     expected_switches = {
         name: arms["candidate"] for name, arms in candidate_switches.items()
@@ -3207,6 +3282,7 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         "headline_invalidation_count": invalidation_count,
         "prior_formal_candidates": prior_candidates,
         "candidate_binary_sha256": candidate_binary_sha256,
+        "candidate_bench_sha256": next(iter(candidate_bench_hashes)),
     }
 
 
@@ -3263,6 +3339,8 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                         },
                         "environment": environment,
                         "ds4_sha256": candidate_manifests[0]["ds4_sha256"],
+                        "ds4_bench_tp_sha256":
+                            derived["candidate_bench_sha256"],
                     },
                 },
                 "numerical": {

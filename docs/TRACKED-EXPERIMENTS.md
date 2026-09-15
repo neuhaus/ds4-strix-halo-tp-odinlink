@@ -66,8 +66,9 @@ directly merging a paused or given-up branch.
    `record-result` seals the CSV state, manifest, both logs, both statuses, and
    completion/cleanup attestations before another arm may start. The producer
    flushes its completion attestation before exposing the timing row. Before
-   launch, its executable must report the SHA-256 of the committed
-   `ds4_bench.c`; a stale producer consumes no formal arm.
+   baseline or candidate launch, its executable must report the SHA-256 of the
+   live `ds4_bench.c`; genesis and promotion independently resolve the
+   committed bytes. A stale producer is ineligible and consumes no formal arm.
    Finish both arms before beginning the next pair. Invalidate only the latest
    pair when its first journaled arm failed before producing a complete result;
    once the second arm is journaled the pair cannot be replaced. Name the exact

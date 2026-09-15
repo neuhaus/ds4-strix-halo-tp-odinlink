@@ -1077,24 +1077,25 @@ BINARY_RUNPATH=$(LC_ALL=C readelf -d "$REPO/ds4" 2>/dev/null |
 TOOLCHAIN_ID=${DECLARED_TOOLCHAIN_ID:-elf-comment-sha256:$BINARY_TOOLCHAIN_SHA256}
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
 BENCH_PRODUCER_SOURCE_SHA256=$(sha256sum "$REPO/ds4_bench.c" | awk '{print $1}')
-BENCH_BINARY_PRODUCER_SOURCE_SHA256=unverified
-if [[ $CANDIDATE == 1 ]]; then
-  if ! BENCH_BINARY_PRODUCER_SOURCE_SHA256=$(
-    "$REPO/ds4-bench-tp" --producer-source-sha256 2>/dev/null
-  ); then
-    echo "error: candidate benchmark binary has no producer source identity; rebuild it" >&2
-    exit 1
-  fi
-  [[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
-    echo "error: candidate benchmark binary returned an invalid producer source identity" >&2
-    exit 1
-  }
-  [[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 == "$BENCH_PRODUCER_SOURCE_SHA256" ]] || {
-    echo "error: candidate benchmark binary is stale for ds4_bench.c; rebuild it" >&2
-    exit 1
-  }
+if ! BENCH_BINARY_PRODUCER_SOURCE_SHA256=$(
+  "$REPO/ds4-bench-tp" --producer-source-sha256 2>/dev/null
+); then
+  echo "error: benchmark binary has no producer source identity; rebuild it" >&2
+  exit 1
 fi
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+  echo "error: benchmark binary returned an invalid producer source identity" >&2
+  exit 1
+}
+[[ $BENCH_BINARY_PRODUCER_SOURCE_SHA256 == "$BENCH_PRODUCER_SOURCE_SHA256" ]] || {
+  echo "error: benchmark binary is stale for ds4_bench.c; rebuild it" >&2
+  exit 1
+}
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+TP_LAYOUT_FIELDS=
+if [[ $MODEL_ARCH == glm5-next && ${ROUTED_FAMILY:-} == Q4_K ]]; then
+  TP_LAYOUT_FIELDS=$(python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL")
+fi
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   FROZEN_TOKEN_HASH=$(sha256sum "$FROZEN_TOKEN_FILE" | awk '{print $1}')
@@ -1138,6 +1139,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
     "$BENCH_BINARY_PRODUCER_SOURCE_SHA256"
   printf 'model=%s\n' "$MODEL"
   printf 'model_arch=%s\n' "$MODEL_ARCH"
+  [[ -z $TP_LAYOUT_FIELDS ]] || printf '%s\n' "$TP_LAYOUT_FIELDS"
   printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
   printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
   printf 'prompt=%s\n' "$PROMPT_FILE"
@@ -1434,6 +1436,11 @@ if [[ -n $CANDIDATE_ID ]] && (( HEADLINE_CLASSIFY_RC != 0 )); then
 fi
 if (( RESULT_RECORD_RC != 0 )); then
   exit "$RESULT_RECORD_RC"
+fi
+if [[ -n $TP_LAYOUT_FIELDS ]]; then
+  python3 "$REPO/scripts/glm5_tp_layout.py" "$MODEL" \
+    --logs "$COORD_LOG" "$WORKER_LOG" >/dev/null
+  echo "validated_glm5_tp_layout=q4k-ffn-intermediate,both-ranks"
 fi
 if [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]]; then
   compare_layer_re=${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-'[0-9]+'}

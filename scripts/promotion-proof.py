@@ -49,7 +49,7 @@ RUN_ARTIFACTS = (
 )
 PAIR_ALLOWED_BUILD_FIELDS = {
     "source_commit", "ds4_sha256", "peer_ds4_sha256",
-    "ds4_bench_tp_sha256", "ds4_bench_producer_source_sha256",
+    "ds4_bench_tp_sha256",
 }
 SWITCH_MANIFEST_FIELDS = {
     "glm5_bf16_wmma_hilo": "DS4_ROCM_GLM5_BF16_WMMA_HILO",
@@ -251,7 +251,7 @@ def read_manifest(path: Path) -> dict[str, str]:
 
 def committed_source_sha256(repo: Path, commit: str, relative: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{commit}:{relative}"],
+        ["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{relative}"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise ProofError(
@@ -303,6 +303,11 @@ def normalize_run(value: object, root: Path, repo: Path, *,
     manifest = read_manifest(paths["manifest"])
     producer_source = manifest.get("ds4_bench_producer_source_sha256", "")
     source_commit = manifest.get("source_commit", "")
+    bench_binary = manifest.get("ds4_bench_tp_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ProofError("benchmark source commit identity is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", bench_binary):
+        raise ProofError("benchmark executable identity is invalid")
     if (not re.fullmatch(r"[0-9a-f]{64}", producer_source) or
             producer_source != committed_source_sha256(
                 repo, source_commit, "ds4_bench.c")):
@@ -725,6 +730,13 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if available.returncode != 0:
             raise ProofError(f"{role} source commit is unavailable in the repository")
+    producer_sources = {
+        role: committed_source_sha256(repo, commit, "ds4_bench.c")
+        for role, commit in source_commits.items()
+    }
+    if len(set(producer_sources.values())) != 1:
+        raise ProofError(
+            "paired control and candidate benchmark producer source differs")
     performance_policy = validate_performance_policy(spec["performance"])
     if spec["required_provider"] != performance_policy["contract"]["required_provider"]:
         raise ProofError("proof provider differs from the frozen performance contract")
@@ -876,12 +888,13 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         all_runs.extend((pair["control"], pair["candidate"]))
     all_pairs = [*pairs, *(item["pair"] for item in final_screens)]
     for arm in ("control", "candidate"):
-        binaries = {
-            pair[arm]["manifest"].get("ds4_sha256") for pair in all_pairs
-        }
-        if len(binaries) != 1:
-            raise ProofError(
-                f"{arm} runs did not use one binary across all proof cells")
+        for field, label in (
+                ("ds4_sha256", "binary"),
+                ("ds4_bench_tp_sha256", "benchmark executable")):
+            identities = {pair[arm]["manifest"].get(field) for pair in all_pairs}
+            if len(identities) != 1:
+                raise ProofError(
+                    f"{arm} runs did not use one {label} across all proof cells")
     run_ids = [run["manifest"].get("run_id") for run in all_runs]
     if len(set(run_ids)) != len(run_ids):
         raise ProofError("promotion proof reuses a process run in multiple slots")

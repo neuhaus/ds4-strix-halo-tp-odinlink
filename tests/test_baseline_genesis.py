@@ -16,6 +16,10 @@ from copy import deepcopy
 from pathlib import Path
 
 
+if os.environ.get("DS4_GATE_CLEAN_TEST") != "1":
+    raise SystemExit("run via tests/test_baseline_genesis.sh")
+
+
 REPO = Path(__file__).resolve().parents[1]
 GATE = REPO / "scripts" / "candidate-gate.py"
 sys.path.insert(0, str(REPO / "scripts"))
@@ -35,6 +39,13 @@ GLM_TP_LAYOUT = {
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def committed_digest(commit: str, relative: str) -> str:
+    content = subprocess.check_output([
+        "git", "-C", str(REPO), "cat-file", "blob", f"{commit}:{relative}",
+    ])
+    return hashlib.sha256(content).hexdigest()
 
 
 def canonical(value: object) -> str:
@@ -195,6 +206,8 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
     workload = key["workload"]
     provider = "roce-v2"
     binary = "b" * 64
+    bench_binary = "d" * 64
+    producer_source = committed_digest(key["source_commit"], "ds4_bench.c")
     effects = [0.0020, -0.0015, -0.0020, 0.0015, 0.0010,
                -0.0005, -0.0010, 0.0005, 0.0]
     decode_effects = effects[3:] + effects[:3]
@@ -244,6 +257,8 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
                 "run_id": run_id,
                 "source_commit": key["source_commit"], "source_dirty": 0,
                 "ds4_sha256": binary, "peer_ds4_sha256": binary,
+                "ds4_bench_tp_sha256": bench_binary,
+                "ds4_bench_producer_source_sha256": producer_source,
                 "model": str(model), "model_arch": "glm5-next",
                 "model_size": key["model_size"],
                 "model_sample_sha256": key["model_sample_sha256"],
@@ -277,10 +292,12 @@ def make_timing_noise(root: Path, record: dict, model: Path) -> Path:
             coordinator = root / f"coordinator-{name}.log"
             worker = root / f"worker-{name}.log"
             coordinator.write_text(
+                "ds4: GLM5 compact Q4_K K-shard active: rank=0 layers=42 rows=0:1024 down-bytes=0:576\n"
                 "ds4-tp: worker connected, transport=rdma\n"
                 "ds4-tp: rdma device mlx5_0 (port state 4)\n"
                 f"ds4-tp: benchmark run_id={run_id}\n" + common_log)
             worker.write_text(
+                "ds4: GLM5 compact Q4_K K-shard active: rank=1 layers=42 rows=1024:2048 down-bytes=576:1152\n"
                 "ds4-tp: leader connected, transport=rdma\n"
                 "ds4-tp: rdma device mlx5_1 (port state 4)\n"
                 f"ds4-tp: benchmark run_id={run_id}\n" + common_log)
@@ -448,6 +465,7 @@ def build_fixture(root: Path, structured: bool = True,
     source_commit = subprocess.check_output(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True
     ).strip()
+    producer_source = committed_digest(source_commit, "ds4_bench.c")
     token_file = root / "frozen.tokens"
     token_file.write_text("1\n" * 300)
     token_sha = digest(token_file)
@@ -461,7 +479,7 @@ def build_fixture(root: Path, structured: bool = True,
             name = f"{provider}-{index + 1}"
             csv_path = root / f"{name}.csv"
             with csv_path.open("w", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=[
+                writer = csv.DictWriter(stream, lineterminator="\n", fieldnames=[
                     "ctx_tokens", "prefill_tokens", "prefill_tps", "gen_tokens",
                     "gen_tps", "gen_first_ms", "gen_steady_tokens",
                     "gen_steady_tps", "kvcache_bytes", "gen_cycles",
@@ -485,7 +503,11 @@ def build_fixture(root: Path, structured: bool = True,
                 "toolchain_id": toolchain, "prompt_sha256": prompt_sha,
                 "frontier": 2048, "generated_tokens": 300, "context": 4096,
                 "prefill_chunk": 2048, "dspark": 0, "rdma_profile": provider,
+                "coordinator_rdma_device": "mlx5_0",
+                "worker_rdma_device": "mlx5_1", "rdma_gid_index": 3,
                 "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
+                "ds4_bench_tp_sha256": "d" * 64,
+                "ds4_bench_producer_source_sha256": producer_source,
                 "common_env": f"DS4_BENCH_RUN_ID={run_id}",
                 "worker_env": f"DS4_BENCH_RUN_ID={run_id}",
                 "coordinator_env": f"DS4_BENCH_RUN_ID={run_id}",
@@ -502,10 +524,33 @@ def build_fixture(root: Path, structured: bool = True,
                     "tp_reduce_dtype": "f32",
                 })
             write_manifest(manifest, manifest_values)
-            benchmarks.append({
+            benchmark = {
                 "path": str(csv_path), "sha256": digest(csv_path),
                 "manifest_sha256": digest(manifest),
-            })
+            }
+            for rank, role, device in ((0, "coordinator", "mlx5_0"),
+                                       (1, "worker", "mlx5_1")):
+                log = root / f"{role}-{name}.log"
+                status = log.with_suffix(".status")
+                connected = "worker" if rank == 0 else "leader"
+                log.write_text(
+                    f"ds4-tp: {connected} connected, transport=rdma\n"
+                    f"ds4-tp: benchmark run_id={run_id}\n"
+                    f"ds4-tp: rdma device {device} (port state 4)\n"
+                    "ds4-tp: rdma GID index 3 (RoCE v2)\n"
+                    "ds4-tp: mlx5 queue pair uses RC\n"
+                    "ds4-tp: mlx5 registered host slab as 3 MRs\n"
+                    '{"fallback_calls":0}\n'
+                    "ds4: memory promotion: expanded_weight_cache_bytes=0\n"
+                    "ds4-tp: transport proof requested=rdma active=rdma "
+                    "payload_fallback_calls=0 failed=0\n"
+                    f"ds4: GLM5 compact Q4_K K-shard active: rank={rank} layers=42 "
+                    f"rows={rank * 1024}:{(rank + 1) * 1024} "
+                    f"down-bytes={rank * 576}:{(rank + 1) * 576}\n")
+                write_manifest(status, {"exit_code": 0, "signal": 0})
+                benchmark[f"{role}_log"] = artifact(log)
+                benchmark[f"{role}_status"] = artifact(status)
+            benchmarks.append(benchmark)
 
     numerical_dir = root / "numerical"
     numerical_dir.mkdir()
@@ -764,6 +809,33 @@ def main() -> int:
                             values.__setitem__("peer_ds4_sha256", "c" * 64))),
         "provider runs used different binaries")
     expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.pop("ds4_bench_producer_source_sha256")),
+        "producer binary does not match")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__(
+                "ds4_bench_producer_source_sha256", "0" * 64)),
+        "producer binary does not match")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.pop("ds4_bench_tp_sha256")),
+        "no valid benchmark binary identity")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__(
+                "ds4_bench_tp_sha256", "unverified")),
+        "no valid benchmark binary identity")
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0,
+            lambda values: values.__setitem__("ds4_bench_tp_sha256", "e" * 64)),
+        "provider runs used different benchmark binaries")
+    expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: (
                 value["record"]["key"].pop("source_commit"),
@@ -806,6 +878,29 @@ def main() -> int:
         lambda _root, genesis: mutate_benchmark_manifest(
             genesis, 0, lambda values: values.pop("tp_reduce_width")),
         "differs in tp_reduce_width", structured=True)
+
+    def mutate_rank_artifact(genesis, name, transform):
+        value = json.loads(genesis.read_text())
+        bound = value["artifacts"]["benchmarks"][0][name]
+        path = Path(bound["path"])
+        path.write_text(transform(path.read_text()))
+        bound["sha256"] = digest(path)
+        genesis.write_text(json.dumps(value))
+
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "worker_log", lambda text: "\n".join(
+                line for line in text.splitlines() if "K-shard active" not in line)),
+        "lacks a unique matching TP allocation", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "worker_status", lambda text: text.replace("exit_code=0", "exit_code=1")),
+        "worker did not exit cleanly", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "coordinator_log", lambda text: text.replace(
+                "payload_fallback_calls=0", "payload_fallback_calls=1")),
+        "zero-payload-fallback proof", structured=True)
     expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: value["record"].__setitem__(
