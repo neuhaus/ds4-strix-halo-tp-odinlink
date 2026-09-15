@@ -141,10 +141,32 @@ def test_registration_and_tampering(root: Path) -> None:
     assert_raises("unpromoted candidate source commit", lambda: controls.register_control(
         REPO, root, descriptor))
     (dossier / "CLOSED.json").write_text("{}\n")
+    unrelated = root / "candidates" / "binary-evidence"
+    unrelated.mkdir()
+    bundle = unrelated / "source.bundle"
+    bundle.write_bytes(b"# v2 git bundle\n\x98\xff\x00")
+    binary_ref = {"kind": "source-bundle", "path": str(bundle),
+                  "sha256": controls.sha256(bundle)}
+    candidate_record = {"candidate_id": "binary-evidence",
+                        "source": {"commit": "1" * 40},
+                        "evidence": [binary_ref]}
+    (unrelated / "candidate.json").write_text(json.dumps(candidate_record))
     control_id = controls.register_control(REPO, root, descriptor)
     record = controls.load_control(root, control_id)
     assert record["control_id"] == "registration-fixture"
     first = candidate / "decode_000000.logits.json"
+    # Binary evidence is not JSON, but its directly bound hash must still
+    # participate in reuse checks, as must hashes nested in JSON proofs.
+    reused = {**binary_ref, "sha256": controls.sha256(first)}
+    candidate_record["evidence"] = [reused]
+    (unrelated / "candidate.json").write_text(json.dumps(candidate_record))
+    assert_raises("reuses artifacts", lambda: controls.register_control(REPO, root, descriptor))
+    proof = unrelated / "proof.json"
+    proof.write_text(json.dumps({"nested": {"sha256": controls.sha256(first)}}))
+    candidate_record["evidence"] = [binary_ref, {"kind": "proof", "path": str(proof),
+                                                "sha256": controls.sha256(proof)}]
+    (unrelated / "candidate.json").write_text(json.dumps(candidate_record))
+    assert_raises("reuses artifacts", lambda: controls.register_control(REPO, root, descriptor))
     first.write_text("tampered\n")
     assert_raises("hash mismatch", lambda: controls.load_control(root, control_id))
 
@@ -267,12 +289,17 @@ def test_calibration_rules(root: Path) -> None:
         }))
         candidate_dir = root / "candidates" / "late-candidate"
         candidate_dir.mkdir(parents=True)
+        bundle = candidate_dir / "source.bundle"
+        bundle.write_bytes(b"# v2 git bundle\n\x98\xff\x00")
         (candidate_dir / "candidate.json").write_text(json.dumps({
             "candidate_id": "late-candidate", "baseline_id": baseline_id,
+            "evidence": [{"kind": "source-bundle", "path": str(bundle),
+                          "sha256": controls.sha256(bundle)}],
         }))
         controls.append_event(root, {
             "type": "candidate-init", "candidate_id": "late-candidate",
         })
+        controls.evaluate_calibration(REPO, root, calibration, scope, previous, proposed)
         records["late-holdout"] = deepcopy(records["holdout"])
         controls.append_event(root, {
             "type": "control-register", "control_id": "late-holdout",

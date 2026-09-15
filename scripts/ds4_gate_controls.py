@@ -409,7 +409,7 @@ def register_control(repo: Path, root: Path, descriptor_path: Path) -> str:
                 if path.is_file():
                     candidate_hashes.update(artifact_hashes(json.loads(
                         path.read_text(encoding="utf-8"))))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
     if artifact_hashes(comparisons) & candidate_hashes:
         raise ControlError("control reuses artifacts from an unpromoted candidate")
@@ -641,7 +641,7 @@ def evaluate_calibration(repo: Path, root: Path, calibration: object,
                 try:
                     candidate_hashes.update(artifact_hashes(json.loads(
                         evidence_path.read_text(encoding="utf-8"))))
-                except (OSError, json.JSONDecodeError):
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     pass
         if selected_hashes & candidate_hashes:
             raise ControlError(
