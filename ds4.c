@@ -61755,6 +61755,12 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#ifndef DS4_NO_GPU
+    /* Library-session users need the live cache counter too. Report before
+     * teardown releases GPU state, outside the generation timing interval. */
+    if (e->metal_ready && getenv("DS4_METAL_MEMORY_REPORT") != NULL)
+        ds4_gpu_print_memory_report("before engine cleanup");
+#endif
 #if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_TP_READY))
     if (e->tp.active || e->tp.ctx || e->tp.slab || e->tp.zero_vec ||
         e->tp.out_views || e->tp.in_views || e->tp.batch_out_views ||
