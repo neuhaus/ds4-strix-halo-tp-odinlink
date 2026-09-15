@@ -6,7 +6,7 @@ OdinLink GPU RDMA, over a Mellanox RoCE v2 link, or over a directly connected
 native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 
 - **2 × Ryzen AI MAX+ 395 / Radeon 8060S**
-- **2 × 128 GB installed RAM; 96 GiB ROCm aperture per node**
+- **2 × 128 GB installed RAM**
 - **Tensor parallelism = 2**
 - **Cache-free Q4_K production defaults**
 - **256K-context server profile**
@@ -22,29 +22,27 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run | **233.53 t/s** | **19.96 t/s** | measured on unmerged successor `9fefea6`, 2026-09-14; FNV `5e0fa38210276c41`, zero fallback |
-| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **231.87 t/s** | **19.92 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `5e0fa38210276c41`, zero fallback |
+| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **270.10 t/s** | **19.89 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `0163c44015591445`, zero fallback |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **304.22 t/s** | **21.19 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `0163c44015591445`, zero fallback |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-These are unmerged single-run results; Huihui and Antirez use different models
-and are not directly comparable. Paired 100-case Q4/Q2 quality scores matched
-`main`; the required 8K gate is pending.
-
-The cache-free slab repair preserved exact fingerprints and zero fallback across
-both Q4_K layouts and RDMA providers. On the affected layout, OdinLink prefill
-improved from 147.99 to **286.29 t/s** at **21.10 decode t/s**; RoCE v2 reached
-**319.05/21.22 t/s**.
+The current rates are individual regression observations, not repeated-run
+headline estimates. Both quantizations preserved the paired control fingerprint
+and met the 3% regression limits. Huihui and Antirez use different model files;
+their rates are not a controlled engine comparison. No expanded-weight cache
+or payload fallback was used.
 
 ### Q4_K throughput through 10K context
 
 ![Antirez DeepSeek V4 Flash Q4_K TP=2 throughput through 10K context](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
 
-This RoCE v2 sweep follows the upstream `ds4-bench` convention: each point
+This historical RoCE v2 sweep follows the upstream `ds4-bench` convention: each point
 adds 2,048 prompt tokens at the stated context frontier, then measures 300
 generated tokens. It uses the same diverse prompt corpus throughout. The
 separate full 10,240-token prefill has a three-run median of **289.23 t/s**;
-its decode median is **18.76 t/s**.
+its decode median is **18.76 t/s**. The sweep has not been repeated for the
+September 15 update.
 
 ```sh
 DS4_BENCH_RDMA_PROFILE=roce-v2 \
@@ -61,28 +59,24 @@ DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; one run | **100.38 t/s** | **10.95 t/s** | restored research recipe, 2026-09-14; FNV `9012bd4d7c5ce422`, zero fallback; diagnostic, not promoted |
-| **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
-| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256 | **52.74 t/s** | **10.35 t/s** | current source-clean mixed IQ2_XXS/Q2_K run; exact FNV `4dabfb16bc99c81b` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; geometric mean of nine paired runs | **93.43 t/s** | **10.29 t/s** | source `71e6a24`, 2026-09-15; exact FNV `9012bd4d7c5ce422`, zero fallback |
+| **GLM-5.3 Flash Q4_K over OdinLink** | 4,096 prompt + 300 decode, batch 256; one matched diagnostic pair | **97.89 t/s** | **9.77 t/s** | candidate `71e6a24`, 2026-09-15; exact FNV `9012bd4d7c5ce422`, zero fallback |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256; one matched diagnostic pair | **36.31 t/s** | **10.39 t/s** | candidate `71e6a24`, 2026-09-15; mixed IQ2_XXS/Q2_K, exact FNV `4dabfb16bc99c81b`, zero fallback |
 
-The Q4_K RoCE v2 row uses the unchanged original Antirez GGUF and reports
-steady decode (overall decode: 10.94 t/s). It restores
-`DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED=1` on frozen research executables;
-their original build provenance is incomplete, and the underlying Q8 path's
-quality gate remains open. It is not a source-bound release benchmark or a
-successor-branch measurement. Evidence and executable hashes are recorded in
-`$DS4_RESEARCH_ROOT/candidates/glm53-flash-roce-v2-20260912/prefill-recipe-repair-20260914.md`;
-the run is `bench-runs/glm53-recipe-check-4096-shared1-r3bin-r1` within that
-candidate directory. The source-clean main baseline remains 95.42 prefill /
-9.95 decode t/s. The 300 prefill / 20 decode t/s GLM target remains unmet.
+The Q4_K RoCE v2 result uses the unchanged original Antirez GGUF and overall
+decode throughput. All nine runs are retained, including the 58.71 t/s prefill
+sample. The matched control averaged 87.45/10.11 t/s. Numerical300, paired
+100-case quality, 8K context, and DeepSeek Q4/Q2 checks passed. The 300 prefill /
+20 decode t/s GLM target remains unmet. See the [measured recipe](docs/GLM53-ROCE-RECIPE.md).
 
-The main Q4_K path keeps all 4,096 prompt rows batched, adds no persistent
-weight cache, and uses 45.07 MiB of reusable scratch per rank.
+The other two GLM rows are single candidate observations. Their matched
+controls measured 90.79/9.74 t/s for Q4 OdinLink and 38.44/10.52 t/s for Q2
+RoCE v2; the latter pair showed 5.5% lower candidate prefill.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its main Q4_K rows
 use the Antirez reference model listed below. The Antirez Q4_K model does not
-fit one node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
+fit one 128 GB node; TP=2 keeps one expert shard on each node. Q2_K
 and Q4_K run without a persistent expanded-weight cache.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
@@ -114,7 +108,7 @@ policy, and maintainer gates are preserved locally under
 | Model source | Tested target files | Support |
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
-| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Used for the September 14 research Q2_K and Q4_K runs. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. Q2_K is used for the current RoCE v2 row; Q4_K has separate research measurements. |
 | [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 

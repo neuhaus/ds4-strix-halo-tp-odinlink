@@ -2941,6 +2941,25 @@ def environment_without_switches(environment: dict[str, str],
             if name not in switches and name not in VOLATILE_BENCH_ENV}
 
 
+def control_anchor_environment(manifest: dict[str, str], switches: dict,
+                               label: str) -> dict[str, dict[str, str]]:
+    environment = {
+        field: environment_without_switches(
+            parse_env(manifest[field], f"{label} {field}"), switches)
+        for field in ENV_FIELDS
+    }
+    # Launchers may repeat an explicit trailing assignment in their common
+    # defaults. It is redundant only when the same value is explicitly bound
+    # in extra_env AND both final rank environments. Never infer defaults or
+    # ignore an actual rank setting, even for reporting switches.
+    environment["common_env"] = {
+        name: value for name, value in environment["common_env"].items()
+        if not all(environment[field].get(name) == value
+                   for field in (*RANK_ENV_FIELDS, "extra_env"))
+    }
+    return environment
+
+
 def verify_control_anchor(proof: dict, baseline: dict,
                           candidate_switches: dict) -> None:
     provider = proof["required_provider"]
@@ -2949,15 +2968,12 @@ def verify_control_anchor(proof: dict, baseline: dict,
         raise GateError("active baseline has no performance anchor for proof provider")
     pairs = proof["headline_pairs"]
     controls = [pair["control"]["manifest"] for pair in pairs]
-    baseline_environment = anchor["environment"]
+    expected = control_anchor_environment(
+        anchor["environment"], candidate_switches, "baseline")
     for manifest in controls:
+        current = control_anchor_environment(manifest, candidate_switches, "control")
         for field in ENV_FIELDS:
-            current = environment_without_switches(
-                parse_env(manifest[field], f"control {field}"), candidate_switches)
-            expected = environment_without_switches(
-                parse_env(baseline_environment[field], f"baseline {field}"),
-                candidate_switches)
-            if current != expected:
+            if current[field] != expected[field]:
                 raise GateError(
                     f"control off-path environment differs from baseline in {field}")
     source_is_baseline = (

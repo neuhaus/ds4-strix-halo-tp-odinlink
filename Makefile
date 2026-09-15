@@ -102,6 +102,7 @@ test-quality-gates:
 	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
 	./tests/run-clean-gate-python.sh tests/test_baseline_control_journal.py
+	python3 tests/test_control_anchor_env.py
 	./tests/test_glm5_prefill_proof.sh
 	./tests/test_bench_producer_identity.sh
 	./tests/test_tp_worker_supervisor.sh
