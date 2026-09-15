@@ -479,7 +479,7 @@ def build_fixture(root: Path, structured: bool = True,
             name = f"{provider}-{index + 1}"
             csv_path = root / f"{name}.csv"
             with csv_path.open("w", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=[
+                writer = csv.DictWriter(stream, lineterminator="\n", fieldnames=[
                     "ctx_tokens", "prefill_tokens", "prefill_tps", "gen_tokens",
                     "gen_tps", "gen_first_ms", "gen_steady_tokens",
                     "gen_steady_tps", "kvcache_bytes", "gen_cycles",
@@ -503,6 +503,8 @@ def build_fixture(root: Path, structured: bool = True,
                 "toolchain_id": toolchain, "prompt_sha256": prompt_sha,
                 "frontier": 2048, "generated_tokens": 300, "context": 4096,
                 "prefill_chunk": 2048, "dspark": 0, "rdma_profile": provider,
+                "coordinator_rdma_device": "mlx5_0",
+                "worker_rdma_device": "mlx5_1", "rdma_gid_index": 3,
                 "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
                 "ds4_bench_tp_sha256": "d" * 64,
                 "ds4_bench_producer_source_sha256": producer_source,
@@ -522,10 +524,33 @@ def build_fixture(root: Path, structured: bool = True,
                     "tp_reduce_dtype": "f32",
                 })
             write_manifest(manifest, manifest_values)
-            benchmarks.append({
+            benchmark = {
                 "path": str(csv_path), "sha256": digest(csv_path),
                 "manifest_sha256": digest(manifest),
-            })
+            }
+            for rank, role, device in ((0, "coordinator", "mlx5_0"),
+                                       (1, "worker", "mlx5_1")):
+                log = root / f"{role}-{name}.log"
+                status = log.with_suffix(".status")
+                connected = "worker" if rank == 0 else "leader"
+                log.write_text(
+                    f"ds4-tp: {connected} connected, transport=rdma\n"
+                    f"ds4-tp: benchmark run_id={run_id}\n"
+                    f"ds4-tp: rdma device {device} (port state 4)\n"
+                    "ds4-tp: rdma GID index 3 (RoCE v2)\n"
+                    "ds4-tp: mlx5 queue pair uses RC\n"
+                    "ds4-tp: mlx5 registered host slab as 3 MRs\n"
+                    '{"fallback_calls":0}\n'
+                    "ds4: memory promotion: expanded_weight_cache_bytes=0\n"
+                    "ds4-tp: transport proof requested=rdma active=rdma "
+                    "payload_fallback_calls=0 failed=0\n"
+                    f"ds4: GLM5 compact Q4_K K-shard active: rank={rank} layers=42 "
+                    f"rows={rank * 1024}:{(rank + 1) * 1024} "
+                    f"down-bytes={rank * 576}:{(rank + 1) * 576}\n")
+                write_manifest(status, {"exit_code": 0, "signal": 0})
+                benchmark[f"{role}_log"] = artifact(log)
+                benchmark[f"{role}_status"] = artifact(status)
+            benchmarks.append(benchmark)
 
     numerical_dir = root / "numerical"
     numerical_dir.mkdir()
@@ -852,6 +877,29 @@ def main() -> int:
         lambda _root, genesis: mutate_benchmark_manifest(
             genesis, 0, lambda values: values.pop("tp_reduce_width")),
         "differs in tp_reduce_width", structured=True)
+
+    def mutate_rank_artifact(genesis, name, transform):
+        value = json.loads(genesis.read_text())
+        bound = value["artifacts"]["benchmarks"][0][name]
+        path = Path(bound["path"])
+        path.write_text(transform(path.read_text()))
+        bound["sha256"] = digest(path)
+        genesis.write_text(json.dumps(value))
+
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "worker_log", lambda text: "\n".join(
+                line for line in text.splitlines() if "K-shard active" not in line)),
+        "lacks a unique matching TP allocation", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "worker_status", lambda text: text.replace("exit_code=0", "exit_code=1")),
+        "worker did not exit cleanly", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_rank_artifact(
+            genesis, "coordinator_log", lambda text: text.replace(
+                "payload_fallback_calls=0", "payload_fallback_calls=1")),
+        "zero-payload-fallback proof", structured=True)
     expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: value["record"].__setitem__(

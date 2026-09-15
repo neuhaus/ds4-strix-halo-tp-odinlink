@@ -1448,6 +1448,30 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             repo, manifest, key["source_commit"], "baseline genesis benchmark")
         verify_tp_layout_manifest(manifest, layout,
                                   "baseline genesis benchmark layout")
+        rank_paths = {}
+        for rank in ("coordinator", "worker"):
+            for suffix in ("log", "status"):
+                name = f"{rank}_{suffix}"
+                path = _bound_timing_artifact(
+                    item.get(name), root, f"baseline genesis {name}")
+                expected = csv_path.parent / f"{rank}-{manifest.get('tag', '')}.{suffix}"
+                if path != expected:
+                    raise GateError(f"baseline genesis {name} is not adjacent to its CSV")
+                rank_paths[name] = path
+            status = read_manifest(rank_paths[f"{rank}_status"])
+            if status.get("exit_code") != "0" or status.get("signal") != "0":
+                raise GateError(f"baseline genesis {rank} did not exit cleanly")
+        checked = subprocess.run([
+            str(repo / "scripts/check-ds4-bench-result.sh"), str(csv_path),
+            str(rank_paths["coordinator_log"]), str(rank_paths["worker_log"]),
+            fnv, str(workload["generated_tokens"]), "0", provider,
+            manifest.get("coordinator_rdma_device", ""),
+            manifest.get("rdma_gid_index", ""),
+            manifest.get("worker_rdma_device", ""), manifest.get("run_id", ""),
+        ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if checked.returncode != 0:
+            raise GateError("baseline genesis runtime validation failed: " +
+                            (checked.stderr.strip() or checked.stdout.strip()))
         for field in workload_manifest_fields(workload):
             if manifest.get(field) != str(workload.get(field, "")):
                 raise GateError(f"baseline genesis benchmark differs in {field}")
