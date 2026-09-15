@@ -1953,6 +1953,22 @@ SUCCESSFUL_HEADLINE_OBSERVATIONS = {
 }
 
 
+def headline_source_matches(root: Path, value: dict, arm: str,
+                            source_commit: str | None) -> bool:
+    """Bind each arm to the candidate or its independently loaded baseline."""
+    if (arm not in {"control", "candidate"} or
+            not re.fullmatch(r"[0-9a-f]{40}", str(source_commit))):
+        return False
+    if source_commit == value.get("source", {}).get("commit"):
+        return True
+    if arm != "control":
+        return False
+    baseline_id = str(value.get("baseline_id", ""))
+    _, baseline = load_baseline(root, baseline_id)
+    require_active_baseline(root, baseline_id, baseline)
+    return source_commit == baseline["key"]["source_commit"]
+
+
 def validate_headline_run_result(root: Path, candidate_id: str, value: dict,
                                  current: dict, event: dict,
                                  label: str) -> dict[str, Path]:
@@ -2007,7 +2023,7 @@ def validate_headline_run_result(root: Path, candidate_id: str, value: dict,
             manifest.get("candidate") != "1" or
             manifest.get("candidate_lane") != value.get("lane") or
             manifest.get("baseline_id") != value.get("baseline_id") or
-            manifest.get("source_commit") != value.get("source", {}).get("commit") or
+            not headline_source_matches(root, value, arm, manifest.get("source_commit")) or
             manifest.get("source_dirty") != "0"):
         raise GateError(f"{label} artifacts do not identify the journaled run")
     verify_manifest_run_id_environment(manifest, f"{label} manifest")
@@ -2200,7 +2216,7 @@ def headline_pair_state(root: Path, candidate_id: str, value: dict) -> list[dict
                     manifest.get("candidate") != "1" or
                     manifest.get("candidate_lane") != value.get("lane") or
                     manifest.get("baseline_id") != value.get("baseline_id") or
-                    manifest.get("source_commit") != value.get("source", {}).get("commit") or
+                    not headline_source_matches(root, value, arm, manifest.get("source_commit")) or
                     manifest.get("source_dirty") != "0" or
                     artifacts != run_result.get("artifacts") or
                     event.get("result_csv") != run_result.get("result_csv") or
@@ -2484,7 +2500,7 @@ def invalidate_headline_pair(root: Path, candidate_id: str, pair_id: str,
             manifest.get("candidate_id") != candidate_id or
             manifest.get("candidate_lane") != value["lane"] or
             manifest.get("baseline_id") != value["baseline_id"] or
-            manifest.get("source_commit") != value["source"]["commit"] or
+            not headline_source_matches(root, value, arm, manifest.get("source_commit")) or
             manifest.get("source_dirty") != "0"):
         raise GateError("pair invalidation artifacts do not identify the active attempt")
     verify_manifest_run_id_environment(manifest, "pair invalidation manifest")
