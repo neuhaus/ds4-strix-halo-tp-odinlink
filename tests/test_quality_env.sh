@@ -23,3 +23,26 @@ assert gate['manifest_switch_values'](manifest, names, 'quality fixture') == {
     'DS4_TP_TIMEOUT_SEC': '600', 'DS4_ROCM_TP_PREFILL_SKIP_UNOWNED': '1'}
 PY
 echo 'PASS quality launch environment retains effective values and passes gate parsing'
+
+# Benchmark diagnostics override GLM greedy-top2 and DeepSeek defaults too.
+# shellcheck disable=SC1090
+source <(sed -n '/^normalize_benchmark_environment()/,/^}/p' "$repo/run-tp-ds4-bench.sh")
+settings=(DS4_TP_GREEDY_TOP2=0 DS4_TP_GREEDY_TOP2=0
+          DS4_TP_TIMEOUT_SEC=120 DS4_TP_TIMEOUT_SEC=600
+          DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1
+          DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=0
+          'LITERAL=spaces and = signs' 'EMPTY=')
+expected=$(env -i "${settings[@]}" /usr/bin/env | LC_ALL=C sort)
+normalize_benchmark_environment settings
+[[ ${#settings[@]} == 5 ]]
+[[ $(env -i "${settings[@]}" /usr/bin/env | LC_ALL=C sort) == "$expected" ]]
+printf -v encoded '%q ' "${settings[@]}"
+python3 - "$repo" "$encoded" <<'PY'
+import runpy
+import sys
+gate = runpy.run_path(sys.argv[1] + '/scripts/candidate-gate.py')
+manifest = {'worker_env': sys.argv[2], 'coordinator_env': sys.argv[2]}
+assert gate['manifest_switch_values'](manifest, {'DS4_TP_GREEDY_TOP2': {}},
+                                     'numerical fixture') == {'DS4_TP_GREEDY_TOP2': '0'}
+PY
+echo 'PASS benchmark launch environment retains effective values and passes gate parsing'

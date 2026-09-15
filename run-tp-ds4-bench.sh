@@ -5,6 +5,23 @@
 # Copy bench.env.example to bench.env.local before the first real run.
 set -euo pipefail
 
+normalize_benchmark_environment() {
+  local -n assignments=$1
+  local -A positions=()
+  local -a normalized=()
+  local assignment name
+  for assignment in "${assignments[@]}"; do
+    name=${assignment%%=*}
+    if [[ ${positions[$name]+present} ]]; then
+      normalized[${positions[$name]}]=$assignment
+    else
+      positions[$name]=${#normalized[@]}
+      normalized+=("$assignment")
+    fi
+  done
+  assignments=("${normalized[@]}")
+}
+
 TAG="${1:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 MODEL="${2:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 shift 2
@@ -1112,6 +1129,11 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%S.%NZ)-$$-${RANDOM}"
 COMMON_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
 WORKER_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
 COORD_ENV+=(DS4_BENCH_RUN_ID="$RUN_ID")
+# Record the same unambiguous, last-assignment-wins environment that is launched.
+# Diagnostic overrides and explicit settings may repeat a profile default.
+for environment_array in COMMON_ENV WORKER_ENV COORD_ENV EXTRA_ENV; do
+  normalize_benchmark_environment "$environment_array"
+done
 if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
    git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
   SOURCE_DIRTY=0
