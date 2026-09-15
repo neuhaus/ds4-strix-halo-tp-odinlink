@@ -57,6 +57,7 @@ int main() {
     const char *model = getenv("DS4_GLM5_MODEL");
     Glm5TestGGUF gguf;
     require(model && gguf.open_file(model), "selected GGUF");
+    setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1);
     setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE","1",1);
     setenv("DS4_ROCM_GLM5_QK_LOW_LDS_EXACT","1",1);
     setenv("DS4_ROCM_GLM5_NOPE_ATTN_EXACT","1",1);
