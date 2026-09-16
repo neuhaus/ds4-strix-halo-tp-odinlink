@@ -334,7 +334,7 @@ path without converting its weights. Set `MODEL` to that file's absolute path
 on both nodes. Its kernel research and performance promotion are separate from
 the Antirez measurements above. For the mandatory RoCE v2 configuration, set
 `RDMA_PROFILE=roce-v2`, the local/peer Mellanox devices and `RDMA_GID_INDEX=3`
-in the deployment config, and keep `DSPARK=0`. Start with `CONTEXT=16384`;
+in the deployment config, and keep `DSPARK=0`. Start with `CONTEXT=8192`;
 benchmark evidence does not establish arbitrary long-context or multi-turn
 server correctness.
 
