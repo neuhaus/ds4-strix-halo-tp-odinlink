@@ -590,7 +590,8 @@ tests/test_glm5_next_real_offset_hash: tests/test_glm5_next_real_offset_hash.cpp
 
 test-glm5-next-real-offset-hash: tests/test_glm5_next_real_offset_hash
 	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 2; }
-	@expected=7cea648ebfd0d89c; actual=$$(./tests/test_glm5_next_real_offset_hash "$(DS4_GLM5_MODEL)"); \
+	@test -n "$(DS4_GLM5_EXPECTED_OFFSET_HASH)" || { echo "DS4_GLM5_EXPECTED_OFFSET_HASH is required (bind it to the selected GGUF)" >&2; exit 2; }
+	@expected="$(DS4_GLM5_EXPECTED_OFFSET_HASH)"; actual=$$(./tests/test_glm5_next_real_offset_hash "$(DS4_GLM5_MODEL)"); \
 	 test "$$actual" = "$$expected" || { echo "FAIL GLM5 offset parity expected=$$expected actual=$$actual" >&2; exit 1; }; \
 	 echo "PASS GLM5 independent offset parity $$actual"
 
