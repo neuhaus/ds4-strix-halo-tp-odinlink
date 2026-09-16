@@ -1668,6 +1668,16 @@ static int matmul_bf16_f32_wmma_hilo_m256_launch(
                    "matmul_bf16 WMMA hi/lo M256 launch");
 }
 
+static int matmul_bf16_f32_wmma_native_m256_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    matmul_bf16_f32_wmma_hilo_m256_kernel<2u, true><<<
+            dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+            16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 native WMMA M256 launch");
+}
+
 static int matmul_bf16_f32_wmma_hilo_qkv_shared_a_launch(
         float *out_q, float *out_k, float *out_v,
         const uint16_t *weight_q, const uint16_t *weight_k,
@@ -1692,6 +1702,12 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         const ds4_gpu_tensor *x, uint64_t n_tok) {
     static const int batch_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    const char *native_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE");
+    const bool native = native_selector && strcmp(native_selector, "1") == 0;
+    if (native_selector && !native && strcmp(native_selector, "0") != 0)
+        return 0;
+    if (native && (g_quality_mode || cuda_runtime_config()->graph_dump))
+        return -1;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
         !ds4_bf16_wmma_hilo_dispatch_allowed(
             true, batch_toktile_disabled, (uint32_t)in_dim,
@@ -1718,9 +1734,22 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
-    return matmul_bf16_f32_wmma_hilo_m256_launch(
-        (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    const int result = native
+        ? matmul_bf16_f32_wmma_native_m256_launch(
+              (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+              (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok)
+        : matmul_bf16_f32_wmma_hilo_m256_launch(
+              (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+              (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    if (result > 0 && native) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, "ds4: GLM5 native-BF16 activation WMMA engaged "
+                            "M256 (weights remain BF16; lane-B)\n");
+            reported = 1;
+        }
+    }
+    return result;
 }
 
 static int cuda_glm5_bf16_qkv_with_panel(

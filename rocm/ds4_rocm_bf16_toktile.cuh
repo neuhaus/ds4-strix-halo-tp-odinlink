@@ -72,7 +72,7 @@ __global__ static void ds4_bf16_hilo_prepare_kernel(
  * activation into BF16 high and residual terms retains substantially more of
  * the incumbent F32-activation accuracy without a persistent conversion
  * buffer.  Production dispatch remains explicit and shape checked. */
-template <uint32_t NTilesN>
+template <uint32_t NTilesN, bool NativeActivation = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_m256_kernel(
         float *out,
@@ -121,7 +121,8 @@ static void matmul_bf16_f32_wmma_hilo_m256_kernel(
                 const uint16_t hi = ds4_bf16_rne_bits(xv);
                 const float hi_f = __uint_as_float((uint32_t)hi << 16u);
                 sh_a_hi[j] = hi;
-                sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+                sh_a_lo[j] = NativeActivation ? 0u :
+                    ds4_bf16_rne_bits(xv - hi_f);
             } else {
                 sh_a_hi[j] = 0u;
                 sh_a_lo[j] = 0u;
@@ -147,10 +148,12 @@ static void matmul_bf16_f32_wmma_hilo_m256_kernel(
                 a, reinterpret_cast<const Bf16 *>(
                     sh_a_hi + mt * BM * BK), BK);
             rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
-            rocwmma::load_matrix_sync(
-                a, reinterpret_cast<const Bf16 *>(
-                    sh_a_lo + mt * BM * BK), BK);
-            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            if (!NativeActivation) {
+                rocwmma::load_matrix_sync(
+                    a, reinterpret_cast<const Bf16 *>(
+                        sh_a_lo + mt * BM * BK), BK);
+                rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            }
         }
         __syncthreads();
     }
