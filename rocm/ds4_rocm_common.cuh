@@ -303,7 +303,7 @@ __global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
  * independent projection (24 wave32 rows total), stages the shared activation
  * vector once, and then applies the incumbent lane-major BF16->F32 reduction
  * to each output.  The GGUF matrices are never concatenated. */
-template <uint32_t PREFETCH>
+template <uint32_t PREFETCH, uint32_t ROWS_PER_PROJECTION = 8u>
 __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
         float *out_q, float *out_k, float *out_v,
         const uint16_t *weight_q, const uint16_t *weight_k,
@@ -313,7 +313,9 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
-    constexpr uint32_t rows_per_projection = 8u;
+    static_assert(ROWS_PER_PROJECTION == 4u || ROWS_PER_PROJECTION == 8u,
+                  "unsupported QKV decode row geometry");
+    constexpr uint32_t rows_per_projection = ROWS_PER_PROJECTION;
     constexpr uint32_t projections = 3u;
     const uint32_t projection = wave / rows_per_projection;
     const uint32_t row_in_block = wave % rows_per_projection;
