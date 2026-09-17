@@ -37,6 +37,17 @@ static __device__ __forceinline__ uint16_t ds4_bf16_rne_bits(float value) {
     return (uint16_t)((bits + 0x00007fffu + tie_to_even) >> 16u);
 }
 
+// Separate contiguous hi/lo panels for a vendor GEMM; no weight conversion.
+__global__ static void ds4_bf16_hilo_prepare_planar_kernel(
+        uint16_t *hi, uint16_t *lo, const float *x, uint64_t count) {
+    const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float value = x[i];
+    const uint16_t high = ds4_bf16_rne_bits(value);
+    hi[i] = high;
+    lo[i] = ds4_bf16_rne_bits(value - __uint_as_float(uint32_t(high) << 16u));
+}
+
 // Transient activation preparation only. The caller owns count * 4 bytes,
 // keeps the F32 input alive, and prepares again whenever that input changes.
 // This must use exactly the same high/residual conversion as the raw loader.

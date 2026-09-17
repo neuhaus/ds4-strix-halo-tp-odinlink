@@ -52,6 +52,7 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.cuh"
+#include "ds4_rocm_glm5_bf16_lt.cuh"
 #endif
 static int g_quality_mode;
 
@@ -8226,6 +8227,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
+    glm5_bf16_lt_cleanup();
     hipblaslt_gemm_plan_clear();
 #endif
     if (g_cublas_ready) {

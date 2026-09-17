@@ -6,6 +6,7 @@
 #include "ds4_rocm.h"
 #include <hip/hip_cooperative_groups.h>
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
