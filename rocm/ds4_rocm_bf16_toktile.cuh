@@ -72,7 +72,8 @@ __global__ static void ds4_bf16_hilo_prepare_kernel(
  * activation into BF16 high and residual terms retains substantially more of
  * the incumbent F32-activation accuracy without a persistent conversion
  * buffer.  Production dispatch remains explicit and shape checked. */
-template <uint32_t NTilesN, bool NativeActivation = false>
+template <uint32_t NTilesN, bool NativeActivation = false,
+          bool CoalescedWeights = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_m256_kernel(
         float *out,
@@ -131,10 +132,11 @@ static void matmul_bf16_f32_wmma_hilo_m256_kernel(
         for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
             const uint32_t nt = j / (BK * BN);
             const uint32_t rem = j % (BK * BN);
-            const uint32_t kk = rem / BN;
-            const uint32_t nn = rem % BN;
+            const uint32_t kk = CoalescedWeights ? rem % BK : rem / BN;
+            const uint32_t nn = CoalescedWeights ? rem / BK : rem % BN;
             const uint32_t n = nbase + nt * BN + nn;
-            sh_b[j] = n < out_dim
+            // Lane ownership changes; the WMMA tile bytes and order do not.
+            sh_b[nt * BK * BN + kk * BN + nn] = n < out_dim
                 ? weight[(uint64_t)n * in_dim + k0 + kk]
                 : 0u;
         }
@@ -746,6 +748,7 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
  * Each exact workgroup handles two output rows and reuses each weight over
  * eight tokens. Its reduction storage aliases the existing WMMA panels.
  * All physical GGUF weights remain independent, unchanged pointers. */
+template <bool CoalescedWeights = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -887,10 +890,10 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
             const uint32_t nt = j / (BK * BN);
             const uint32_t rem = j % (BK * BN);
-            const uint32_t kk = rem / BN;
-            const uint32_t nn = rem % BN;
+            const uint32_t kk = CoalescedWeights ? rem % BK : rem / BN;
+            const uint32_t nn = CoalescedWeights ? rem / BK : rem % BN;
             const uint32_t n = nbase + nt * BN + nn;
-            sh_b[j] = n < out_dim
+            sh_b[nt * BK * BN + kk * BN + nn] = n < out_dim
                 ? weight[(uint64_t)n * in_dim + k0 + kk]
                 : 0u;
         }

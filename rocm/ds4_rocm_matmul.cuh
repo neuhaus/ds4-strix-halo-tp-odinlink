@@ -1658,12 +1658,24 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int glm5_bf16_wmma_coalesced_weights_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int matmul_bf16_f32_wmma_hilo_m256_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
-            dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
-            16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    if (glm5_bf16_wmma_coalesced_weights_requested() == 1) {
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u, false, true><<<
+                dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+                16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    } else {
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
+                dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+                16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    }
     return cuda_ok(cudaGetLastError(),
                    "matmul_bf16 WMMA hi/lo M256 launch");
 }
@@ -1704,6 +1716,8 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
     const char *native_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE");
     const bool native = native_selector && strcmp(native_selector, "1") == 0;
+    const int coalesced = glm5_bf16_wmma_coalesced_weights_requested();
+    if (coalesced < 0 || (coalesced && native)) return 0;
     if (native_selector && !native && strcmp(native_selector, "0") != 0)
         return 0;
     if (native && (g_quality_mode || cuda_runtime_config()->graph_dump))
@@ -1741,6 +1755,15 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         : matmul_bf16_f32_wmma_hilo_m256_launch(
               (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    if (result > 0 && coalesced) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 WMMA coalesced weight loads engaged M256 "
+                    "arithmetic=hilo weights=original scratch=unchanged\n");
+            reported = 1;
+        }
+    }
     if (result > 0 && native) {
         static int reported;
         if (!reported) {
@@ -2054,6 +2077,9 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         prefill_selector && strcmp(prefill_selector, "1") == 0;
     if ((n_tok == 1u && !decode_enabled) ||
         (n_tok != 1u && !prefill_enabled)) return -1;
+    const int coalesced = n_tok == 1u ? 0 :
+        glm5_bf16_wmma_coalesced_weights_requested();
+    if (coalesced < 0) return 0;
     /* M=1 uses the shared-x wave matvec.  Batched prefill uses the existing
      * 256-row hi/lo WMMA tile, extended to all six independent pointers. */
     if (!out_q || !out_k || !out_v || !out_f || !out_g || !out_beta ||
@@ -2177,17 +2203,38 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         const uint32_t beta_blocks = ((uint32_t)beta_out_dim + 1u) / 2u;
         const uint32_t total_blocks =
             3u * q_blocks + 2u * low_blocks + beta_blocks;
-        matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<<<
-            dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
-            16u * 32u>>>(
-            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
-            (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
-            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
-            (const uint16_t *)weights[2], (const uint16_t *)weights[3],
-            (const uint16_t *)weights[4], (const uint16_t *)weights[5],
-            (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
-            (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
-            (uint32_t)n_tok);
+        if (coalesced) {
+            matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<true><<<
+                dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
+                (uint32_t)n_tok);
+            static int reported;
+            if (!reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 six-pointer coalesced weight loads engaged "
+                        "arithmetic=hilo/exact-gates weights=original scratch=unchanged\n");
+                reported = 1;
+            }
+        } else {
+            matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<><<<
+                dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
+                (uint32_t)n_tok);
+        }
     }
     static int reported = 0;
     if (!reported) {

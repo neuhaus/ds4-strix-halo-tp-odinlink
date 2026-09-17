@@ -198,6 +198,11 @@ test-rocm-glm5-q4k-grouped: tests/test_rocm_glm5_q4k_batch_partition
 	done
 
 .PHONY: test-rocm-glm5-six-prefill-exact
+.PHONY: test-rocm-glm5-bf16-coalesced-weight
+test-rocm-glm5-bf16-coalesced-weight: tests/test_rocm_glm5_six_prefill_exact
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact 0 --coalesced
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact 1 --coalesced
+
 tests/test_rocm_glm5_six_prefill_exact.o: tests/test_rocm_glm5_six_prefill_exact.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
