@@ -55,6 +55,9 @@ static int g_cublas_ready;
 #include "ds4_rocm_glm5_bf16_lt.cuh"
 #endif
 static int g_quality_mode;
+// Default-stream, device-0 GLM projection scratch. Contains only activations.
+static uint32_t *g_glm5_bf16_exact_activations;
+static constexpr size_t glm5_bf16_exact_scratch_bytes = 32u * 1024u * 1024u;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -8226,6 +8229,14 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
+    if (g_glm5_bf16_exact_activations) {
+        int saved = -1;
+        (void)cudaGetDevice(&saved);
+        if (cudaSetDevice(0) == cudaSuccess)
+            (void)cudaFree(g_glm5_bf16_exact_activations);
+        g_glm5_bf16_exact_activations = nullptr;
+        if (saved >= 0) (void)cudaSetDevice(saved);
+    }
 #ifdef __HIP_PLATFORM_AMD__
     glm5_bf16_lt_cleanup();
     hipblaslt_gemm_plan_clear();

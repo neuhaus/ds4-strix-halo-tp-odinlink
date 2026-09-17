@@ -270,7 +270,7 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
     }
 }
 
-// Test-only smaller workgroup geometry. Each wave owns three independent
+// Smaller workgroup geometry. Each wave owns three independent
 // 16x16 output tiles. Retain the incumbent K16 high/residual update sequence,
 // including at M96 panel tails. Caller admits whole M16/N32/K32 multiples.
 template <bool Prepared = false, uint32_t LdsPad = 0u, bool VectorLoads = false>

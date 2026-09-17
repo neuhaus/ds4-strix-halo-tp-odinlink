@@ -1716,6 +1716,33 @@ static int matmul_bf16_f32_wmma_hilo_qkv_shared_a_launch(
                    "matmul_bf16 WMMA hi/lo QKV shared-A launch");
 }
 
+static int glm5_bf16_exact_m96_launch(float *out, const uint16_t *weight,
+        const float *x, uint32_t k, uint32_t n, uint32_t m) {
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess || device != 0) return 0;
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop,device) != hipSuccess ||
+        strncmp(prop.gcnArchName,"gfx1151",7) != 0) return 0;
+    const uint64_t count = uint64_t(k)*m;
+    if (count > glm5_bf16_exact_scratch_bytes/sizeof(uint32_t)) return 0;
+    if (!g_glm5_bf16_exact_activations && !cuda_ok(
+            cudaMalloc(&g_glm5_bf16_exact_activations,glm5_bf16_exact_scratch_bytes),
+            "GLM BF16 exact activation allocation")) return 0;
+    ds4_bf16_hilo_prepare_kernel<<<(count+255u)/256u,256>>>(
+        g_glm5_bf16_exact_activations,x,count);
+    if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact activation preparation")) return 0;
+    matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true><<<
+        dim3(n/32u,(m+95u)/96u),128>>>(out,weight,x,k,n,m,g_glm5_bf16_exact_activations);
+    if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact M96 launch")) return 0;
+    static int reported;
+    if (!reported) {
+        fprintf(stderr,"ds4: ROCm GLM5 BF16 exact M96 engaged weights=original activation_scratch_bytes=%zu weight_cache_bytes=0 arithmetic=K16-high-residual\n",
+                glm5_bf16_exact_scratch_bytes);
+        reported = 1;
+    }
+    return 1;
+}
+
 static int glm5_bf16_lt_launch(float *out, const uint16_t *weight,
         const float *x, uint32_t k, uint32_t m) {
     auto *plan = glm5_bf16_lt_get_plan(k,m);
@@ -1754,6 +1781,10 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const int wide_tile = glm5_bf16_wmma_wide_tile_requested();
     const char *lt_selector = getenv("DS4_ROCM_GLM5_BF16_LT_HILO");
     const bool lt = lt_selector && strcmp(lt_selector,"1") == 0;
+    const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_EXACT_M96");
+    const bool exact = exact_selector && strcmp(exact_selector,"1") == 0;
+    if (exact_selector && !exact && strcmp(exact_selector,"0") != 0) return 0;
+    if (exact && (lt || native || coalesced || wide_tile)) return 0;
     if (lt_selector && !lt && strcmp(lt_selector,"0") != 0) return 0;
     if (lt && (native || coalesced || wide_tile)) return 0;
     if (coalesced < 0 || wide_tile < 0 || (coalesced && native) ||
@@ -1776,6 +1807,7 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
     const uint64_t x_elems = n_tok * in_dim;
     const uint64_t out_elems = n_tok * out_dim;
+    const bool exact_shape = exact && n_tok == 1024u;
     if (x_elems > UINT64_MAX / sizeof(float) ||
         out_elems > UINT64_MAX / sizeof(float) ||
         weight_offset > model_size ||
@@ -1789,9 +1821,19 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     // not. Reject before lookup/copy as well as checking the device pointer.
     if (lt && out_dim == 4096u && (n_tok == 256u || n_tok == 1024u) &&
         (weight_offset & 15u)) return 0;
+    if (exact_shape && ((weight_offset & 15u) || out->device_id != 0 ||
+        x->device_id != 0 || ((uintptr_t)x->ptr & 3u) ||
+        ((uintptr_t)out->ptr & 15u))) return 0;
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
+    if (exact_shape) {
+        if (((uintptr_t)wptr & 15u) || cuda_u64_ranges_overlap(
+                (uint64_t)(uintptr_t)out->ptr,out_elems*sizeof(float),
+                (uint64_t)(uintptr_t)wptr,weight_bytes)) return 0;
+        return glm5_bf16_exact_m96_launch((float *)out->ptr,(const uint16_t *)wptr,
+            (const float *)x->ptr,(uint32_t)in_dim,(uint32_t)out_dim,(uint32_t)n_tok);
+    }
     if ((wide_tile && (uintptr_t)wptr % alignof(uint16_t) != 0u) ||
         (coalesced && ((uintptr_t)wptr & 3u) != 0u)) return 0;
     if (lt && out_dim == 4096u && (n_tok == 256u || n_tok == 1024u)) {
