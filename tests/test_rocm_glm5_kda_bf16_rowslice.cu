@@ -1040,11 +1040,14 @@ bool benchmark_prefill_kda_six_multiptr(
               ds4_gpu_tensor_read(fused[i], 0u, b.data(),
                                   counts[i] * sizeof(float)),
               "read KDA prefill six-pointer A/B");
-        for (size_t j = 0u; j < a.size(); ++j)
+        for (size_t j = 0u; j < a.size(); ++j) {
+            CHECK(std::isfinite(a[j]) && std::isfinite(b[j]),
+                  "finite KDA prefill six-pointer outputs");
             max_abs[i] = std::max(max_abs[i],
                                   std::fabs((double)a[j] - b[j]));
+        }
         CHECK(std::isfinite(max_abs[i]) && max_abs[i] <=
-                  (i < 3u ? 1.0e-4 : 5.0e-3),
+                  (i < 3u ? 1.0e-4 : 0.0),
               "KDA prefill six-pointer numerical envelope");
     }
     constexpr uint32_t warmup = 2u, repeats = 8u;

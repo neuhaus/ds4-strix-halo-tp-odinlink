@@ -187,7 +187,9 @@ tests/test_rocm_glm5_six_prefill_exact: tests/test_rocm_glm5_six_prefill_exact.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-six-prefill-exact: tests/test_rocm_glm5_six_prefill_exact
-	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact
+	@set -e; for skinny in 0 1; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact $$skinny; \
+	done
 
 test-rocm-glm5-router-moe-bridge: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose

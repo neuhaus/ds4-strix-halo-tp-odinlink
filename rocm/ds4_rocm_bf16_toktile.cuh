@@ -816,6 +816,9 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
                   "exact recurrent gates must not grow the WMMA LDS footprint");
     __shared__ Shared tile;
     if (projection >= 3u) {
+        // The sole production launcher rejects incomplete M256 batches.
+        // These exact groups therefore need no token-tail masking; any new
+        // launcher must retain that precondition or mask its final group.
         const uint32_t lane = tid & 255u;
         const uint32_t row = nblock * 2u + (tid >> 8u);
         for (uint32_t first = 0u; first < MTile; first += 8u) {
