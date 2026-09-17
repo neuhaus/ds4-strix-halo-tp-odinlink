@@ -352,6 +352,59 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* Projection-split decode experiment.  The incumbent above puts Q, K and V
+ * in one 24-wave block.  This form keeps the same independent pointers and
+ * lane-major reduction, but gives each projection its own 4/8-row block.  A
+ * y-grid of three lets the gfx1151 scheduler interleave the projections and
+ * avoids making one 768-thread block the occupancy unit. */
+template <uint32_t PREFETCH, uint32_t ROWS_PER_PROJECTION = 8u>
+__global__ static void matmul_bf16_f32_sharedx_qkv_split_decode_kernel(
+        float *out_q, float *out_k, float *out_v,
+        const uint16_t *weight_q, const uint16_t *weight_k,
+        const uint16_t *weight_v, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    static_assert(ROWS_PER_PROJECTION == 4u || ROWS_PER_PROJECTION == 8u,
+                  "unsupported split QKV decode row geometry");
+    const uint32_t projection = blockIdx.y;
+    if (projection >= 3u) return;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * ROWS_PER_PROJECTION + wave;
+    if (row >= out_dim) return;
+    const uint16_t *weight = projection == 0u ? weight_q :
+                             projection == 1u ? weight_k : weight_v;
+    float *out = projection == 0u ? out_q :
+                 projection == 1u ? out_k : out_v;
+    const uint16_t *wr = weight + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    uint32_t i = lane;
+    for (; i + (PREFETCH - 1u) * 32u < in_dim;
+         i += PREFETCH * 32u) {
+        uint16_t packed_w[PREFETCH];
+        float packed_x[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = __builtin_nontemporal_load(&wr[index]);
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u)
+            acc += __uint_as_float((uint32_t)packed_w[u] << 16u) *
+                   packed_x[u];
+    }
+    for (; i < in_dim; i += 32u)
+        acc += __uint_as_float(
+                   (uint32_t)__builtin_nontemporal_load(&wr[i]) << 16u) *
+               shx[i];
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 /* Exact-order gfx1151 decode matvec.  Each lane retains the original
  * lane,lane+32,... accumulation sequence, but batches 64 independent weight
  * and LDS loads before consuming them.  This raises memory-level parallelism
