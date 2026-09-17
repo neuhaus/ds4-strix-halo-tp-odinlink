@@ -288,6 +288,26 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+/* Same integer dot and floating expression, bounded group unrolling for the
+ * packed GLM decode experiment. The incumbent helper stays unchanged. */
+__device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_unroll2(
+        const cuda_block_q4_K *x, const cuda_block_q8_K *y) {
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    int isum = 0;
+    int summs = 0;
+    #pragma unroll 2
+    for (uint32_t j = 0; j < 8u; j++) {
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+        summs += (int)m * (int)(y->bsums[2u * j] + y->bsums[2u * j + 1u]);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        isum += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
+    }
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
 /* Correctness-first dense Q4_K projection used by GLM-5.3 KDA. One wave32
  * owns one output row and reads the compact GGUF blocks directly; no expanded
  * weight cache or activation cache is created. */
@@ -2066,7 +2086,7 @@ __global__ static void moe_down_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
-template <uint32_t Rows = 128u>
+template <uint32_t Rows = 128u, bool BoundedDot = false>
 __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -2116,8 +2136,13 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
-            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            if constexpr (BoundedDot) {
+                gate += dev_dot_q4_K_q8_K_block_unroll2(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block_unroll2(ur + b, xqb + b);
+            } else {
+                gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            }
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);

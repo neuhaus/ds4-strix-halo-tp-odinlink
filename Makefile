@@ -193,6 +193,13 @@ test-rocm-glm5-q4k-cold-lds5-padding: tests/test_rocm_glm5_q4k_batch_partition
 
 .PHONY: test-rocm-glm5-q4k-grouped
 .PHONY: test-rocm-glm5-q4k-decode-rows
+.PHONY: test-rocm-glm5-q4k-decode-dot2
+test-rocm-glm5-q4k-decode-dot2: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for fixture in 0 1 2; do \
+		DS4_TEST_MOE_INPUT_CASE=$$fixture DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+		./tests/test_rocm_glm5_q4k_batch_partition 1 --decode-dot2; \
+	done
+
 test-rocm-glm5-q4k-decode-rows: tests/test_rocm_glm5_q4k_batch_partition
 	@set -e; for fixture in 0 1 2; do for span in 32 64; do \
 		DS4_TEST_MOE_INPUT_CASE=$$fixture DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \

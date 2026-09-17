@@ -24,17 +24,21 @@ int main(int argc, char **argv) {
     uint32_t rows = 1024;
     REQUIRE(argc <= 3);
     const bool grouped = argc == 3 && std::strcmp(argv[2], "--grouped") == 0;
+    const bool dot_unroll = argc == 3 && std::strcmp(argv[2], "--decode-dot2") == 0;
     const unsigned decode_rows = argc != 3 ? 0u :
+        dot_unroll ? 128u :
         std::strcmp(argv[2], "--decode32") == 0 ? 32u :
         std::strcmp(argv[2], "--decode64") == 0 ? 64u : 0u;
     const bool cold_lds5 = argc == 3 && !grouped && !decode_rows;
     const bool cold_padding = cold_lds5 &&
         std::strcmp(argv[2], "--cold-lds5-pad") == 0;
     if (cold_lds5) REQUIRE(cold_padding || std::strcmp(argv[2], "--cold-lds5") == 0);
-    const char *timing_selector = decode_rows ? "DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS" :
+    const char *timing_selector = dot_unroll ? "DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL" :
+        decode_rows ? "DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS" :
         grouped ? "DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED" : cold_padding ?
         "DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD" : "DS4_ROCM_GLM5_Q4K_COLD_LDS5";
-    const char *candidate_mode = decode_rows == 32u ? "32" : decode_rows == 64u ? "64" : "1";
+    const char *candidate_mode = dot_unroll ? "2" :
+        decode_rows == 32u ? "32" : decode_rows == 64u ? "64" : "1";
     const char *input_case = std::getenv("DS4_TEST_MOE_INPUT_CASE");
     unsigned fixture = 0;
     if (input_case) {
@@ -70,6 +74,7 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0);
@@ -166,6 +171,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
             const unsigned count = rows-first < tile ? rows-first : tile;
@@ -247,6 +253,15 @@ int main(int argc, char **argv) {
                 for (float value:actual) REQUIRE(std::isnan(value));
             }
             REQUIRE(setenv(timing_selector,"0",1) == 0);
+            if (dot_unroll) {
+                REQUIRE(setenv(timing_selector,"2",1) == 0);
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS","32",1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                for (float value:actual) REQUIRE(std::isnan(value));
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS","0",1) == 0);
+                REQUIRE(setenv(timing_selector,"0",1) == 0);
+            }
         }
         if (cold_lds5) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "invalid", 1) == 0);
