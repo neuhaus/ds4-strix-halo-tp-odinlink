@@ -270,6 +270,65 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
     }
 }
 
+// Test-only smaller workgroup geometry. Each wave owns three independent
+// 16x16 output tiles. Retain the incumbent K16 high/residual update sequence,
+// including at M96 panel tails. Caller admits whole M16/N32/K32 multiples.
+__global__ __launch_bounds__(128, 1)
+static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t tokens) {
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u;
+    constexpr uint32_t MTile = 96u, NTile = 32u, KStage = 32u;
+    constexpr uint32_t NThreads = 128u;
+    __shared__ uint16_t a_hi[MTile*KStage], a_lo[MTile*KStage];
+    __shared__ uint16_t b_tile[NTile*KStage];
+    const uint32_t tid = threadIdx.x, wave = tid >> 5u;
+    const uint32_t mbase = blockIdx.y*MTile, nbase = blockIdx.x*NTile;
+    if (mbase >= tokens) return;
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a,BM,BN,BK,Bf16,rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b,BM,BN,BK,Bf16,rocwmma::col_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator,BM,BN,BK,float>;
+    FragC acc[3];
+#pragma unroll
+    for (uint32_t t=0; t<3; ++t) rocwmma::fill_fragment(acc[t],0.0f);
+    for (uint32_t k0=0; k0<in_dim; k0+=KStage) {
+        for (uint32_t j=tid; j<MTile*KStage; j+=NThreads) {
+            const uint32_t m = mbase+j/KStage, k = k0+j%KStage;
+            const float value = m < tokens ? x[uint64_t(m)*in_dim+k] : 0.0f;
+            const uint16_t high = ds4_bf16_rne_bits(value);
+            a_hi[j] = high;
+            a_lo[j] = ds4_bf16_rne_bits(value-__uint_as_float(uint32_t(high)<<16u));
+        }
+        for (uint32_t j=tid; j<NTile*KStage; j+=NThreads) {
+            const uint32_t n=nbase+j/KStage, k=k0+j%KStage;
+            b_tile[j] = n < out_dim ? weight[uint64_t(n)*in_dim+k] : 0u;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t ks=0; ks<KStage; ks+=BK) {
+#pragma unroll
+            for (uint32_t t=0; t<3; ++t) {
+                const uint32_t tile=wave+4u*t, mt=tile%6u, nt=tile/6u;
+                FragA high, low;
+                FragB b;
+                rocwmma::load_matrix_sync(high,reinterpret_cast<const Bf16 *>(a_hi+mt*BM*KStage+ks),KStage);
+                rocwmma::load_matrix_sync(low,reinterpret_cast<const Bf16 *>(a_lo+mt*BM*KStage+ks),KStage);
+                rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+nt*BN*KStage+ks),KStage);
+                rocwmma::mma_sync(acc[t],high,b,acc[t]);
+                rocwmma::mma_sync(acc[t],low,b,acc[t]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t t=0; t<3; ++t) {
+        const uint32_t tile=wave+4u*t, m=mbase+(tile%6u)*BM, n=nbase+(tile/6u)*BN;
+        if (m < tokens && n < out_dim)
+            rocwmma::store_matrix_sync(out+uint64_t(m)*out_dim+n,acc[t],out_dim,rocwmma::mem_row_major);
+    }
+}
+
 /* Collapse the three equal-shape GLM KDA Q/K/V projections into one grid.
  * Each workgroup retains the validated single-projection arithmetic and owns
  * exactly one weight/output pointer; removing the two kernel boundaries lets
