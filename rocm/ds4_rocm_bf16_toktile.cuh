@@ -205,7 +205,7 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
     using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
                                    Bf16, rocwmma::row_major>;
     using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
-                                   Bf16, rocwmma::row_major>;
+                                   Bf16, rocwmma::col_major>;
     using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
     FragA a_hi, a_lo;
     FragB b;
@@ -223,14 +223,13 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
             sh_a_lo[j] = ds4_bf16_rne_bits(
                 xv - __uint_as_float((uint32_t)hi << 16u));
         }
-        // Contiguous K words in global memory; transpose only inside LDS.
+        // Keep original [N,K] order in LDS. Column-major B consumes this
+        // directly, avoiding stride-16 BF16 stores across the K lanes.
         for (uint32_t j = tid; j < NTilesN * KStage * BN; j += NThreads) {
             const uint32_t nlocal = j / KStage;
             const uint32_t kk = j % KStage;
-            const uint32_t nt = nlocal / BN;
-            const uint32_t nn = nlocal % BN;
             const uint32_t n = nbase + nlocal;
-            sh_b[nt * KStage * BN + kk * BN + nn] = n < out_dim ?
+            sh_b[j] = n < out_dim ?
                 weight[(uint64_t)n * in_dim + k0 + kk] : 0u;
         }
         __syncthreads();
@@ -243,7 +242,7 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
 #pragma unroll
             for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
                 rocwmma::load_matrix_sync(b, reinterpret_cast<const Bf16 *>(
-                    sh_b + nt * KStage * BN + ks * BN), BN);
+                    sh_b + nt * KStage * BN + ks), KStage);
                 rocwmma::mma_sync(acc[nt], a_hi, b, acc[nt]);
                 rocwmma::mma_sync(acc[nt], a_lo, b, acc[nt]);
             }
