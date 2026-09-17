@@ -130,12 +130,16 @@ int main() {
         for (unsigned repeat=0; repeat<3; ++repeat) for (unsigned arm=0; arm<2; ++arm) {
             const bool matrix = bool(arm ^ (repeat%2));
             const unsigned mode = matrix ? candidate : 0;
-            for (unsigned j=0; j<5; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
+            // Each host oracle leaves the GPU idle. A handful of launches
+            // did not cover clock ramp-up; warm both arms equally before
+            // measuring a longer steady block. Raw alternating arms remain.
+            constexpr unsigned warmup = 1000, iterations = 1000;
+            for (unsigned j=0; j<warmup; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
             HIP(hipEventRecord(begin));
-            for (unsigned j=0; j<100; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
+            for (unsigned j=0; j<iterations; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
             HIP(hipEventRecord(end)); HIP(hipEventSynchronize(end));
             float ms; HIP(hipEventElapsedTime(&ms,begin,end));
-            std::printf("diagnostic repeat=%u M=%u mode=%u kernel_us=%.3f\n",repeat,m,mode,ms*10);
+            std::printf("diagnostic repeat=%u M=%u mode=%u warmup=%u iterations=%u kernel_us=%.3f\n",repeat,m,mode,warmup,iterations,ms*1000/iterations);
         }
         HIP(hipEventDestroy(begin)); HIP(hipEventDestroy(end));
     }
