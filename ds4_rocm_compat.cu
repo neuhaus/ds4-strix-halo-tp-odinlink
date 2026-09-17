@@ -322,6 +322,13 @@ static int rocm_glm5_kda_matmul_typed(
         strcmp(wmma_hilo_value, "1") == 0;
     static const int wmma_hilo_valid = wmma_hilo_value == NULL ||
         strcmp(wmma_hilo_value, "0") == 0 || wmma_hilo_enabled;
+    static const char *native_output_only_value =
+        getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE_OUTPUT_ONLY");
+    static const int native_output_only = native_output_only_value != NULL &&
+        strcmp(native_output_only_value, "1") == 0;
+    static const int native_output_only_valid =
+        native_output_only_value == NULL ||
+        strcmp(native_output_only_value, "0") == 0 || native_output_only;
     if (!wmma_hilo_valid) {
         static int invalid_reported;
         if (!invalid_reported) {
@@ -331,7 +338,27 @@ static int rocm_glm5_kda_matmul_typed(
         }
         return 0;
     }
+    if (!native_output_only_valid) {
+        static int invalid_native_output_only_reported;
+        if (!invalid_native_output_only_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 native-BF16 output-only selector\n");
+            invalid_native_output_only_reported = 1;
+        }
+        return 0;
+    }
     if (wmma_hilo_enabled) {
+        /* Native activation rounding is deliberately isolated from the KDA
+         * inputs when requested.  Those projections feed the recurrent state
+         * and a BF16-only pass can change the route by layer 3.  The output
+         * projection has no recurrent consumer, so it remains a useful,
+         * shape-checked prefill experiment without changing model bytes. */
+        if (native_output_only &&
+            base_offset != args->weights->output) {
+            return ds4_gpu_matmul_bf16_tensor(
+                out, args->model_map, args->model_size, offset,
+                in_dim, out_dim, input, args->n_tokens);
+        }
         rocm_glm5_bf16_wmma_hilo_register_report();
         const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_tensor(
             out, args->model_map, args->model_size, offset,
