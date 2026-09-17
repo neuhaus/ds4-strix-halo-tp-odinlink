@@ -22,6 +22,39 @@ __global__ void q4k_fullrow_dp4a(const cuda_block_q4_K *w,
     if (!lane) out[blockIdx.y*n+row] = sum;
 }
 
+// The stronger cold-prefill control shares unpacked weights across eight
+// tokens with the actual production helper and stages its activation tile.
+// This is one projection; routing and the fused gate/up pair remain outside
+// this leaf experiment and must be measured before integration claims.
+__global__ void q4k_fullrow_dp4a8(const cuda_block_q4_K *w,
+        const cuda_block_q8_K *x, float *out, unsigned n, unsigned m,
+        unsigned blocks) {
+    const unsigned lane=threadIdx.x&7u, row=blockIdx.x*32+threadIdx.x/8;
+    const unsigned first=blockIdx.y*8, count=min(8u,m-first);
+    __shared__ cuda_block_q8_K staged[8][16];
+    const cuda_block_q8_K *xp[8]={};
+    for (unsigned p=0; p<count; ++p) xp[p]=x+(first+p)*blocks;
+    if (blocks<=16) {
+        for (unsigned i=threadIdx.x; i<count*blocks; i+=blockDim.x)
+            staged[i/blocks][i%blocks]=xp[i/blocks][i%blocks];
+        __syncthreads();
+        for (unsigned p=0; p<count; ++p) xp[p]=staged[p];
+    }
+    if (row>=n) return;
+    float sum[8]={};
+    for (unsigned b=lane; b<blocks; b+=8)
+        dev_dot_q4_K_q8_K_block8(w+row*blocks+b,
+            xp[0] ? xp[0]+b : nullptr, xp[1] ? xp[1]+b : nullptr,
+            xp[2] ? xp[2]+b : nullptr, xp[3] ? xp[3]+b : nullptr,
+            xp[4] ? xp[4]+b : nullptr, xp[5] ? xp[5]+b : nullptr,
+            xp[6] ? xp[6]+b : nullptr, xp[7] ? xp[7]+b : nullptr,count,sum);
+    for (unsigned p=0; p<count; ++p) {
+        for (unsigned offset=4; offset; offset/=2)
+            sum[p]+=__shfl_down(sum[p],offset,8);
+        if (!lane) out[(first+p)*n+row]=sum[p];
+    }
+}
+
 // Force the same binary addition tree as the quarter-wave shuffles. Fast
 // math must not reassociate the cross-wave sums into a different tree.
 __device__ __forceinline__ float q4k_ordered_add(float a, float b) {
@@ -110,8 +143,9 @@ hipError_t glm5_q4k_fullrows(const cuda_block_q4_K *w,
         const cuda_block_q8_K *x, float *out, unsigned n, unsigned m,
         unsigned blocks, unsigned mode) {
     if (!w || !x || !out || !n || n%16 || n>65536 || !m || m>256 ||
-        !blocks || blocks>64 || mode>2) return hipErrorInvalidValue;
+        !blocks || blocks>64 || mode>3) return hipErrorInvalidValue;
     if (mode==0) q4k_fullrow_dp4a<<<dim3((n+31)/32,m),256>>>(w,x,out,n,blocks);
+    else if (mode==3) q4k_fullrow_dp4a8<<<dim3((n+31)/32,(m+7)/8),256>>>(w,x,out,n,m,blocks);
     else if (mode==1) q4k_fullrow_mma<false><<<dim3(n/16,(m+15)/16),256>>>(w,x,out,n,m,blocks);
     else q4k_fullrow_mma<true><<<dim3(n/16,(m+15)/16),256>>>(w,x,out,n,m,blocks);
     return hipGetLastError();

@@ -109,14 +109,14 @@ int main() {
         HIP(hipMemcpy(dx,x.data(),x.size()*sizeof(x[0]),hipMemcpyHostToDevice));
         REQUIRE(glm5_q4k_fullrows(dw,dx,dgot,n-1,16,blocks,1)==hipErrorInvalidValue);
         REQUIRE(glm5_q4k_fullrows(dw,dx,dgot,n,16,0,1)==hipErrorInvalidValue);
-        REQUIRE(glm5_q4k_fullrows(dw,dx,dgot,n,16,blocks,3)==hipErrorInvalidValue);
+        REQUIRE(glm5_q4k_fullrows(dw,dx,dgot,n,16,blocks,4)==hipErrorInvalidValue);
         REQUIRE(glm5_q4k_fullrows(nullptr,dx,dgot,n,16,blocks,1)==hipErrorInvalidValue);
         for (unsigned m : {1u,7u,16u,17u,28u,32u,64u,96u}) {
             HIP(hipMemset(dref,0x5a,(n*max_m+32)*sizeof(float)));
             HIP(glm5_q4k_fullrows(dw,dx,dref+16,n,m,blocks,0));
             std::vector<float> ref(n*m+32),got(n*m+32);
             HIP(hipMemcpy(ref.data(),dref,ref.size()*sizeof(float),hipMemcpyDeviceToHost));
-            for (unsigned candidate : {1u,2u}) {
+            for (unsigned candidate : {1u,2u,3u}) {
                 HIP(hipMemset(dgot,0x5a,(n*max_m+32)*sizeof(float)));
                 HIP(glm5_q4k_fullrows(dw,dx,dgot+16,n,m,blocks,candidate));
                 HIP(hipMemcpy(got.data(),dgot,got.size()*sizeof(float),hipMemcpyDeviceToHost));
@@ -138,11 +138,13 @@ int main() {
                 }
                 std::printf("PASS role=%s K=%u N=%u M=%u mode=%u exact=%u canaries=32 scalar=pass\n",
                             role,blocks*256,n,m,candidate,n*m);
-                if (m==7 || m==17) continue;
+                if (m==7 || m==17 || candidate==1) continue;
                 hipEvent_t begin,end;
                 HIP(hipEventCreate(&begin)); HIP(hipEventCreate(&end));
                 for (unsigned pair=0; pair<3; ++pair) for (unsigned arm=0; arm<2; ++arm) {
-                    const unsigned mode=(arm^(pair%2)) ? candidate : 0;
+                    // Compare the split-scale MMA to both scalar and
+                    // eight-token DP4A; retain every adjacent arm result.
+                    const unsigned mode=(arm^(pair%2)) ? 2u : (candidate==3 ? 3u : 0u);
                     constexpr unsigned warmup=1000, iterations=1000;
                     for (unsigned j=0; j<warmup; ++j) HIP(glm5_q4k_fullrows(dw,dx,dgot+16,n,m,blocks,mode));
                     HIP(hipEventRecord(begin));
