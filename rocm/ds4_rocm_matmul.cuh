@@ -2138,6 +2138,7 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
         if (!weights[i]) return 0;
     }
     const char *rows_selector = getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_ROWS");
+    const bool rows2 = rows_selector && strcmp(rows_selector, "2") == 0;
     const bool rows4 = rows_selector && strcmp(rows_selector, "4") == 0;
     const char *split_selector = getenv(
         "DS4_ROCM_GLM5_BF16_QKV_DECODE_SPLIT");
@@ -2175,7 +2176,11 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
         (const uint16_t *)weights[0], (const uint16_t *)weights[1],       \
         (const uint16_t *)weights[2], (const float *)x->ptr,               \
         (uint32_t)in_dim, (uint32_t)out_dim)
-        if (rows4 && (out_dim & 3u) == 0u) {
+        if (rows2 && (out_dim & 1u) == 0u) {
+            if (prefetch == 16u) DS4_LAUNCH_QKV_SPLIT(16u, 2u);
+            else if (prefetch == 32u) DS4_LAUNCH_QKV_SPLIT(32u, 2u);
+            else DS4_LAUNCH_QKV_SPLIT(64u, 2u);
+        } else if (rows4 && (out_dim & 3u) == 0u) {
             if (prefetch == 16u) DS4_LAUNCH_QKV_SPLIT(16u, 4u);
             else if (prefetch == 32u) DS4_LAUNCH_QKV_SPLIT(32u, 4u);
             else DS4_LAUNCH_QKV_SPLIT(64u, 4u);
