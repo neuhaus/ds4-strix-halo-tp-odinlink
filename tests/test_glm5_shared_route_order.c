@@ -89,6 +89,8 @@ int main(void) {
     expected_seq=fnv64_continue(UINT64_C(1469598103934665603),fields,sizeof(fields));
     unsetenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
     unsetenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+    unsetenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
+    unsetenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
     assert(shared_route_overlap_mode(&ctx,&w,1)==0);
     setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP","1",1);
     for (unsigned rank=0; rank<2; ++rank) {
@@ -120,6 +122,13 @@ int main(void) {
     setenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE","1",1);
     assert(shared_route_overlap_mode(&ctx,&w,1)==-1);
     unsetenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+    setenv("DS4_ROCM_GLM5_WINDOW_OVERLAP", "1", 1);
+    setenv("DS4_ROCM_GLM5_WINDOW_SCRATCH", "1", 1);
+    w.decode_phase=true;
+    assert(shared_route_overlap_mode(&ctx,&w,1)==-1);
+    unsetenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
+    assert(shared_route_overlap_mode(&ctx,&w,1)==1);
+    unsetenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
     w.decode_phase=false; assert(shared_route_overlap_mode(&ctx,&w,1)==0);
     setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP","yes",1);
     assert(shared_route_overlap_mode(&ctx,&w,1)==-1);
