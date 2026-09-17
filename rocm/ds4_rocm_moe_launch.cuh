@@ -1742,6 +1742,18 @@ static int routed_moe_launch(
         const uint32_t cold_pair_capacity = glm5_grouped_cold ? n_tokens / 256u * 5u : 0u;
         const uint32_t cold_tile_capacity = glm5_grouped_cold ?
             288u * ((cold_pair_capacity + 15u) / 16u) : 0u;
+        const uint64_t cold_metadata_bytes = glm5_grouped_cold ?
+            (288u + 289u + 288u * cold_pair_capacity + 289u + 1u +
+             2u * cold_tile_capacity) * sizeof(uint32_t) : 0u;
+        uint64_t cold_metadata_off = 0u;
+        // down starts with the staged Q8_K input. Its remaining bytes are
+        // dead until down projection, after every cold-metadata consumer
+        // finishes on this same stream. Preserve the original sorted-scratch
+        // allocation size and Q8_1 offsets rather than growing that slab.
+        if (glm5_grouped_cold &&
+            (!routed_moe_align256_checked(xq_bytes, &cold_metadata_off) ||
+             cold_metadata_off > down->bytes ||
+             cold_metadata_bytes > down->bytes - cold_metadata_off)) return 0;
         ds4_q8_1_mmq_block *q4k_q81 = NULL;
         ds4_q8_1_mmq_block *down_q81 = NULL;
         uint32_t *iq2_gate_hot_dev = NULL;
@@ -1914,10 +1926,6 @@ static int routed_moe_launch(
             const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
             const uint64_t iq2_gate_hot_off = tile16_starts_off + tile16_starts_bytes;
             const uint64_t iq2_gate_hot_bytes = (uint64_t)bucket_count * sizeof(uint32_t);
-            const uint64_t cold_metadata_off = iq2_gate_hot_off + iq2_gate_hot_bytes;
-            const uint64_t cold_metadata_bytes = glm5_grouped_cold ?
-                (288u + 289u + 288u * cold_pair_capacity + 289u + 1u +
-                 2u * cold_tile_capacity) * sizeof(uint32_t) : 0u;
             uint64_t q81_off = 0;
             uint64_t q81_count = 0;
             uint64_t q81_bytes = 0;
@@ -1925,7 +1933,7 @@ static int routed_moe_launch(
             uint64_t down_q81_count = 0;
             uint64_t down_q81_bytes = 0;
             uint64_t scratch_bytes = 0;
-            if (!routed_moe_align256_checked(cold_metadata_off + cold_metadata_bytes,
+            if (!routed_moe_align256_checked(iq2_gate_hot_off + iq2_gate_hot_bytes,
                                              &q81_off) ||
                 (need_x_q81 &&
                  (!cuda_u64_mul_checked(n_tokens, (uint64_t)xq_blocks * 2u,
@@ -1964,7 +1972,7 @@ static int routed_moe_launch(
                 iq2_gate_hot_dev = (uint32_t *)(scratch + iq2_gate_hot_off);
                 uint32_t *cold_tile_offsets = NULL;
                 if (glm5_grouped_cold) {
-                    cold_counts = (uint32_t *)(scratch + cold_metadata_off);
+                    cold_counts = (uint32_t *)((uint8_t *)down->ptr + cold_metadata_off);
                     cold_offsets = cold_counts + 288u;
                     cold_pairs = cold_offsets + 289u;
                     cold_tile_offsets = cold_pairs + 288u * cold_pair_capacity;

@@ -350,6 +350,22 @@ int main(int argc, char **argv) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
         }
         if (cold_coalesce) {
+            if (rows > tile && rows % tile == 0u) {
+                // Input Q8_K fits, but no tail remains for cold metadata.
+                // Refuse before even the input quantization writes down.
+                REQUIRE(setenv(timing_selector,"1",1) == 0);
+                REQUIRE(ds4_gpu_tensor_fill_f32(t[4],NAN,16u));
+                ds4_gpu_tensor *short_down = ds4_gpu_tensor_view(
+                    t[4],0,uint64_t(rows)*16u*292u);
+                REQUIRE(short_down);
+                std::memcpy(invalid,t,sizeof(t));
+                invalid[4] = short_down;
+                REQUIRE(!call(invalid,rows));
+                ds4_gpu_tensor_free(short_down);
+                float untouched[16];
+                REQUIRE(ds4_gpu_tensor_read(t[4],0,untouched,sizeof(untouched)));
+                for (float value:untouched) REQUIRE(std::isnan(value));
+            }
             for (const char *invalid_mode : {"invalid", "2", ""}) {
                 REQUIRE(setenv(timing_selector,invalid_mode,1) == 0);
                 REQUIRE(!call(t,rows));
