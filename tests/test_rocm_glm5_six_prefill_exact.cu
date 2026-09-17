@@ -65,9 +65,17 @@ int main(int argc, char **argv) {
                              std::cos(double(i)*0.031+rank)*0.11);
             ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(x.size()*4u);
             REQUIRE(input && ds4_gpu_tensor_write(input,0,x.data(),x.size()*4u));
-            REQUIRE(ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
-                reference[0],reference[1],reference[2],gguf.map,gguf.size,
-                local[0],local[1],local[2],4096,q_width,input,rows) == 1);
+            if (rank < 2) {
+                REQUIRE(ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+                    reference[0],reference[1],reference[2],gguf.map,gguf.size,
+                    local[0],local[1],local[2],4096,q_width,input,rows) == 1);
+            } else {
+                // The incumbent fused-QKV selector supports TP halves only;
+                // full heads use the three ordinary hi/lo dispatches.
+                for (unsigned i=0; i<3; ++i)
+                    REQUIRE(ds4_gpu_matmul_bf16_wmma_hilo_tensor(reference[i],
+                        gguf.map,gguf.size,local[i],4096,q_width,input,rows) == 1);
+            }
             for (unsigned i=3; i<6; ++i)
                 REQUIRE(ds4_gpu_matmul_bf16_tensor(reference[i],gguf.map,
                     gguf.size,local[i],4096,widths[i],input,rows));
