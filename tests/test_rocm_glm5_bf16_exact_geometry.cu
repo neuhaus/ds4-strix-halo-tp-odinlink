@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-extern "C" hipError_t glm5_exact_geometry(float *,const uint16_t *,const float *,unsigned,unsigned,unsigned,unsigned);
+extern "C" hipError_t glm5_exact_geometry(float *,const uint16_t *,const float *,unsigned,unsigned,unsigned,unsigned,uint32_t *);
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr,"FAIL line=%d: %s\n",__LINE__,#x); std::exit(1); } } while (0)
 int main() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
@@ -36,6 +36,8 @@ int main() {
             for (size_t i=0; i<x.size(); ++i)
                 x[i]=float(std::sin(double(i)*0.017+layer)*0.13+std::cos(double(i)*0.037+layout)*0.19);
             float *dx,*a,*b;
+            uint32_t *panel;
+            REQUIRE(hipMalloc(&panel,x.size()*4u) == hipSuccess);
             REQUIRE(hipMalloc(&dx,x.size()*4u) == hipSuccess);
             REQUIRE(hipMalloc(&a,reference.size()*4u) == hipSuccess);
             REQUIRE(hipMalloc(&b,candidate.size()*4u) == hipSuccess);
@@ -43,7 +45,7 @@ int main() {
             REQUIRE(hipMemcpy(a,reference.data(),reference.size()*4u,hipMemcpyHostToDevice) == hipSuccess);
             REQUIRE(hipMemcpy(b,candidate.data(),candidate.size()*4u,hipMemcpyHostToDevice) == hipSuccess);
             auto launch = [&](unsigned mode) {
-                REQUIRE(glm5_exact_geometry((mode ? b : a)+guard,w,dx,k,n,m,mode) == hipSuccess);
+                REQUIRE(glm5_exact_geometry((mode ? b : a)+guard,w,dx,k,n,m,mode,panel) == hipSuccess);
             };
             launch(0);
             launch(1);
@@ -61,8 +63,9 @@ int main() {
             std::fflush(stdout);
             REQUIRE(different == 0);
             total += count;
-            REQUIRE(glm5_exact_geometry(b+guard,w,dx,k,n,m-1u,1) == hipErrorInvalidValue);
-            REQUIRE(glm5_exact_geometry(b+guard,w,dx,k,n,m,2) == hipErrorInvalidValue);
+            REQUIRE(glm5_exact_geometry(b+guard,w,dx,k,n,m-1u,1,panel) == hipErrorInvalidValue);
+            REQUIRE(glm5_exact_geometry(b+guard,w,dx,k,n,m,2,panel) == hipErrorInvalidValue);
+            REQUIRE(glm5_exact_geometry(b+guard,w,dx,k,n,m,1,nullptr) == hipErrorInvalidValue);
             if (m == 256u || m == 1024u) {
                 hipEvent_t begin,end;
                 REQUIRE(hipEventCreate(&begin) == hipSuccess);
@@ -86,6 +89,7 @@ int main() {
             REQUIRE(hipFree(b) == hipSuccess);
             REQUIRE(hipFree(a) == hipSuccess);
             REQUIRE(hipFree(dx) == hipSuccess);
+            REQUIRE(hipFree(panel) == hipSuccess);
             std::fflush(stdout);
         }
         REQUIRE(hipFree(w) == hipSuccess);
