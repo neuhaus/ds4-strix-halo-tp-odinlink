@@ -167,6 +167,16 @@ tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o
 test-rocm-glm5-q4k-shard-compose: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
 
+.PHONY: test-rocm-glm5-q4k-batch-partition
+tests/test_rocm_glm5_q4k_batch_partition.o: tests/test_rocm_glm5_q4k_batch_partition.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_q4k_batch_partition: tests/test_rocm_glm5_q4k_batch_partition.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_glm5_next_runtime.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-q4k-batch-partition: tests/test_rocm_glm5_q4k_batch_partition
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition
+
 test-rocm-glm5-router-moe-bridge: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
 
