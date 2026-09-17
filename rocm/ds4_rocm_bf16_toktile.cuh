@@ -306,7 +306,7 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
             b_tile[j] = n < out_dim ? weight[uint64_t(n)*in_dim+k] : 0u;
         }
         __syncthreads();
-#pragma unroll
+#pragma unroll 1
         for (uint32_t ks=0; ks<KStage; ks+=BK) {
             FragB b;
             rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+wave_n*BN*KStage+ks),KStage);
