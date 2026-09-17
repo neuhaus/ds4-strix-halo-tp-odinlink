@@ -25,19 +25,21 @@ int main(int argc, char **argv) {
     REQUIRE(argc <= 3);
     const bool grouped = argc == 3 && std::strcmp(argv[2], "--grouped") == 0;
     const bool dot_unroll = argc == 3 && std::strcmp(argv[2], "--decode-dot2") == 0;
+    const bool dot_lanes = argc == 3 && std::strcmp(argv[2], "--decode-dot4") == 0;
     const unsigned decode_rows = argc != 3 ? 0u :
-        dot_unroll ? 128u :
+        (dot_unroll || dot_lanes) ? 128u :
         std::strcmp(argv[2], "--decode32") == 0 ? 32u :
         std::strcmp(argv[2], "--decode64") == 0 ? 64u : 0u;
     const bool cold_lds5 = argc == 3 && !grouped && !decode_rows;
     const bool cold_padding = cold_lds5 &&
         std::strcmp(argv[2], "--cold-lds5-pad") == 0;
     if (cold_lds5) REQUIRE(cold_padding || std::strcmp(argv[2], "--cold-lds5") == 0);
-    const char *timing_selector = dot_unroll ? "DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL" :
+    const char *timing_selector = dot_lanes ? "DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES" :
+        dot_unroll ? "DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL" :
         decode_rows ? "DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS" :
         grouped ? "DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED" : cold_padding ?
         "DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD" : "DS4_ROCM_GLM5_Q4K_COLD_LDS5";
-    const char *candidate_mode = dot_unroll ? "2" :
+    const char *candidate_mode = dot_lanes ? "4" : dot_unroll ? "2" :
         decode_rows == 32u ? "32" : decode_rows == 64u ? "64" : "1";
     const char *input_case = std::getenv("DS4_TEST_MOE_INPUT_CASE");
     unsigned fixture = 0;
@@ -75,6 +77,7 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0);
@@ -137,6 +140,11 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_tensor_write(t[5],0,selected.data(),rows*strides[5]));
     REQUIRE(ds4_gpu_tensor_write(t[6],0,weights.data(),rows*strides[6]));
     std::vector<float> reference(rows*width), actual(rows*width);
+    // The production path suppresses gate/up stores; mid is the exposed
+    // pre-quantization state, so compare it before down-projection can hide
+    // a difference through activation quantization.
+    std::vector<float> mid_reference(decode_rows ? used*mid_width : 0u);
+    std::vector<float> mid_actual(mid_reference.size());
     for (unsigned rank=0; rank<2; ++rank) {
         for (uint64_t offset : {go, uo}) {
             REQUIRE(ds4_gpu_q4k_packed_slice_declare(gguf.map,gguf.size,
@@ -172,6 +180,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL", "0", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
             const unsigned count = rows-first < tile ? rows-first : tile;
@@ -184,6 +193,10 @@ int main(int argc, char **argv) {
             for (auto *view:v) ds4_gpu_tensor_free(view);
         }
         REQUIRE(ds4_gpu_tensor_read(t[0],0,reference.data(),rows*strides[0]));
+        if (decode_rows) {
+            REQUIRE(ds4_gpu_tensor_read(t[3],0,mid_reference.data(),strides[3]));
+            REQUIRE(ds4_gpu_tensor_fill_f32(t[3],NAN,used*mid_width));
+        }
         REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "256", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_lds5 ? "1" : "0", 1) == 0);
@@ -203,6 +216,15 @@ int main(int argc, char **argv) {
                     rank,rows,actual.size(),different,max_abs);
         std::fflush(stdout);
         REQUIRE(different == 0);
+        if (decode_rows) {
+            REQUIRE(ds4_gpu_tensor_read(t[3],0,mid_actual.data(),strides[3]));
+            for (size_t i=0; i<mid_actual.size(); ++i) {
+                REQUIRE(std::isfinite(mid_reference[i]) && std::isfinite(mid_actual[i]));
+                REQUIRE(std::memcmp(&mid_reference[i],&mid_actual[i],sizeof(float)) == 0);
+            }
+            std::printf("rank=%u pre-quantization mid values=%zu bit_exact=1\n",
+                        rank,mid_actual.size());
+        }
         if (cold_lds5 || grouped || decode_rows) {
             // Warm both full-MoE arms before timing. These are GPU-event
             // microbenchmarks with synthetic routes, not model throughput.
@@ -253,13 +275,20 @@ int main(int argc, char **argv) {
                 for (float value:actual) REQUIRE(std::isnan(value));
             }
             REQUIRE(setenv(timing_selector,"0",1) == 0);
-            if (dot_unroll) {
-                REQUIRE(setenv(timing_selector,"2",1) == 0);
+            if (dot_unroll || dot_lanes) {
+                REQUIRE(setenv(timing_selector,candidate_mode,1) == 0);
                 REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS","32",1) == 0);
                 REQUIRE(!call(t,rows));
                 REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
                 for (float value:actual) REQUIRE(std::isnan(value));
                 REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS","0",1) == 0);
+                if (dot_lanes) {
+                    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL","2",1) == 0);
+                    REQUIRE(!call(t,rows));
+                    REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                    for (float value:actual) REQUIRE(std::isnan(value));
+                    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_UNROLL","0",1) == 0);
+                }
                 REQUIRE(setenv(timing_selector,"0",1) == 0);
             }
         }

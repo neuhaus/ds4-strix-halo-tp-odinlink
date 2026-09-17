@@ -124,6 +124,12 @@ static int routed_moe_glm5_decode_dot_unroll(void) {
     return strcmp(value, "2") == 0 ? 2 : -1;
 }
 
+static int routed_moe_glm5_decode_dot_lanes(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "4") == 0 ? 4 : -1;
+}
+
 static int routed_moe_q4k_wmma_pair_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1353,7 +1359,8 @@ static int routed_moe_launch(
         bool force_q4k_sorted_off,
         bool glm5_grouped = false,
         uint32_t glm5_decode_rows = 128u,
-        bool glm5_decode_bounded_dot = false) {
+        bool glm5_decode_bounded_dot = false,
+        bool glm5_decode_cooperative_dot = false) {
     if (add_fused_out) *add_fused_out = 0;
     if (gate_type == 39u || down_type == 39u) {
         if (gate_type != 39u || down_type != 39u) {
@@ -2582,6 +2589,14 @@ static int routed_moe_launch(
                         tp_skip_unowned && n_tokens == 1u,
                         write_gate_up,
                         clamp);
+                    } else if (glm5_decode_cooperative_dot) {
+                        moe_gate_up_mid_decode_q4K_lanes4_kernel<<<
+                            dim3((expert_mid_dim + 31u) / 32u, pair_count), 256>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr, gate_expert_bytes,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            tp_skip_unowned && n_tokens == 1u, write_gate_up, clamp);
                     } else if (glm5_decode_bounded_dot) {
                         moe_gate_up_mid_decode_q4K_qwarp32_kernel<128u, true><<<qgrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
@@ -4300,9 +4315,11 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         uint32_t layer_index) {
     const int decode_rows = routed_moe_glm5_decode_gate_rows();
     const int dot_unroll = routed_moe_glm5_decode_dot_unroll();
-    if (decode_rows < 0 || dot_unroll < 0 ||
+    const int dot_lanes = routed_moe_glm5_decode_dot_lanes();
+    if (decode_rows < 0 || dot_unroll < 0 || dot_lanes < 0 ||
+        (dot_lanes && (decode_rows != 128 || dot_unroll)) ||
         (dot_unroll && decode_rows != 128) ||
-        ((decode_rows != 128 || dot_unroll) &&
+        ((decode_rows != 128 || dot_unroll || dot_lanes) &&
          (n_total_expert != 288u || n_expert != 8u ||
           routed_moe_q4k_decode_stage_xq_enabled() ||
           routed_moe_q4k_decode_split_gate_up_enabled()))) return 0;
@@ -4376,7 +4393,17 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         selected, weights, n_total_expert, n_expert, clamp, x, add_in,
         &add_fused, layer_index, 1u, false,
         (const char *)gate_w, (const char *)up_w, (const char *)down_w,
-        true, false, false, false, (uint32_t)decode_rows, dot_unroll == 2);
+        true, false, false, false, (uint32_t)decode_rows, dot_unroll == 2,
+        dot_lanes == 4);
+    if (rc && dot_lanes) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 Q4_K decode dot lanes=4 engaged rows=32 "
+                    "weights=original arithmetic=ordered\n");
+            reported = 1;
+        }
+    }
     if (rc && dot_unroll) {
         static int reported;
         if (!reported) {

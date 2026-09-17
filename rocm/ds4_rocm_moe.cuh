@@ -308,6 +308,34 @@ __device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_unroll2(
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+/* Four lanes share one original Q4_K block. Only the subgroup leader's
+ * result is consumed. Integer reassociation is exact: even the conservative
+ * eight-group bound is below 2^25, including signed Q8 activations. */
+__device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_lanes4(
+        const cuda_block_q4_K *x, const cuda_block_q8_K *y,
+        uint32_t part) {
+    int isum = 0;
+    int summs = 0;
+    #pragma unroll
+    for (uint32_t g = 0; g < 2u; ++g) {
+        const uint32_t j = 2u * part + g;
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+        summs += (int)m * (int)(y->bsums[2u*j] + y->bsums[2u*j+1u]);
+        isum += (int)sc * dev_dot_q4_32(x->qs + part*32u,
+                                       y->qs + j*32u, g ? 4 : 0);
+    }
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+    #pragma unroll
+    for (int delta = 2; delta > 0; delta >>= 1) {
+        isum += __shfl_down_sync(mask, isum, delta, 4);
+        summs += __shfl_down_sync(mask, summs, delta, 4);
+    }
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
 /* Correctness-first dense Q4_K projection used by GLM-5.3 KDA. One wave32
  * owns one output row and reads the compact GGUF blocks directly; no expanded
  * weight cache or activation cache is created. */
@@ -2157,6 +2185,66 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
+        }
+    }
+}
+
+/* One wave per row, eight cooperative four-lane block dots. The leader of
+ * each subgroup owns the same b, b+8 sequence as an incumbent quarter-wave
+ * lane; offsets 16/8/4 reproduce its eight-way FP32 sum tree exactly. */
+__global__ static void moe_gate_up_mid_decode_q4K_lanes4_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const char *gate_base, const char *up_base,
+        const cuda_block_q8_K *xq, const int32_t *selected,
+        const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert,
+        uint32_t skip_zero_weight, uint32_t write_aux, float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t part = lane & 3u;
+    const uint32_t block_lane = lane >> 2u;
+    const uint32_t row_lane = threadIdx.x >> 5u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    const float route_weight = weights[(uint64_t)tok * n_expert + slot];
+    const bool skip = expert_i < 0 || (skip_zero_weight && route_weight == 0.0f);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = blockIdx.x * 32u + row_lane + rr * 8u;
+        if (row >= expert_mid_dim) continue;
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (skip) {
+            if (lane == 0u) {
+                if (write_aux) { gate_out[off] = 0.0f; up_out[off] = 0.0f; }
+                mid_out[off] = 0.0f;
+            }
+            continue;
+        }
+        const uint64_t byte_off = (uint64_t)(uint32_t)expert_i * gate_expert_bytes +
+                                  (uint64_t)row * gate_row_bytes;
+        const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + byte_off);
+        const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + byte_off);
+        float gate = 0.0f, up = 0.0f;
+        for (uint32_t b = block_lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_q4_K_q8_K_block_lanes4(gr+b, xqb+b, part);
+            up += dev_dot_q4_K_q8_K_block_lanes4(ur+b, xqb+b, part);
+        }
+        const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+        #pragma unroll
+        for (int delta = 16; delta >= 4; delta >>= 1) {
+            gate += __shfl_down_sync(mask, gate, delta, 32);
+            up += __shfl_down_sync(mask, up, delta, 32);
+        }
+        if (lane == 0u) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            if (write_aux) { gate_out[off] = gate; up_out[off] = up; }
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
         }
     }
