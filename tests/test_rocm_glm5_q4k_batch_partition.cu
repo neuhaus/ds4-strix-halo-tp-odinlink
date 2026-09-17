@@ -86,6 +86,15 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "0", 1) == 0);
+    /* Test-only opt-in for the repaired split geometry.  Production launchers
+     * still keep both selectors explicit and default-off; this lets the real
+     * GGUF oracle compare rows32/64 in the staged split arm rather than the
+     * independent fused kernel. */
+    if (decode_rows && std::getenv("DS4_TEST_Q4K_DECODE_SPLIT") &&
+        std::strcmp(std::getenv("DS4_TEST_Q4K_DECODE_SPLIT"), "1") == 0) {
+        REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "1", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "1", 1) == 0);
+    }
     REQUIRE(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED", "1", 1) == 0);
     ds4_gpu_config config = {};
