@@ -115,6 +115,12 @@ static int routed_moe_glm5_grouped_cold_requested(void) {
     return strcmp(value, "1") == 0 ? 1 : -1;
 }
 
+static int routed_moe_glm5_grouped_cold_i8_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_I8");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int routed_moe_glm5_decode_gate_rows(void) {
     const char *value = getenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS");
     if (!value || strcmp(value, "0") == 0 || strcmp(value, "128") == 0)
@@ -2365,7 +2371,25 @@ static int routed_moe_launch(
                                     expert_in_dim == 4096u && expert_mid_dim == 1024u &&
                                     xq_blocks == 16u && wmma_min_count <= 6u &&
                                     routed_moe_glm5_cold_lds5_requested() == 1;
-                                if (glm5_grouped_cold) {
+                                if (glm5_grouped_cold &&
+                                    routed_moe_glm5_grouped_cold_i8_requested() == 1) {
+                                    // Packed-half admission fixes N1024, K4096,
+                                    // threshold6 and original packed row strides.
+                                    moe_gate_up_q4K_cold_integer16_kernel<<<
+                                        dim3(expert_mid_dim / 16u, cold_tile_capacity, 2u),256>>>(
+                                        (float *)gate->ptr,(float *)up->ptr,
+                                        gate_w,up_w,xq,cold_pairs,cold_offsets,cold_counts,
+                                        cold_total,cold_experts,cold_starts,gate_expert_bytes,
+                                        gate_row_bytes,xq_blocks,expert_mid_dim,n_expert);
+                                    static int reported;
+                                    if (!reported) {
+                                        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                                "GLM5 Q4_K cold integer MMA engaged "
+                                                "K=4096 N=1024 lds_bytes=8192 weights=original "
+                                                "weight_cache_bytes=0\n");
+                                        reported = 1;
+                                    }
+                                } else if (glm5_grouped_cold) {
                                     // These pairs already passed the unchanged
                                     // per-domain threshold6 classifier. The
                                     // larger bound admits only their union.
@@ -4616,6 +4640,7 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
     if (mid_is_f16) *mid_is_f16 = false;
     if (routed_moe_glm5_grouped_requested() < 0 ||
         routed_moe_glm5_grouped_cold_requested() < 0 ||
+        routed_moe_glm5_grouped_cold_i8_requested() < 0 ||
         routed_moe_glm5_cold_lds5_requested() < 0 ||
         routed_moe_glm5_cold_lds5_pad_requested() < 0 ||
         (routed_moe_glm5_cold_lds5_pad_requested() == 1 &&
@@ -4645,6 +4670,8 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         strcmp(partition, "256") != 0) return 0;
     const bool grouped_requested = routed_moe_glm5_grouped_requested() == 1;
     const bool cold_requested = routed_moe_glm5_grouped_cold_requested() == 1;
+    if (routed_moe_glm5_grouped_cold_i8_requested() == 1 && !cold_requested)
+        return 0;
     if (cold_requested && (!grouped_requested ||
         routed_moe_q4k_wmma_min_count() != 6u ||
         routed_moe_glm5_cold_lds5_requested() != 0 ||

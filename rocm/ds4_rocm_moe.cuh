@@ -5775,6 +5775,43 @@ __device__ static void dev_dot_q4_K_q8_K_cold_block5(
     }
 }
 
+#include "ds4_rocm_glm5_q4k_integer.cuh"
+
+// Only already-cold routes collected across unchanged M256 domains enter
+// this experimental path. Hot arithmetic and every down route stay intact.
+// The third grid dimension selects gate/up, sharing one launch while keeping
+// original independent weight pointers. The only tile scratch is 8 KiB LDS.
+__global__ static void moe_gate_up_q4K_cold_integer16_kernel(
+        float *gate_out, float *up_out, const char *gate_base,
+        const char *up_base, const cuda_block_q8_K *xq,
+        const uint32_t *pairs, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *tile_total, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, uint64_t expert_bytes, uint64_t row_bytes,
+        uint32_t blocks, uint32_t nrows, uint32_t n_expert) {
+    const uint32_t tile=blockIdx.y;
+    if (tile>=*tile_total) return;
+    const uint32_t expert=tile_experts[tile], start=tile_starts[tile];
+    const uint32_t count=counts[expert];
+    if (start>=count) return;
+    const uint32_t np=min(16u,count-start), col=threadIdx.x%16;
+    const uint32_t pair=pairs[offsets[expert]+start+(col<np ? col : 0u)];
+    const uint32_t tok=pair/n_expert;
+    const uint32_t first_row=blockIdx.x*16;
+    const char *base=blockIdx.z ? up_base : gate_base;
+    const auto *w=reinterpret_cast<const cuda_block_q4_K *>(
+        base+uint64_t(expert)*expert_bytes+uint64_t(first_row)*row_bytes);
+    __shared__ float partial[8][256];
+    float sum[8]={};
+    glm5_q4k_i8_partials<true>(w,xq+uint64_t(tok)*blocks,blocks,sum);
+    const float value=glm5_q4k_i8_reduce(partial,sum);
+    const uint32_t at=threadIdx.x;
+    if (at%16<np) {
+        const uint32_t out_pair=pairs[offsets[expert]+start+at%16];
+        float *out=blockIdx.z ? up_out : gate_out;
+        out[uint64_t(out_pair)*nrows+first_row+at/16]=value;
+    }
+}
+
 /* Complementary half of the Stage-3 crossover.  The routing stream is built
  * in 16-pair tiles for WMMA; cold experts consume each tile as two instances
  * of the shipping eight-pair DP4A computation. */

@@ -36,7 +36,8 @@ git rev-parse HEAD > "$probe_dir/source.txt"
 stat -Lc 'model=%n bytes=%s mtime=%y inode=%i' "$DS4_GLM5_MODEL" > "$probe_dir/model-stat.txt"
 sha256sum tests/glm5_q4k_fullrow_kernels.cu tests/test_glm5_q4k_fullrow.cu \
     tests/glm5_q4k_fullrow_test.hpp tests/glm5_gguf_test.hpp \
-    rocm/ds4_rocm_q4k_dot.cuh rocm/ds4_rocm_q4k_types.cuh ds4_rocm.h \
+    rocm/ds4_rocm_q4k_dot.cuh rocm/ds4_rocm_q4k_types.cuh \
+    rocm/ds4_rocm_glm5_q4k_integer.cuh ds4_rocm.h \
     scripts/run-glm5-q4k-fullrow-probe.sh > "$probe_dir/source-SHA256SUMS"
 exec 3> "$probe_dir/commands.log"
 export BASH_XTRACEFD=3
