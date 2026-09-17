@@ -2636,27 +2636,87 @@ static int routed_moe_launch(
                 if (q4k_path) {
                     if (routed_moe_q4k_decode_split_gate_up_enabled() &&
                         !write_gate_up) {
-                        dim3 split_grid((expert_mid_dim + 127u) / 128u,
-                                        pair_count, 1);
-                        moe_gate_or_up_decode_q4K_staged_xq_kernel<8, false>
-                            <<<split_grid, 128>>>(
-                            (float *)gate->ptr, NULL, gate_w, xq,
-                            (const int32_t *)selected_exec->ptr,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks,
-                            expert_mid_dim, n_expert,
-                            tp_skip_unowned && n_tokens == 1u, clamp);
-                        ok = cudaGetLastError() == cudaSuccess;
-                        if (ok) {
-                            moe_gate_or_up_decode_q4K_staged_xq_kernel<8, true>
+                        /* Keep split gate/up shape-gated like the fused
+                         * kernel.  The previous arm always launched the
+                         * 128-row template, so selecting 32/64 rows changed
+                         * only the fused path and silently invalidated the
+                         * geometry comparison.  Each variant stages the same
+                         * bounded Q8 activation tile and uses the identical
+                         * ordered dot helper; only the number of row groups
+                         * per block changes. */
+                        if (glm5_decode_rows == 32u) {
+                            dim3 split_grid((expert_mid_dim + 31u) / 32u,
+                                            pair_count, 1);
+                            moe_gate_or_up_decode_q4K_staged_xq_kernel<2, false>
                                 <<<split_grid, 128>>>(
-                                (float *)mid->ptr,
-                                (const float *)gate->ptr, up_w, xq,
+                                (float *)gate->ptr, NULL, gate_w, xq,
                                 (const int32_t *)selected_exec->ptr,
                                 (const float *)weights->ptr,
                                 gate_expert_bytes, gate_row_bytes, xq_blocks,
                                 expert_mid_dim, n_expert,
                                 tp_skip_unowned && n_tokens == 1u, clamp);
+                        } else if (glm5_decode_rows == 64u) {
+                            dim3 split_grid((expert_mid_dim + 63u) / 64u,
+                                            pair_count, 1);
+                            moe_gate_or_up_decode_q4K_staged_xq_kernel<4, false>
+                                <<<split_grid, 128>>>(
+                                (float *)gate->ptr, NULL, gate_w, xq,
+                                (const int32_t *)selected_exec->ptr,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert,
+                                tp_skip_unowned && n_tokens == 1u, clamp);
+                        } else {
+                            dim3 split_grid((expert_mid_dim + 127u) / 128u,
+                                            pair_count, 1);
+                            moe_gate_or_up_decode_q4K_staged_xq_kernel<8, false>
+                                <<<split_grid, 128>>>(
+                                (float *)gate->ptr, NULL, gate_w, xq,
+                                (const int32_t *)selected_exec->ptr,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert,
+                                tp_skip_unowned && n_tokens == 1u, clamp);
+                        }
+                        ok = cudaGetLastError() == cudaSuccess;
+                        if (ok) {
+                            if (glm5_decode_rows == 32u) {
+                                dim3 split_grid((expert_mid_dim + 31u) / 32u,
+                                                pair_count, 1);
+                                moe_gate_or_up_decode_q4K_staged_xq_kernel<2, true>
+                                    <<<split_grid, 128>>>(
+                                    (float *)mid->ptr, (const float *)gate->ptr,
+                                    up_w, xq,
+                                    (const int32_t *)selected_exec->ptr,
+                                    (const float *)weights->ptr,
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                    expert_mid_dim, n_expert,
+                                    tp_skip_unowned && n_tokens == 1u, clamp);
+                            } else if (glm5_decode_rows == 64u) {
+                                dim3 split_grid((expert_mid_dim + 63u) / 64u,
+                                                pair_count, 1);
+                                moe_gate_or_up_decode_q4K_staged_xq_kernel<4, true>
+                                    <<<split_grid, 128>>>(
+                                    (float *)mid->ptr, (const float *)gate->ptr,
+                                    up_w, xq,
+                                    (const int32_t *)selected_exec->ptr,
+                                    (const float *)weights->ptr,
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                    expert_mid_dim, n_expert,
+                                    tp_skip_unowned && n_tokens == 1u, clamp);
+                            } else {
+                                dim3 split_grid((expert_mid_dim + 127u) / 128u,
+                                                pair_count, 1);
+                                moe_gate_or_up_decode_q4K_staged_xq_kernel<8, true>
+                                    <<<split_grid, 128>>>(
+                                    (float *)mid->ptr, (const float *)gate->ptr,
+                                    up_w, xq,
+                                    (const int32_t *)selected_exec->ptr,
+                                    (const float *)weights->ptr,
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                    expert_mid_dim, n_expert,
+                                    tp_skip_unowned && n_tokens == 1u, clamp);
+                            }
                             ok = cudaGetLastError() == cudaSuccess;
                         }
                     } else if (routed_moe_q4k_decode_stage_xq_enabled()) {
@@ -4409,9 +4469,7 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         (dot_lanes && (decode_rows != 128 || dot_unroll)) ||
         (dot_unroll && decode_rows != 128) ||
         ((decode_rows != 128 || dot_unroll || dot_lanes) &&
-         (n_total_expert != 288u || n_expert != 8u ||
-          routed_moe_q4k_decode_stage_xq_enabled() ||
-          routed_moe_q4k_decode_split_gate_up_enabled()))) return 0;
+         (n_total_expert != 288u || n_expert != 8u))) return 0;
     if (!cuda_q4k_kshard_enabled() ||
         !out || !gate || !up || !mid || !down || !model_map ||
         model_size == 0u ||
