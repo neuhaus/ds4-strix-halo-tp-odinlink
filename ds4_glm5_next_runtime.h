@@ -148,8 +148,11 @@ int ds4_glm5_next_mla_sparse_selection_plan(
         uint32_t *selected_pools, uint32_t *selected_tokens);
 /* Stop a dense tile exactly at the sparse boundary. If the negotiated sparse
  * bridge is disabled, use scalar execution thereafter. If it is enabled,
- * later tiles retain their requested size while each sparse MLA attention
- * stage executes causally through the established scalar implementation. */
+ * later tiles are capped by the requested size while each sparse MLA
+ * attention stage executes causally through the established scalar path.
+ * Tiles larger than 256 rows retain complete M256 groups; a smaller tail
+ * follows separately so projection dispatch matches the M256 reference.
+ * Group boundaries are relative to the current sync start or crossover. */
 uint32_t ds4_glm5_next_prefill_chunk(
         uint32_t position, uint32_t remaining, uint32_t requested_batch,
         bool allow_sparse_batch);

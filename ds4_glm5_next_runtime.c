@@ -47,13 +47,19 @@ uint32_t ds4_glm5_next_prefill_chunk(
         bool allow_sparse_batch) {
     if (remaining == 0u) return 0u;
     if (requested_batch < 2u) return 1u;
-    if (position >= DS4_GLM5_NEXT_INDEX_TOP_K) {
-        if (!allow_sparse_batch) return 1u;
-        return remaining < requested_batch ? remaining : requested_batch;
-    }
+    if (position >= DS4_GLM5_NEXT_INDEX_TOP_K && !allow_sparse_batch)
+        return 1u;
     uint32_t chunk = remaining < requested_batch ? remaining : requested_batch;
-    const uint32_t dense_remaining = DS4_GLM5_NEXT_INDEX_TOP_K - position;
-    if (chunk > dense_remaining) chunk = dense_remaining;
+    if (position < DS4_GLM5_NEXT_INDEX_TOP_K) {
+        const uint32_t dense_remaining = DS4_GLM5_NEXT_INDEX_TOP_K - position;
+        if (chunk > dense_remaining) chunk = dense_remaining;
+    }
+    /* Large projection kernels require complete M256 tiles. Keep those
+     * tiles ahead of a small remainder, matching the incumbent M256 call
+     * boundaries (relative to this sync's start, not absolute position).
+     * A single 308-row generic projection is not numerically equivalent to
+     * the reference's 256-row WMMA followed by its 52-row generic tail. */
+    if (chunk > 256u) chunk -= chunk % 256u;
     return chunk ? chunk : 1u;
 }
 

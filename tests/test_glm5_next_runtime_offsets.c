@@ -138,6 +138,46 @@ static int test_contract(void) {
     CHECK(ds4_glm5_next_prefill_chunk(0u, 8u, 1u, true) == 1u &&
           ds4_glm5_next_prefill_chunk(0u, 0u, 1024u, true) == 0u,
           "prefill planner preserves scalar and empty contracts");
+    CHECK(ds4_glm5_next_prefill_chunk(8192u, 308u, 1024u, true) == 256u &&
+          ds4_glm5_next_prefill_chunk(8448u, 52u, 1024u, true) == 52u,
+          "large prefill preserves a complete projection tile before the tail");
+    CHECK(ds4_glm5_next_prefill_chunk(1500u, 2000u, 1024u, true) == 512u &&
+          ds4_glm5_next_prefill_chunk(2012u, 1488u, 1024u, true) == 36u &&
+          ds4_glm5_next_prefill_chunk(2048u, 1452u, 1024u, true) == 1024u &&
+          ds4_glm5_next_prefill_chunk(3072u, 428u, 1024u, true) == 256u,
+          "resumed prefill preserves reference groups across sparse crossover");
+    /* Expand large tiles into their M256 occupancy domains. This must give
+     * the same domain boundaries as the incumbent M256 planner, including
+     * resumed prefixes and the dense/sparse crossover. An incomplete large
+     * tile would instead choose generic projection arithmetic for every row. */
+    const uint32_t starts[] = {0u, 1u, 1001u, 1500u, 1900u, 2047u,
+                               2048u, 2051u, 8192u, 8193u};
+    const uint32_t batches[] = {257u, 300u, 511u, 512u, 768u, 1000u, 1024u};
+    for (size_t si = 0; si < sizeof(starts) / sizeof(starts[0]); ++si) {
+        for (size_t bi = 0; bi < sizeof(batches) / sizeof(batches[0]); ++bi) {
+            for (uint32_t length = 1u; length <= 2050u; ++length) {
+                uint32_t position = starts[si], remaining = length;
+                while (remaining) {
+                    const uint32_t chunk = ds4_glm5_next_prefill_chunk(
+                        position, remaining, batches[bi], true);
+                    CHECK(chunk && chunk <= remaining && chunk <= batches[bi],
+                          "large prefill planner makes bounded progress");
+                    CHECK(chunk <= 256u || chunk % 256u == 0u,
+                          "large prefill never selects a partial projection tile");
+                    uint32_t consumed = 0u;
+                    while (consumed < chunk) {
+                        const uint32_t reference = ds4_glm5_next_prefill_chunk(
+                            position + consumed, remaining - consumed, 256u, true);
+                        CHECK(reference <= chunk - consumed,
+                              "large prefill does not split a reference domain");
+                        consumed += reference;
+                    }
+                    position += chunk;
+                    remaining -= chunk;
+                }
+            }
+        }
+    }
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;
     CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count, 0u) &&
