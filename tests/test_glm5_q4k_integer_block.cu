@@ -107,7 +107,7 @@ int main() {
     HIP(hipMemcpy(dw,w.data(),w.size()*sizeof(w[0]),hipMemcpyHostToDevice));
     HIP(hipMemcpy(dx,x.data(),x.size()*sizeof(x[0]),hipMemcpyHostToDevice));
     HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n-1,16,true,true)==hipErrorInvalidValue ? hipSuccess : hipErrorUnknown);
-    for (unsigned candidate : {1u,2u}) for (unsigned m : {1u, 7u, 16u, 17u, 256u}) {
+    for (unsigned candidate : {1u,2u,3u}) for (unsigned m : {1u, 7u, 16u, 17u, 256u}) {
         HIP(glm5_q4k_integer_blocks(dw,dx,dref,n,m,false,true));
         HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,candidate,true));
         std::vector<Q4KBlockResult> ref(n*m),got(n*m);

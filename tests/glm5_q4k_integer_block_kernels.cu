@@ -140,12 +140,66 @@ __global__ void q4k_block_mma_register(const cuda_block_q4_K *w,
     }
 }
 
+// A six-bit subgroup scale cannot multiply a nibble into signed int8 in one
+// fragment. Two three-bit pieces can: 15*7=105. Integer accumulation across
+// all subgroups is exact, including the separately accumulated minimum term.
+template<bool Trace>
+__global__ void q4k_block_mma_scaled(const cuda_block_q4_K *w,
+        const cuda_block_q8_K *x, Q4KBlockResult *out, unsigned n, unsigned m) {
+    using I4 = int32_t __attribute__((ext_vector_type(4)));
+    using I8 = int32_t __attribute__((ext_vector_type(8)));
+    const unsigned lane = threadIdx.x, col = lane%16;
+    const unsigned wbase = blockIdx.x*16, tbase = blockIdx.y*16;
+    const auto &wb = w[wbase+col];
+    const auto &xb = x[tbase+col < m ? tbase+col : 0];
+    I8 low = {}, high = {}, minimum = {};
+    #pragma unroll 1
+    for (unsigned g = 0; g < 8; ++g) {
+        uint8_t scale, mn;
+        dev_q4_K_get_scale_min(g,wb.scales,&scale,&mn);
+        I4 am;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) am[j] = uint32_t(mn)*0x01010101u;
+        #pragma unroll
+        for (unsigned half = 0; half < 2; ++half) {
+            I4 al,ah,b;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const uint32_t packed = (reinterpret_cast<const uint32_t *>(wb.qs+(g/2)*32)[half*4+j] >> ((g%2)*4)) & 0x0f0f0f0fu;
+                // No cross-byte carries: every byte product is <=105.
+                al[j] = packed*uint32_t(scale&7u);
+                ah[j] = packed*uint32_t(scale>>3u);
+                b[j] = reinterpret_cast<const int32_t *>(xb.qs+g*32)[half*4+j];
+            }
+            low = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,al,true,b,low,true);
+            high = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,ah,true,b,high,true);
+            minimum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true,am,true,b,minimum,true);
+        }
+    }
+    if (tbase+col >= m) return;
+    #pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned row = wbase+2*i+lane/16;
+        const int total = low[i]+8*high[i];
+        const float xd = dev_f16_to_f32(w[row].d), xmin = dev_f16_to_f32(w[row].dmin);
+        auto &result = out[(tbase+col)*n+row];
+        result.value = xb.d * xd * float(total) - xb.d * xmin * float(minimum[i]);
+        if constexpr (Trace) {
+            result.dot = total;
+            result.minimum = minimum[i];
+        }
+    }
+}
+
 hipError_t glm5_q4k_integer_blocks(const cuda_block_q4_K *w,
         const cuda_block_q8_K *x, Q4KBlockResult *out, unsigned n, unsigned m,
         unsigned mode, bool trace) {
-    if (!w || !x || !out || !n || n%16 || !m || m > 256 || n > 65536 || mode>2)
+    if (!w || !x || !out || !n || n%16 || !m || m > 256 || n > 65536 || mode>3)
         return hipErrorInvalidValue;
-    if (mode==2) {
+    if (mode==3) {
+        if (trace) q4k_block_mma_scaled<true><<<dim3(n/16,(m+15)/16),32>>>(w,x,out,n,m);
+        else q4k_block_mma_scaled<false><<<dim3(n/16,(m+15)/16),32>>>(w,x,out,n,m);
+    } else if (mode==2) {
         if (trace) q4k_block_mma_register<true><<<dim3(n/16,(m+15)/16),32>>>(w,x,out,n,m);
         else q4k_block_mma_register<false><<<dim3(n/16,(m+15)/16),32>>>(w,x,out,n,m);
     } else if (mode==1) {
