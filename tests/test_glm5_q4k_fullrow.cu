@@ -59,12 +59,23 @@ int main() {
     REQUIRE(gguf.open_file(model));
     constexpr unsigned n=1024, max_m=96;
     for (const char *role : {"gate","up","down"}) {
-        const std::string name = std::string("blk.0.ffn_")+role+"_exps.weight";
-        REQUIRE(gguf.tensors.count(name));
+        // Early layers can be dense: discover actual routed tensors rather
+        // than assuming expert weights exist in block zero.
+        const std::string suffix = std::string(".ffn_")+role+"_exps.weight";
+        std::vector<std::string> names;
+        for (const auto &item : gguf.tensors)
+            if (item.first.size()>=suffix.size() &&
+                item.first.compare(item.first.size()-suffix.size(),suffix.size(),suffix)==0)
+                names.push_back(item.first);
+        REQUIRE(names.size()>=3);
+        std::sort(names.begin(),names.end());
+        for (size_t fixture : {size_t(0), names.size()/2, names.size()-1}) {
+        const std::string &name=names[fixture];
         const auto &info = gguf.tensors.at(name);
         REQUIRE(info.type==12 && info.dims.size()==3 && info.dims[0]%256==0);
         const unsigned blocks = info.dims[0]/256;
         REQUIRE(blocks>0 && blocks<=64 && info.dims[1]*info.dims[2]>=n);
+        std::printf("fixture tensor=%s K=%u original_rows=%u\n",name.c_str(),blocks*256,n);
         uint64_t offset;
         REQUIRE(gguf.tensor(name.c_str(),info.dims,12,offset));
         std::vector<cuda_block_q4_K> w(n*blocks);
@@ -145,6 +156,7 @@ int main() {
             }
         }
         HIP(hipFree(dw)); HIP(hipFree(dx)); HIP(hipFree(dref)); HIP(hipFree(dgot));
+        }
     }
     return 0;
 }
