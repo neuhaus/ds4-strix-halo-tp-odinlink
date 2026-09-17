@@ -175,7 +175,9 @@ tests/test_rocm_glm5_q4k_batch_partition: tests/test_rocm_glm5_q4k_batch_partiti
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-q4k-batch-partition: tests/test_rocm_glm5_q4k_batch_partition
-	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 257 511 512 767 768 1000 1023 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows; \
+	done
 
 test-rocm-glm5-router-moe-bridge: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose

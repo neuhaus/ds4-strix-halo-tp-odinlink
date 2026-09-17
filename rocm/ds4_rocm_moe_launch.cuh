@@ -4366,7 +4366,7 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
     if (partition && strcmp(partition, "0") != 0 &&
         strcmp(partition, "256") != 0) return 0;
     if (partition && strcmp(partition, "256") == 0 &&
-        n_tokens > 256u && n_tokens <= 1024u && n_tokens % 256u == 0u) {
+        n_tokens > 256u && n_tokens <= 1024u) {
         const uint64_t mid_stride = (uint64_t)n_expert * row_count * sizeof(float);
         const uint64_t strides[] = {
             4096u * sizeof(float), mid_stride, mid_stride, mid_stride,
@@ -4382,11 +4382,13 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
                 (uint64_t)n_tokens * strides[i]) return 0;
         }
         for (uint32_t first = 0u; first < n_tokens; first += 256u) {
+            const uint32_t count = n_tokens - first < 256u ?
+                                   n_tokens - first : 256u;
             ds4_gpu_tensor *views[8] = {};
             bool valid = true;
             for (uint32_t i = 0u; i < 8u; ++i) {
                 views[i] = ds4_gpu_tensor_view(
-                    bases[i], (uint64_t)first * strides[i], 256u * strides[i]);
+                    bases[i], (uint64_t)first * strides[i], count * strides[i]);
                 valid = valid && views[i] != NULL;
             }
             bool tile_mid_is_f16 = false;
@@ -4396,7 +4398,7 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
                 n_total_expert, source_gate_row_bytes, source_down_row_bytes,
                 row_base, row_count, down_column_byte_base,
                 down_column_byte_count, views[5], views[6], n_expert, clamp,
-                views[7], layer_index, 256u, &tile_mid_is_f16);
+                views[7], layer_index, count, &tile_mid_is_f16);
             for (uint32_t i = 0u; i < 8u; ++i) ds4_gpu_tensor_free(views[i]);
             if (!ok || tile_mid_is_f16) return 0;
         }

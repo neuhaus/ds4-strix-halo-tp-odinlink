@@ -1,5 +1,6 @@
-// Compare the real packed-half production entry with four independent M256
-// calls. Rare routes are cold within each M256 group and hot across M1024.
+// Compare the real packed-half production entry with independent <=M256
+// calls, including the final partial group. Rare routes change hot/cold
+// occupancy if an outer batch is accidentally treated as one group.
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 extern "C" {
@@ -17,8 +18,16 @@ extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
     std::fprintf(stderr, "FAIL line=%d: %s\n", __LINE__, #x); \
     std::exit(1); } } while (0)
 
-int main() {
-    constexpr uint32_t rows = 1024, width = 4096, mid_width = 1024;
+int main(int argc, char **argv) {
+    constexpr uint32_t width = 4096, mid_width = 1024;
+    uint32_t rows = 1024;
+    REQUIRE(argc <= 2);
+    if (argc == 2) {
+        char *end = nullptr;
+        const unsigned long count = std::strtoul(argv[1], &end, 10);
+        REQUIRE(end != argv[1] && *end == '\0' && count > 0 && count <= 1024);
+        rows = uint32_t(count);
+    }
     constexpr uint32_t experts = 288, used = 8, tile = 256;
     constexpr uint64_t gate_row = 16u * 144u, down_row = 8u * 144u;
     const char *model = std::getenv("DS4_GLM5_MODEL");
@@ -90,12 +99,13 @@ int main() {
         };
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
+            const unsigned count = rows-first < tile ? rows-first : tile;
             ds4_gpu_tensor *v[8];
             for (unsigned i=0; i<8; ++i) {
-                v[i] = ds4_gpu_tensor_view(t[i],first*strides[i],tile*strides[i]);
+                v[i] = ds4_gpu_tensor_view(t[i],first*strides[i],count*strides[i]);
                 REQUIRE(v[i]);
             }
-            REQUIRE(call(v,tile));
+            REQUIRE(call(v,count));
             for (auto *view:v) ds4_gpu_tensor_free(view);
         }
         REQUIRE(ds4_gpu_tensor_read(t[0],0,reference.data(),rows*strides[0]));
@@ -110,8 +120,8 @@ int main() {
             different += std::memcmp(&reference[i],&actual[i],sizeof(float)) != 0;
             max_abs = std::fmax(max_abs,std::fabs(double(reference[i])-actual[i]));
         }
-        std::printf("rank=%u values=%zu different=%zu max_abs=%.9g\n",
-                    rank,actual.size(),different,max_abs);
+        std::printf("rank=%u rows=%u values=%zu different=%zu max_abs=%.9g\n",
+                    rank,rows,actual.size(),different,max_abs);
         std::fflush(stdout);
         REQUIRE(different == 0);
         // Invalid outer capacity must be rejected before writing earlier tiles.
@@ -133,5 +143,5 @@ int main() {
     }
     for (auto *tensor:t) ds4_gpu_tensor_free(tensor);
     ds4_gpu_cleanup();
-    std::puts("PASS packed Q4_K M1024 equals independent M256 groups on both halves");
+    std::puts("PASS packed Q4_K batch equals independent <=M256 groups on both halves");
 }
