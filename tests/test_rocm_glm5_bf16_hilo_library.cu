@@ -23,8 +23,13 @@ static float bf16_value(uint16_t v) {
 }
 
 int main(int argc, char **argv) {
-    REQUIRE(argc == 1 || (argc == 2 && std::strcmp(argv[1],"--lt") == 0));
-    const bool use_lt = argc == 2;
+    REQUIRE(argc == 1 || ((argc == 2 || argc == 3) && std::strcmp(argv[1],"--lt") == 0));
+    const bool use_lt = argc >= 2;
+    int requested = -1; // Without an index retain first-successful selection.
+    if (argc == 3) {
+        REQUIRE(std::strlen(argv[2]) == 1 && argv[2][0] >= '0' && argv[2][0] <= '7');
+        requested = argv[2][0]-'0';
+    }
     const char *model = std::getenv("DS4_GLM5_MODEL");
     REQUIRE(model);
     Glm5TestGGUF gguf;
@@ -82,12 +87,15 @@ int main(int argc, char **argv) {
                 int returned=0, chosen=-1;
                 const auto status = hipblasLtMatmulAlgoGetHeuristic(lt_handle,desc,ad,bd,cd,cd,pref,8,heuristics,&returned);
                 REQUIRE(hipblasLtMatmulPreferenceDestroy(pref) == HIPBLAS_STATUS_SUCCESS);
+                REQUIRE(returned >= 0 && returned <= 8);
                 if (status == HIPBLAS_STATUS_SUCCESS)
-                    for (int i=0; i<returned; ++i)
+                    for (int i=0; i<returned; ++i) {
+                        if (requested >= 0 && i != requested) continue;
                         if (heuristics[i].state == HIPBLAS_STATUS_SUCCESS &&
                             heuristics[i].workspaceSize <= max_workspace) { chosen=i; break; }
-                std::printf("lt_plan layer=%u layout=%u M=%u K=%u N=%u status=%d returned=%d chosen=%d\n",
-                            layer,layout,m,k,n,int(status),returned,chosen);
+                    }
+                std::printf("lt_plan layer=%u layout=%u M=%u K=%u N=%u status=%d returned=%d requested=%d chosen=%d\n",
+                            layer,layout,m,k,n,int(status),returned,requested,chosen);
                 std::fflush(stdout);
                 REQUIRE(chosen >= 0);
                 algorithm=heuristics[chosen];
