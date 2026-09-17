@@ -86,7 +86,7 @@ int main() {
                 down_offset,experts,gate_row,down_row,rank*mid_width,
                 mid_width,rank*down_row/2,down_row/2,v[5],v[6],used,
                 10.0f,v[7],3,count,&half_mid);
-            REQUIRE(ok && !half_mid);
+            return ok && !half_mid;
         };
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
@@ -95,13 +95,13 @@ int main() {
                 v[i] = ds4_gpu_tensor_view(t[i],first*strides[i],tile*strides[i]);
                 REQUIRE(v[i]);
             }
-            call(v,tile);
+            REQUIRE(call(v,tile));
             for (auto *view:v) ds4_gpu_tensor_free(view);
         }
         REQUIRE(ds4_gpu_tensor_read(t[0],0,reference.data(),rows*strides[0]));
         REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "256", 1) == 0);
-        call(t,rows);
+        REQUIRE(call(t,rows));
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         size_t different=0;
         double max_abs=0;
@@ -114,6 +114,20 @@ int main() {
                     rank,actual.size(),different,max_abs);
         std::fflush(stdout);
         REQUIRE(different == 0);
+        // Invalid outer capacity must be rejected before writing earlier tiles.
+        REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
+        ds4_gpu_tensor *short_out = ds4_gpu_tensor_view(
+            t[0],0,(rows-1u)*strides[0]);
+        REQUIRE(short_out);
+        ds4_gpu_tensor *invalid[8];
+        std::memcpy(invalid,t,sizeof(t));
+        invalid[0] = short_out;
+        REQUIRE(!call(invalid,rows));
+        ds4_gpu_tensor_free(short_out);
+        REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+        for (float value:actual) REQUIRE(std::isnan(value));
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "invalid", 1) == 0);
+        REQUIRE(!call(t,rows));
         REQUIRE(ds4_gpu_synchronize());
         ds4_gpu_q4k_packed_slice_release_all();
     }

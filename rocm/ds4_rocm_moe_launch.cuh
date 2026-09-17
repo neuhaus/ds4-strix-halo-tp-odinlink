@@ -4356,6 +4356,61 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         return 0;
     }
 
+    /* Expert occupancy selects different WMMA/DP4A arithmetic. Preserve the
+     * production M256 occupancy domains while allowing the surrounding dense
+     * projections to use a larger prefill batch. Views share the existing
+     * activation/scratch allocations and the original packed weight slices.
+     * Only the resident GLM packed-half entry is affected; keep default-off
+     * until the full-model numerical and performance gates pass. */
+    const char *partition = getenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION");
+    if (partition && strcmp(partition, "0") != 0 &&
+        strcmp(partition, "256") != 0) return 0;
+    if (partition && strcmp(partition, "256") == 0 &&
+        n_tokens > 256u && n_tokens <= 1024u && n_tokens % 256u == 0u) {
+        const uint64_t mid_stride = (uint64_t)n_expert * row_count * sizeof(float);
+        const uint64_t strides[] = {
+            4096u * sizeof(float), mid_stride, mid_stride, mid_stride,
+            (uint64_t)n_expert * 4096u * sizeof(float),
+            (uint64_t)n_expert * sizeof(int32_t),
+            (uint64_t)n_expert * sizeof(float), 4096u * sizeof(float),
+        };
+        const ds4_gpu_tensor *bases[] = {
+            out, gate, up, mid, down, selected, weights, x,
+        };
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            if (ds4_gpu_tensor_bytes(bases[i]) <
+                (uint64_t)n_tokens * strides[i]) return 0;
+        }
+        for (uint32_t first = 0u; first < n_tokens; first += 256u) {
+            ds4_gpu_tensor *views[8] = {};
+            bool valid = true;
+            for (uint32_t i = 0u; i < 8u; ++i) {
+                views[i] = ds4_gpu_tensor_view(
+                    bases[i], (uint64_t)first * strides[i], 256u * strides[i]);
+                valid = valid && views[i] != NULL;
+            }
+            bool tile_mid_is_f16 = false;
+            const int ok = valid && ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+                views[0], views[1], views[2], views[3], views[4],
+                model_map, model_size, gate_offset, up_offset, down_offset,
+                n_total_expert, source_gate_row_bytes, source_down_row_bytes,
+                row_base, row_count, down_column_byte_base,
+                down_column_byte_count, views[5], views[6], n_expert, clamp,
+                views[7], layer_index, 256u, &tile_mid_is_f16);
+            for (uint32_t i = 0u; i < 8u; ++i) ds4_gpu_tensor_free(views[i]);
+            if (!ok || tile_mid_is_f16) return 0;
+        }
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 packed Q4_K prefill partition engaged "
+                    "outer=%u tile=256 weights=original scratch=views\n",
+                    n_tokens);
+            reported = 1;
+        }
+        return 1;
+    }
+
     const void *gate_w = NULL, *up_w = NULL, *down_w = NULL;
     uint64_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;
     uint64_t gate_expert_bytes = 0, up_expert_bytes = 0;
