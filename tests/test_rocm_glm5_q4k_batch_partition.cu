@@ -24,18 +24,31 @@ int main(int argc, char **argv) {
     uint32_t rows = 1024;
     REQUIRE(argc <= 3);
     const bool grouped = argc == 3 && std::strcmp(argv[2], "--grouped") == 0;
-    const bool cold_lds5 = argc == 3 && !grouped;
+    const unsigned decode_rows = argc != 3 ? 0u :
+        std::strcmp(argv[2], "--decode32") == 0 ? 32u :
+        std::strcmp(argv[2], "--decode64") == 0 ? 64u : 0u;
+    const bool cold_lds5 = argc == 3 && !grouped && !decode_rows;
     const bool cold_padding = cold_lds5 &&
         std::strcmp(argv[2], "--cold-lds5-pad") == 0;
     if (cold_lds5) REQUIRE(cold_padding || std::strcmp(argv[2], "--cold-lds5") == 0);
-    const char *timing_selector = grouped ? "DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED" : cold_padding ?
+    const char *timing_selector = decode_rows ? "DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS" :
+        grouped ? "DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED" : cold_padding ?
         "DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD" : "DS4_ROCM_GLM5_Q4K_COLD_LDS5";
+    const char *candidate_mode = decode_rows == 32u ? "32" : decode_rows == 64u ? "64" : "1";
+    const char *input_case = std::getenv("DS4_TEST_MOE_INPUT_CASE");
+    unsigned fixture = 0;
+    if (input_case) {
+        REQUIRE(std::strcmp(input_case,"0") == 0 || std::strcmp(input_case,"1") == 0 ||
+                std::strcmp(input_case,"2") == 0);
+        fixture = unsigned(input_case[0]-'0');
+    }
     if (argc >= 2) {
         char *end = nullptr;
         const unsigned long count = std::strtoul(argv[1], &end, 10);
         REQUIRE(end != argv[1] && *end == '\0' && count > 0 && count <= 1024);
         rows = uint32_t(count);
     }
+    if (decode_rows) REQUIRE(rows == 1u);
     constexpr uint32_t experts = 288, used = 8, tile = 256;
     constexpr uint64_t gate_row = 16u * 144u, down_row = 8u * 144u;
     const char *model = std::getenv("DS4_GLM5_MODEL");
@@ -56,6 +69,10 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED", "1", 1) == 0);
     ds4_gpu_config config = {};
     config.n_gpus = 1;
@@ -77,8 +94,8 @@ int main(int argc, char **argv) {
     std::vector<float> x(rows*width), weights(rows*used);
     std::vector<int32_t> selected(rows*used);
     for (size_t i=0; i<x.size(); ++i)
-        x[i] = float(std::sin(double(i)*0.013)*0.17 +
-                     std::cos(double(i)*0.031)*0.11);
+        x[i] = float(std::sin(double(i)*0.013+fixture)*0.17 +
+                     std::cos(double(i)*0.031+fixture*2)*0.11);
     for (unsigned r=0; r<rows; ++r) for (unsigned s=0; s<used; ++s) {
         selected[r*used+s] = s<7 ? int(s) : 7+int(r%128);
         if ((cold_lds5 || grouped) && s == 7u) {
@@ -102,6 +119,14 @@ int main(int argc, char **argv) {
             selected[r*used+s] = -1;
             weights[r*used+s] = 0.0f;
         }
+        if (decode_rows) {
+            selected[r*used+s] = int((s*37u + fixture*41u) % experts);
+            if (fixture == 1u && s == 6u) {
+                selected[r*used+s] = -1;
+                weights[r*used+s] = 0.0f;
+            }
+            if (fixture == 2u && s == 7u) weights[r*used+s] = 0.0f;
+        }
     }
     REQUIRE(ds4_gpu_tensor_write(t[7],0,x.data(),rows*strides[7]));
     REQUIRE(ds4_gpu_tensor_write(t[5],0,selected.data(),rows*strides[5]));
@@ -121,6 +146,14 @@ int main(int argc, char **argv) {
         REQUIRE(ds4_gpu_q4k_packed_slice_load(gguf.map,down_offset,
             0,width,rank*down_row/2,down_row/2));
         auto call = [&](ds4_gpu_tensor **v, unsigned count) {
+            if (decode_rows) {
+                REQUIRE(count == 1u);
+                return ds4_gpu_routed_moe_one_packed_q4k_tensor(
+                    v[0],v[1],v[2],v[3],v[4],gguf.map,gguf.size,go,uo,
+                    down_offset,experts,gate_row,down_row,rank*mid_width,
+                    mid_width,rank*down_row/2,down_row/2,v[5],v[6],used,
+                    fixture == 2u ? 0.0f : 10.0f,v[7],nullptr,3) != 0;
+            }
             bool half_mid = true;
             const int ok = ds4_gpu_routed_moe_batch_packed_q4k_tensor(
                 v[0],v[1],v[2],v[3],v[4],gguf.map,gguf.size,go,uo,
@@ -132,6 +165,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_padding ? "1" : "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
             const unsigned count = rows-first < tile ? rows-first : tile;
@@ -149,6 +183,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_lds5 ? "1" : "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", cold_padding ? "1" : "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", grouped ? "1" : "0", 1) == 0);
+        if (decode_rows) REQUIRE(setenv(timing_selector,candidate_mode,1) == 0);
         REQUIRE(call(t,rows));
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         size_t different=0;
@@ -162,13 +197,13 @@ int main(int argc, char **argv) {
                     rank,rows,actual.size(),different,max_abs);
         std::fflush(stdout);
         REQUIRE(different == 0);
-        if (cold_lds5 || grouped) {
+        if (cold_lds5 || grouped || decode_rows) {
             // Warm both full-MoE arms before timing. These are GPU-event
             // microbenchmarks with synthetic routes, not model throughput.
             hipEvent_t begin, end;
             REQUIRE(hipEventCreate(&begin) == hipSuccess);
             REQUIRE(hipEventCreate(&end) == hipSuccess);
-            for (const char *mode : {"0", "1"}) {
+            for (const char *mode : {"0", candidate_mode}) {
                 REQUIRE(setenv(timing_selector, mode, 1) == 0);
                 REQUIRE(call(t,rows));
             }
@@ -176,7 +211,7 @@ int main(int argc, char **argv) {
             for (unsigned pair = 0; pair < 3u; ++pair) {
                 for (unsigned arm = 0; arm < 2u; ++arm) {
                     const unsigned mode = arm ^ (pair & 1u);
-                    REQUIRE(setenv(timing_selector, mode ? "1" : "0", 1) == 0);
+                    REQUIRE(setenv(timing_selector, mode ? candidate_mode : "0", 1) == 0);
                     REQUIRE(hipEventRecord(begin, nullptr) == hipSuccess);
                     for (unsigned repeat = 0; repeat < 5u; ++repeat)
                         REQUIRE(call(t,rows));
@@ -186,7 +221,7 @@ int main(int argc, char **argv) {
                     REQUIRE(hipEventElapsedTime(&ms, begin, end) == hipSuccess);
                     REQUIRE(std::isfinite(ms) && ms > 0.0f);
                     std::printf("microbench rank=%u rows=%u pair=%u %s=%u moe_ms=%.6f\n",
-                                rank, rows, pair, grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
+                                rank, rows, pair, decode_rows ? "decode_rows" : grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
                 }
             }
             REQUIRE(hipEventDestroy(begin) == hipSuccess);
@@ -195,7 +230,7 @@ int main(int argc, char **argv) {
         // Invalid outer capacity must be rejected before writing earlier tiles.
         REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
         ds4_gpu_tensor *short_out = ds4_gpu_tensor_view(
-            t[0],0,(rows-1u)*strides[0]);
+            t[0],0,rows*strides[0]-sizeof(float));
         REQUIRE(short_out);
         ds4_gpu_tensor *invalid[8];
         std::memcpy(invalid,t,sizeof(t));
@@ -204,6 +239,15 @@ int main(int argc, char **argv) {
         ds4_gpu_tensor_free(short_out);
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         for (float value:actual) REQUIRE(std::isnan(value));
+        if (decode_rows) {
+            for (const char *invalid_mode : {"invalid", "16", "33"}) {
+                REQUIRE(setenv(timing_selector,invalid_mode,1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                for (float value:actual) REQUIRE(std::isnan(value));
+            }
+            REQUIRE(setenv(timing_selector,"0",1) == 0);
+        }
         if (cold_lds5) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "invalid", 1) == 0);
             REQUIRE(!call(t,rows));
@@ -246,7 +290,7 @@ int main(int argc, char **argv) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
         }
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "invalid", 1) == 0);
-        REQUIRE(!call(t,rows));
+        if (!decode_rows) REQUIRE(!call(t,rows));
         REQUIRE(ds4_gpu_synchronize());
         ds4_gpu_q4k_packed_slice_release_all();
     }

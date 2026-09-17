@@ -2066,6 +2066,7 @@ __global__ static void moe_down_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+template <uint32_t Rows = 128u>
 __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -2083,6 +2084,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         uint32_t skip_zero_weight,
         uint32_t write_aux,
         float clamp) {
+    static_assert(Rows == 32u || Rows == 64u || Rows == 128u,
+                  "decode row geometry must use complete groups of 32 rows");
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t pair = blockIdx.y;
@@ -2091,8 +2094,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     const float route_weight = weights[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0 || (skip_zero_weight && route_weight == 0.0f)) {
-        for (uint32_t rr = 0; rr < 4u; rr++) {
-            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        for (uint32_t rr = 0; rr < Rows / 32u; rr++) {
+            const uint32_t row = blockIdx.x * Rows + row_lane + rr * 32u;
             if (row >= expert_mid_dim || lane != 0u) continue;
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             if (write_aux) {
@@ -2105,8 +2108,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     }
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < Rows / 32u; rr++) {
+        uint32_t row = blockIdx.x * Rows + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
