@@ -89,9 +89,9 @@ int main() {
     std::vector<cuda_block_q8_K> x(256);
     for (unsigned t = 0; t < x.size(); ++t) {
         auto &v = x[t];
-        v.d = t==0 ? 0.0f : (t%2 ? -1.0f : 1.0f)*(0.001f+float(t)*0.00017f);
+        v.d = t==4 ? 0.0f : (t%2 ? -1.0f : 1.0f)*(0.001f+float(t)*0.00017f);
         for (unsigned k = 0; k < 256; ++k)
-            v.qs[k] = t==0 ? 0 : t==1 ? -128 : t==2 ? 127 :
+            v.qs[k] = t==4 ? 0 : t==1 ? -128 : t==2 ? 127 :
                 t==3 ? (k%2 ? -128 : 127) : int8_t(int(next()%256)-128);
         for (unsigned g = 0; g < 16; ++g) {
             int sum = 0;
@@ -107,9 +107,9 @@ int main() {
     HIP(hipMemcpy(dw,w.data(),w.size()*sizeof(w[0]),hipMemcpyHostToDevice));
     HIP(hipMemcpy(dx,x.data(),x.size()*sizeof(x[0]),hipMemcpyHostToDevice));
     HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n-1,16,true,true)==hipErrorInvalidValue ? hipSuccess : hipErrorUnknown);
-    for (unsigned m : {1u, 7u, 16u, 17u, 256u}) {
+    for (unsigned candidate : {1u,2u}) for (unsigned m : {1u, 7u, 16u, 17u, 256u}) {
         HIP(glm5_q4k_integer_blocks(dw,dx,dref,n,m,false,true));
-        HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,true,true));
+        HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,candidate,true));
         std::vector<Q4KBlockResult> ref(n*m),got(n*m);
         HIP(hipMemcpy(ref.data(),dref,ref.size()*sizeof(ref[0]),hipMemcpyDeviceToHost));
         HIP(hipMemcpy(got.data(),dgot,got.size()*sizeof(got[0]),hipMemcpyDeviceToHost));
@@ -123,18 +123,19 @@ int main() {
                 return 1;
             }
         }
-        std::printf("PASS original_blocks=%u adversarial_blocks=%u M=%u outputs=%u integer_oracle=exact float_dp4a=bitwise\n",real,n-real,m,n*m);
+        std::printf("PASS mode=%u original_blocks=%u adversarial_blocks=%u M=%u outputs=%u integer_oracle=exact float_dp4a=bitwise\n",candidate,real,n-real,m,n*m);
         if (m!=1 && m!=16 && m!=256) continue;
         hipEvent_t begin,end;
         HIP(hipEventCreate(&begin)); HIP(hipEventCreate(&end));
         for (unsigned repeat=0; repeat<3; ++repeat) for (unsigned arm=0; arm<2; ++arm) {
             const bool matrix = bool(arm ^ (repeat%2));
-            for (unsigned j=0; j<5; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,matrix,false));
+            const unsigned mode = matrix ? candidate : 0;
+            for (unsigned j=0; j<5; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
             HIP(hipEventRecord(begin));
-            for (unsigned j=0; j<100; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,matrix,false));
+            for (unsigned j=0; j<100; ++j) HIP(glm5_q4k_integer_blocks(dw,dx,dgot,n,m,mode,false));
             HIP(hipEventRecord(end)); HIP(hipEventSynchronize(end));
             float ms; HIP(hipEventElapsedTime(&ms,begin,end));
-            std::printf("diagnostic repeat=%u M=%u path=%s kernel_us=%.3f\n",repeat,m,matrix?"mma":"dp4a",ms*10);
+            std::printf("diagnostic repeat=%u M=%u mode=%u kernel_us=%.3f\n",repeat,m,mode,ms*10);
         }
         HIP(hipEventDestroy(begin)); HIP(hipEventDestroy(end));
     }
