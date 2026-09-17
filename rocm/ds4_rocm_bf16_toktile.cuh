@@ -273,12 +273,15 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
 // Smaller workgroup geometry. Each wave owns three independent
 // 16x16 output tiles. Retain the incumbent K16 high/residual update sequence,
 // including at M96 panel tails. Caller admits whole M16/N32/K32 multiples.
-template <bool Prepared = false, uint32_t LdsPad = 0u, bool VectorLoads = false>
+template <bool Prepared = false, uint32_t LdsPad = 0u, bool VectorLoads = false,
+          bool MultiPointer = false>
 __global__ __launch_bounds__(128, 1)
 static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t tokens,
-        const uint32_t *prepared = nullptr) {
+        const uint32_t *prepared = nullptr,
+        float *out_k = nullptr, float *out_v = nullptr,
+        const uint16_t *weight_k = nullptr, const uint16_t *weight_v = nullptr) {
     constexpr uint32_t BM = 16u, BN = 16u, BK = 16u;
     constexpr uint32_t MTile = 96u, NTile = 32u, KStage = 32u;
     constexpr uint32_t Ld = KStage+LdsPad;
@@ -288,7 +291,16 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
     __shared__ __align__(16) uint16_t b_tile[NTile*Ld];
     const uint32_t tid = threadIdx.x, wave = tid >> 5u;
     const uint32_t wave_m = (wave & 1u)*3u, wave_n = wave >> 1u;
-    const uint32_t mbase = blockIdx.y*MTile, nbase = blockIdx.x*NTile;
+    uint32_t nblock = blockIdx.x;
+    if constexpr (MultiPointer) {
+        const uint32_t blocks_per_projection = out_dim/NTile;
+        const uint32_t projection = nblock/blocks_per_projection;
+        if (projection >= 3u) return;
+        nblock %= blocks_per_projection;
+        if (projection == 1u) { out = out_k; weight = weight_k; }
+        if (projection == 2u) { out = out_v; weight = weight_v; }
+    }
+    const uint32_t mbase = blockIdx.y*MTile, nbase = nblock*NTile;
     if (mbase >= tokens) return;
     using Bf16 = rocwmma::bfloat16_t;
     using FragA = rocwmma::fragment<rocwmma::matrix_a,BM,BN,BK,Bf16,rocwmma::row_major>;
@@ -937,7 +949,7 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
  * Each exact workgroup handles two output rows and reuses each weight over
  * eight tokens. Its reduction storage aliases the existing WMMA panels.
  * All physical GGUF weights remain independent, unchanged pointers. */
-template <bool CoalescedWeights = false>
+template <bool CoalescedWeights = false, bool SkinnyOnly = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -957,7 +969,9 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
     const uint32_t q_blocks = (q_rows + 31u) / 32u;
     const uint32_t low_blocks = (low_rows + 1u) / 2u;
     const uint32_t beta_blocks = (beta_rows + 1u) / 2u;
-    const uint32_t bx = blockIdx.x;
+    // The standalone split-scheduling probe launches only the small gates
+    // here, retaining their original token/reduction order and pointers.
+    const uint32_t bx = blockIdx.x + (SkinnyOnly ? 3u*q_blocks : 0u);
     uint32_t projection = 0u;
     uint32_t nblock = 0u;
     uint32_t out_dim = 0u;
