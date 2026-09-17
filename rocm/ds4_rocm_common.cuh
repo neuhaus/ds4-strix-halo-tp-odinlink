@@ -367,7 +367,9 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_split_decode_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
-    static_assert(ROWS_PER_PROJECTION == 4u || ROWS_PER_PROJECTION == 8u,
+    static_assert(ROWS_PER_PROJECTION == 2u ||
+                  ROWS_PER_PROJECTION == 4u ||
+                  ROWS_PER_PROJECTION == 8u,
                   "unsupported split QKV decode row geometry");
     const uint32_t projection = blockIdx.y;
     if (projection >= 3u) return;
