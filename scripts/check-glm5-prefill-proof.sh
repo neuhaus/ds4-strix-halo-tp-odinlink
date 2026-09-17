@@ -67,6 +67,10 @@ while (( remaining > 0 )); do
   if (( processed < 2048 && chunk > 2048 - processed )); then
     chunk=$((2048 - processed))
   fi
+  # Match ds4_glm5_next_prefill_chunk: keep complete M256 projection groups
+  # ahead of a smaller tail. Still require one exact schedule on both ranks;
+  # accepting the older unaligned tail would hide changed arithmetic.
+  if (( chunk > 256 )); then chunk=$((chunk - chunk % 256)); fi
   if (( BATCH < 2 || chunk < 2 )); then
     chunk=1
     scalar_rows=$((scalar_rows + 1))

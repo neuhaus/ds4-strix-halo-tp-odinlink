@@ -23,10 +23,33 @@ write_pair 512 600 2 600 0 88 512
 write_pair 1024 4096 2 2048 2048 1024 1024
 "$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 1024 4096 >/dev/null
 
-# The negotiated sparse bridge keeps later rows batched. A non-divisor batch
-# must still split once at exactly 2048 rather than straddling the boundary.
-write_pair 300 4096 14 4096 0 248 300
+# Large tiles preserve complete M256 projection groups, including requested
+# sizes that are not multiples of 256. The sparse boundary remains exact.
+write_pair 300 4096 16 4096 0 256 256
 "$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 300 4096 1 >/dev/null
+
+write_pair 1024 8497 10 8497 0 49 1024
+"$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 1024 8497 1 >/dev/null
+
+write_pair 1024 1537 2 1536 1 512 1024
+"$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 1024 1537 >/dev/null
+
+write_pair 1024 2305 3 2304 1 256 1024
+"$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 1024 2305 1 >/dev/null
+
+write_pair 1024 8497 9 8497 0 305 1024
+if "$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 1024 8497 1 \
+    >/dev/null 2>&1; then
+  echo "FAIL: unaligned legacy tail was accepted" >&2
+  exit 1
+fi
+
+write_pair 300 4096 14 4096 0 248 300
+if "$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 300 4096 1 \
+    >/dev/null 2>&1; then
+  echo "FAIL: unaligned legacy non-divisor tiles were accepted" >&2
+  exit 1
+fi
 
 write_pair 256 4096 16 4096 0 256 256
 "$CHECK" "$TMP/coordinator.log" "$TMP/worker.log" 256 4096 1 >/dev/null
