@@ -847,8 +847,6 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel(
     const uint32_t lane = tid & 255u;
     const uint32_t low_row = nblock * 2u + (tid >> 8u);
     const uint32_t beta_row = low_row;
-    const uint32_t first_lane = lane & ~15u;
-    const uint32_t kk = lane - first_lane;
     for (uint32_t p = 0u; p < 3u; ++p) {
         const uint32_t rows = p == 2u ? beta_rows : low_rows;
         const uint32_t row = p == 2u ? beta_row : low_row;
