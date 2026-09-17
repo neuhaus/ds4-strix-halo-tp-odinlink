@@ -154,7 +154,10 @@ int main(int argc, char **argv) {
     // a difference through activation quantization.
     std::vector<float> mid_reference(decode_rows ? used*mid_width : 0u);
     std::vector<float> mid_actual(mid_reference.size());
-    std::vector<float> stage_reference[3], stage_actual;
+    // gate aliases packed Q8_K mid storage by the end of the call. Its
+    // bytes are no longer FP32 gate values; up and pre-quantization mid
+    // remain inspectable. Poison gate too to expose omitted gate writes.
+    std::vector<float> stage_reference[2], stage_actual;
     if (cold_coalesce) {
         for (auto &v : stage_reference) v.resize(rows*used*mid_width);
         stage_actual.resize(rows*used*mid_width);
@@ -186,7 +189,7 @@ int main(int argc, char **argv) {
                 v[0],v[1],v[2],v[3],v[4],gguf.map,gguf.size,go,uo,
                 down_offset,experts,gate_row,down_row,rank*mid_width,
                 mid_width,rank*down_row/2,down_row/2,v[5],v[6],used,
-                10.0f,v[7],3,count,&half_mid);
+                cold_coalesce && fixture == 2u ? 0.0f : 10.0f,v[7],3,count,&half_mid);
             return ok && !half_mid;
         };
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_padding ? "1" : "0", 1) == 0);
@@ -209,9 +212,10 @@ int main(int argc, char **argv) {
         }
         REQUIRE(ds4_gpu_tensor_read(t[0],0,reference.data(),rows*strides[0]));
         if (cold_coalesce) {
-            for (unsigned stage=0; stage<3u; ++stage) {
-                REQUIRE(ds4_gpu_tensor_read(t[stage+1],0,stage_reference[stage].data(),rows*strides[stage+1]));
-                REQUIRE(ds4_gpu_tensor_fill_f32(t[stage+1],NAN,rows*used*mid_width));
+            REQUIRE(ds4_gpu_tensor_fill_f32(t[1],NAN,rows*used*mid_width));
+            for (unsigned stage=0; stage<2u; ++stage) {
+                REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_reference[stage].data(),rows*strides[stage+2]));
+                REQUIRE(ds4_gpu_tensor_fill_f32(t[stage+2],NAN,rows*used*mid_width));
             }
         }
         if (decode_rows) {
@@ -239,8 +243,8 @@ int main(int argc, char **argv) {
         std::fflush(stdout);
         REQUIRE(different == 0);
         if (cold_coalesce) {
-            for (unsigned stage=0; stage<3u; ++stage) {
-                REQUIRE(ds4_gpu_tensor_read(t[stage+1],0,stage_actual.data(),rows*strides[stage+1]));
+            for (unsigned stage=0; stage<2u; ++stage) {
+                REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_actual.data(),rows*strides[stage+2]));
                 size_t live_values=0;
                 for (size_t i=0; i<stage_actual.size(); ++i) {
                     const size_t pair = i/mid_width;
