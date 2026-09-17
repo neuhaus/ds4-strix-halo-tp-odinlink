@@ -273,7 +273,7 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
 // Test-only smaller workgroup geometry. Each wave owns three independent
 // 16x16 output tiles. Retain the incumbent K16 high/residual update sequence,
 // including at M96 panel tails. Caller admits whole M16/N32/K32 multiples.
-template <bool Prepared = false, uint32_t LdsPad = 0u>
+template <bool Prepared = false, uint32_t LdsPad = 0u, bool VectorLoads = false>
 __global__ __launch_bounds__(128, 1)
 static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
         float *out, const uint16_t *weight, const float *x,
@@ -284,8 +284,8 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
     constexpr uint32_t Ld = KStage+LdsPad;
     static_assert(LdsPad == 0u || LdsPad == 16u,"measured LDS layouts only");
     constexpr uint32_t NThreads = 128u;
-    __shared__ uint16_t a_hi[MTile*Ld], a_lo[MTile*Ld];
-    __shared__ uint16_t b_tile[NTile*Ld];
+    __shared__ __align__(16) uint16_t a_hi[MTile*Ld], a_lo[MTile*Ld];
+    __shared__ __align__(16) uint16_t b_tile[NTile*Ld];
     const uint32_t tid = threadIdx.x, wave = tid >> 5u;
     const uint32_t wave_m = (wave & 1u)*3u, wave_n = wave >> 1u;
     const uint32_t mbase = blockIdx.y*MTile, nbase = blockIdx.x*NTile;
@@ -298,7 +298,18 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
 #pragma unroll
     for (uint32_t t=0; t<3; ++t) rocwmma::fill_fragment(acc[t],0.0f);
     for (uint32_t k0=0; k0<in_dim; k0+=KStage) {
-        for (uint32_t j=tid; j<MTile*KStage; j+=NThreads) {
+        if constexpr (Prepared && VectorLoads) {
+            for (uint32_t j=tid*4u; j<MTile*KStage; j+=NThreads*4u) {
+                const uint32_t m=mbase+j/KStage, k=k0+j%KStage;
+                const uint32_t dest=(j/KStage)*Ld+j%KStage;
+                const uint4 v = m < tokens ?
+                    *reinterpret_cast<const uint4 *>(prepared+uint64_t(m)*in_dim+k) : make_uint4(0,0,0,0);
+                *reinterpret_cast<uint2 *>(a_hi+dest) = make_uint2(
+                    (v.x&0xffffu)|(v.y<<16u),(v.z&0xffffu)|(v.w<<16u));
+                *reinterpret_cast<uint2 *>(a_lo+dest) = make_uint2(
+                    (v.x>>16u)|(v.y&0xffff0000u),(v.z>>16u)|(v.w&0xffff0000u));
+            }
+        } else for (uint32_t j=tid; j<MTile*KStage; j+=NThreads) {
             const uint32_t m = mbase+j/KStage, k = k0+j%KStage;
             const uint32_t dest=(j/KStage)*Ld+j%KStage;
             if constexpr (Prepared) {
@@ -312,7 +323,13 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
                 a_lo[dest] = ds4_bf16_rne_bits(value-__uint_as_float(uint32_t(high)<<16u));
             }
         }
-        for (uint32_t j=tid; j<NTile*KStage; j+=NThreads) {
+        if constexpr (VectorLoads) {
+            for (uint32_t j=tid*8u; j<NTile*KStage; j+=NThreads*8u) {
+                const uint32_t n=nbase+j/KStage, k=k0+j%KStage;
+                *reinterpret_cast<uint4 *>(b_tile+(j/KStage)*Ld+j%KStage) = n < out_dim ?
+                    *reinterpret_cast<const uint4 *>(weight+uint64_t(n)*in_dim+k) : make_uint4(0,0,0,0);
+            }
+        } else for (uint32_t j=tid; j<NTile*KStage; j+=NThreads) {
             const uint32_t n=nbase+j/KStage, k=k0+j%KStage;
             b_tile[(j/KStage)*Ld+j%KStage] = n < out_dim ? weight[uint64_t(n)*in_dim+k] : 0u;
         }

@@ -16,7 +16,7 @@ extern "C" hipError_t glm5_exact_geometry(float *out, const uint16_t *w,
         ds4_bf16_hilo_prepare_kernel<<<(count+255u)/256u,256>>>(panel,x,count);
         const auto status=hipGetLastError();
         if (status != hipSuccess) return status;
-        matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,16u><<<dim3(n/32u,(m+95u)/96u),128>>>(out,w,x,k,n,m,panel);
+        matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true><<<dim3(n/32u,(m+95u)/96u),128>>>(out,w,x,k,n,m,panel);
     }
     return hipGetLastError();
 }
