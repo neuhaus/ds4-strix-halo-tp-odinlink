@@ -129,16 +129,30 @@ static void matmul_bf16_f32_wmma_hilo_m256_kernel(
                 sh_a_lo[j] = 0u;
             }
         }
-        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
-            const uint32_t nt = j / (BK * BN);
-            const uint32_t rem = j % (BK * BN);
-            const uint32_t kk = CoalescedWeights ? rem % BK : rem / BN;
-            const uint32_t nn = CoalescedWeights ? rem / BK : rem % BN;
-            const uint32_t n = nbase + nt * BN + nn;
-            // Lane ownership changes; the WMMA tile bytes and order do not.
-            sh_b[nt * BK * BN + kk * BN + nn] = n < out_dim
-                ? weight[(uint64_t)n * in_dim + k0 + kk]
-                : 0u;
+        if constexpr (CoalescedWeights) {
+            // Two adjacent BF16 words per aligned load; identical LDS tile.
+            for (uint32_t j = tid; j < NTilesN * BK * BN / 2u; j += NThreads) {
+                const uint32_t nt = j / (BK * BN / 2u);
+                const uint32_t rem = j % (BK * BN / 2u);
+                const uint32_t kk = (rem % (BK / 2u)) * 2u;
+                const uint32_t nn = rem / (BK / 2u);
+                const uint32_t n = nbase + nt * BN + nn;
+                const uint32_t bits = n < out_dim ?
+                    *reinterpret_cast<const uint32_t *>(
+                        weight + (uint64_t)n * in_dim + k0 + kk) : 0u;
+                sh_b[nt * BK * BN + kk * BN + nn] = (uint16_t)bits;
+                sh_b[nt * BK * BN + (kk + 1u) * BN + nn] = (uint16_t)(bits >> 16u);
+            }
+        } else {
+            for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+                const uint32_t nt = j / (BK * BN);
+                const uint32_t rem = j % (BK * BN);
+                const uint32_t kk = rem / BN;
+                const uint32_t nn = rem % BN;
+                const uint32_t n = nbase + nt * BN + nn;
+                sh_b[j] = n < out_dim ?
+                    weight[(uint64_t)n * in_dim + k0 + kk] : 0u;
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -887,15 +901,30 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
                 sh_a_lo[j] = 0u;
             }
         }
-        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
-            const uint32_t nt = j / (BK * BN);
-            const uint32_t rem = j % (BK * BN);
-            const uint32_t kk = CoalescedWeights ? rem % BK : rem / BN;
-            const uint32_t nn = CoalescedWeights ? rem / BK : rem % BN;
-            const uint32_t n = nbase + nt * BN + nn;
-            sh_b[nt * BK * BN + kk * BN + nn] = n < out_dim
-                ? weight[(uint64_t)n * in_dim + k0 + kk]
-                : 0u;
+        if constexpr (CoalescedWeights) {
+            // Two adjacent BF16 words per aligned load; identical LDS tile.
+            for (uint32_t j = tid; j < NTilesN * BK * BN / 2u; j += NThreads) {
+                const uint32_t nt = j / (BK * BN / 2u);
+                const uint32_t rem = j % (BK * BN / 2u);
+                const uint32_t kk = (rem % (BK / 2u)) * 2u;
+                const uint32_t nn = rem / (BK / 2u);
+                const uint32_t n = nbase + nt * BN + nn;
+                const uint32_t bits = n < out_dim ?
+                    *reinterpret_cast<const uint32_t *>(
+                        weight + (uint64_t)n * in_dim + k0 + kk) : 0u;
+                sh_b[nt * BK * BN + kk * BN + nn] = (uint16_t)bits;
+                sh_b[nt * BK * BN + (kk + 1u) * BN + nn] = (uint16_t)(bits >> 16u);
+            }
+        } else {
+            for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+                const uint32_t nt = j / (BK * BN);
+                const uint32_t rem = j % (BK * BN);
+                const uint32_t kk = rem / BN;
+                const uint32_t nn = rem % BN;
+                const uint32_t n = nbase + nt * BN + nn;
+                sh_b[j] = n < out_dim ?
+                    weight[(uint64_t)n * in_dim + k0 + kk] : 0u;
+            }
         }
         __syncthreads();
 #pragma unroll

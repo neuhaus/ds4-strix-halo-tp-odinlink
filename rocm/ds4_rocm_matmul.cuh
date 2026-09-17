@@ -1748,6 +1748,7 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
+    if (coalesced && ((uintptr_t)wptr & 3u) != 0u) return 0;
     const int result = native
         ? matmul_bf16_f32_wmma_native_m256_launch(
               (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
@@ -2178,6 +2179,8 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             "glm5_bf16_kda_six_multiptr");
         if (!weights[i] ||
             ((uint64_t)(uintptr_t)weights[i] & (sizeof(uint16_t) - 1u)) != 0u)
+            return 0;
+        if (coalesced && i < 3u && ((uintptr_t)weights[i] & 3u) != 0u)
             return 0;
         for (uint32_t j = 0u; j < i; ++j)
             if (cuda_u64_ranges_overlap(
