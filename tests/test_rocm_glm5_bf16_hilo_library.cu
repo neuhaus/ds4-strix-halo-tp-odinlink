@@ -39,7 +39,7 @@ int main() {
         else REQUIRE(gguf.tensor(name,{4096,8192},30,offset));
         if (layout == 1) offset += uint64_t(4096)*4096u*2u;
         const auto *host_w = reinterpret_cast<const uint16_t *>(
-            static_cast<const char *>(gguf.map)+offset);
+            gguf.map+offset);
         uint16_t *w;
         const size_t weight_bytes = size_t(k)*n*2u;
         REQUIRE(hipMalloc(&w,weight_bytes) == hipSuccess);
