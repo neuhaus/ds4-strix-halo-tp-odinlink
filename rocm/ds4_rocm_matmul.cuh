@@ -1785,6 +1785,10 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         cuda_u64_ranges_overlap(
             (uint64_t)(uintptr_t)out->ptr, out_elems * sizeof(float),
             (uint64_t)(uintptr_t)x->ptr, x_elems * sizeof(float))) return 0;
+    // A copied range may be aligned even when its original GGUF offset is
+    // not. Reject before lookup/copy as well as checking the device pointer.
+    if (lt && out_dim == 4096u && (n_tok == 256u || n_tok == 1024u) &&
+        (weight_offset & 15u)) return 0;
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
