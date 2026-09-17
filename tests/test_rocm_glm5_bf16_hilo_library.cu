@@ -2,6 +2,7 @@
 #include "glm5_gguf_test.hpp"
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,14 +22,19 @@ static float bf16_value(uint16_t v) {
     return value;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    REQUIRE(argc == 1 || (argc == 2 && std::strcmp(argv[1],"--lt") == 0));
+    const bool use_lt = argc == 2;
     const char *model = std::getenv("DS4_GLM5_MODEL");
     REQUIRE(model);
     Glm5TestGGUF gguf;
     REQUIRE(gguf.open_file(model));
     hipblasHandle_t handle;
     REQUIRE(hipblasCreate(&handle) == HIPBLAS_STATUS_SUCCESS);
-    std::puts("diagnostic=library-hilo lane=B weights=original single_weight_buffer=1");
+    hipblasLtHandle_t lt_handle = nullptr;
+    if (use_lt) REQUIRE(hipblasLtCreate(&lt_handle) == HIPBLAS_STATUS_SUCCESS);
+    std::printf("diagnostic=library-hilo lane=B weights=original single_weight_buffer=1 backend=%s\n",
+                use_lt ? "hipblasLt" : "hipblas");
     for (unsigned layer : {0u,44u}) for (unsigned layout=0; layout<3; ++layout) {
         const unsigned k = layout == 2 ? 8192u : 4096u, n = 4096u;
         char name[80];
@@ -56,6 +62,39 @@ int main() {
             REQUIRE(hipMalloc(&hi,x.size()*2u) == hipSuccess);
             REQUIRE(hipMalloc(&lo,x.size()*2u) == hipSuccess);
             REQUIRE(hipMemcpy(dx,x.data(),x.size()*4u,hipMemcpyHostToDevice) == hipSuccess);
+            hipblasLtMatmulDesc_t desc = nullptr;
+            hipblasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+            hipblasLtMatmulHeuristicResult_t algorithm = {};
+            void *workspace = nullptr;
+            if (use_lt) {
+                REQUIRE(hipblasLtMatmulDescCreate(&desc,HIPBLAS_COMPUTE_32F,HIP_R_32F) == HIPBLAS_STATUS_SUCCESS);
+                const hipblasOperation_t trans_a=HIPBLAS_OP_T, trans_b=HIPBLAS_OP_N;
+                REQUIRE(hipblasLtMatmulDescSetAttribute(desc,HIPBLASLT_MATMUL_DESC_TRANSA,&trans_a,sizeof(trans_a)) == HIPBLAS_STATUS_SUCCESS);
+                REQUIRE(hipblasLtMatmulDescSetAttribute(desc,HIPBLASLT_MATMUL_DESC_TRANSB,&trans_b,sizeof(trans_b)) == HIPBLAS_STATUS_SUCCESS);
+                REQUIRE(hipblasLtMatrixLayoutCreate(&ad,HIP_R_16BF,k,n,k) == HIPBLAS_STATUS_SUCCESS);
+                REQUIRE(hipblasLtMatrixLayoutCreate(&bd,HIP_R_16BF,k,m,k) == HIPBLAS_STATUS_SUCCESS);
+                REQUIRE(hipblasLtMatrixLayoutCreate(&cd,HIP_R_32F,n,m,n) == HIPBLAS_STATUS_SUCCESS);
+                hipblasLtMatmulPreference_t pref;
+                REQUIRE(hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS);
+                const size_t max_workspace = 16u*1024u*1024u;
+                REQUIRE(hipblasLtMatmulPreferenceSetAttribute(pref,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&max_workspace,sizeof(max_workspace)) == HIPBLAS_STATUS_SUCCESS);
+                hipblasLtMatmulHeuristicResult_t heuristics[8];
+                int returned=0, chosen=-1;
+                const auto status = hipblasLtMatmulAlgoGetHeuristic(lt_handle,desc,ad,bd,cd,cd,pref,8,heuristics,&returned);
+                REQUIRE(hipblasLtMatmulPreferenceDestroy(pref) == HIPBLAS_STATUS_SUCCESS);
+                if (status == HIPBLAS_STATUS_SUCCESS)
+                    for (int i=0; i<returned; ++i)
+                        if (heuristics[i].state == HIPBLAS_STATUS_SUCCESS &&
+                            heuristics[i].workspaceSize <= max_workspace) { chosen=i; break; }
+                std::printf("lt_plan layer=%u layout=%u M=%u K=%u N=%u status=%d returned=%d chosen=%d\n",
+                            layer,layout,m,k,n,int(status),returned,chosen);
+                std::fflush(stdout);
+                REQUIRE(chosen >= 0);
+                algorithm=heuristics[chosen];
+                if (algorithm.workspaceSize)
+                    REQUIRE(hipMalloc(&workspace,algorithm.workspaceSize) == hipSuccess);
+                std::printf("lt_workspace_bytes=%zu\n",algorithm.workspaceSize);
+            }
             auto launch = [&](unsigned mode) {
                 if (!mode) {
                     REQUIRE(glm5_test_hilo_reference(out,w,dx,k,n,m) == hipSuccess);
@@ -64,7 +103,10 @@ int main() {
                 REQUIRE(glm5_test_hilo_prepare(hi,lo,dx,x.size()) == hipSuccess);
                 const float alpha=1, zero=0, one=1;
                 auto gemm = [&](const uint16_t *input, const float *beta) {
-                    const auto status = hipblasGemmEx(handle,HIPBLAS_OP_T,HIPBLAS_OP_N,
+                    const auto status = use_lt ? hipblasLtMatmul(lt_handle,desc,&alpha,
+                        w,ad,input,bd,beta,out,cd,out,cd,&algorithm.algo,
+                        workspace,algorithm.workspaceSize,nullptr) :
+                        hipblasGemmEx(handle,HIPBLAS_OP_T,HIPBLAS_OP_N,
                         n,m,k,&alpha,w,HIP_R_16BF,k,input,HIP_R_16BF,k,
                         beta,out,HIP_R_32F,n,HIPBLAS_COMPUTE_32F,HIPBLAS_GEMM_DEFAULT);
                     if (status != HIPBLAS_STATUS_SUCCESS)
@@ -131,6 +173,11 @@ int main() {
             }
             REQUIRE(hipEventDestroy(begin) == hipSuccess);
             REQUIRE(hipEventDestroy(end) == hipSuccess);
+            if (workspace) REQUIRE(hipFree(workspace) == hipSuccess);
+            if (cd) REQUIRE(hipblasLtMatrixLayoutDestroy(cd) == HIPBLAS_STATUS_SUCCESS);
+            if (bd) REQUIRE(hipblasLtMatrixLayoutDestroy(bd) == HIPBLAS_STATUS_SUCCESS);
+            if (ad) REQUIRE(hipblasLtMatrixLayoutDestroy(ad) == HIPBLAS_STATUS_SUCCESS);
+            if (desc) REQUIRE(hipblasLtMatmulDescDestroy(desc) == HIPBLAS_STATUS_SUCCESS);
             REQUIRE(hipFree(lo) == hipSuccess);
             REQUIRE(hipFree(hi) == hipSuccess);
             REQUIRE(hipFree(out) == hipSuccess);
@@ -140,5 +187,6 @@ int main() {
         REQUIRE(hipFree(w) == hipSuccess);
     }
     REQUIRE(hipblasDestroy(handle) == HIPBLAS_STATUS_SUCCESS);
+    if (lt_handle) REQUIRE(hipblasLtDestroy(lt_handle) == HIPBLAS_STATUS_SUCCESS);
     std::puts("COMPLETE library diagnostic; numerical equivalence and model quality not established");
 }
