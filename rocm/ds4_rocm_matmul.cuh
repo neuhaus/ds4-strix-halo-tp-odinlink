@@ -2139,28 +2139,41 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
     }
     const char *rows_selector = getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_ROWS");
     const bool rows4 = rows_selector && strcmp(rows_selector, "4") == 0;
-    if (rows4 && (out_dim & 3u) == 0u) {
-        matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<64u, 4u><<<
-            (unsigned)((out_dim + 3u) / 4u), 12u * 32u,
-            (size_t)in_dim * sizeof(float)>>>(
-            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
-            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
-            (const uint16_t *)weights[2], (const float *)x->ptr,
-            (uint32_t)in_dim, (uint32_t)out_dim);
-    } else {
-        matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<64u, 8u><<<
-            (unsigned)((out_dim + 7u) / 8u), 24u * 32u,
-            (size_t)in_dim * sizeof(float)>>>(
-            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
-            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
-            (const uint16_t *)weights[2], (const float *)x->ptr,
-            (uint32_t)in_dim, (uint32_t)out_dim);
+    const char *prefetch_selector =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_PREFETCH");
+    const uint32_t prefetch =
+        prefetch_selector == NULL || strcmp(prefetch_selector, "64") == 0 ? 64u :
+        strcmp(prefetch_selector, "32") == 0 ? 32u :
+        strcmp(prefetch_selector, "16") == 0 ? 16u : 0u;
+    if (prefetch == 0u) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "invalid GLM5 BF16 QKV decode prefetch selector\n");
+        return 0;
     }
+#define DS4_LAUNCH_QKV_MULTIPTR(P, R)                                      \
+    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<P, R><<<             \
+        (unsigned)((out_dim + (R) - 1u) / (R)), (3u * (R)) * 32u,           \
+        (size_t)in_dim * sizeof(float)>>>(                                  \
+        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,     \
+        (const uint16_t *)weights[0], (const uint16_t *)weights[1],         \
+        (const uint16_t *)weights[2], (const float *)x->ptr,               \
+        (uint32_t)in_dim, (uint32_t)out_dim)
+    if (rows4 && (out_dim & 3u) == 0u) {
+        if (prefetch == 16u) DS4_LAUNCH_QKV_MULTIPTR(16u, 4u);
+        else if (prefetch == 32u) DS4_LAUNCH_QKV_MULTIPTR(32u, 4u);
+        else DS4_LAUNCH_QKV_MULTIPTR(64u, 4u);
+    } else {
+        if (prefetch == 16u) DS4_LAUNCH_QKV_MULTIPTR(16u, 8u);
+        else if (prefetch == 32u) DS4_LAUNCH_QKV_MULTIPTR(32u, 8u);
+        else DS4_LAUNCH_QKV_MULTIPTR(64u, 8u);
+    }
+#undef DS4_LAUNCH_QKV_MULTIPTR
     static int reported = 0;
     if (!reported) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu rows=%u\n",
-                (unsigned long long)out_dim, rows4 ? 4u : 8u);
+                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu rows=%u "
+                "prefetch=%u\n", (unsigned long long)out_dim,
+                rows4 ? 4u : 8u, prefetch);
         reported = 1;
     }
     return cuda_ok(cudaGetLastError(),
