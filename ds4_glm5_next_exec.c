@@ -1720,12 +1720,39 @@ static int validate_layer_finite(const ds4_glm5_next_exec_ctx *ctx,
     return finite;
 }
 
+/* Independent of routed IDs/weights. Queue the incumbent shared arithmetic
+ * before waiting on peer agreement; all outputs use separate shared scratch.
+ * The caller drains outstanding work on any later failure. */
+static int shared_ffn_before_route_check(
+        const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
+        ds4_glm5_next_workspace *w) {
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[layer].ffn_weight;
+    const uint32_t base = ctx->tp_rank * GLM5_RANK_MID;
+    const uint64_t row_bytes =
+        (GLM5_WIDTH / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    return ds4_gpu_matmul_q8_0_tensor(
+               w->shared_gate, ctx->model_map, ctx->model_size,
+               f->gate_shexp + (uint64_t)base * row_bytes,
+               GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+           ds4_gpu_matmul_q8_0_tensor(
+               w->shared_up, ctx->model_map, ctx->model_size,
+               f->up_shexp + (uint64_t)base * row_bytes,
+               GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+           ds4_gpu_swiglu_tensor(w->shared_mid, w->shared_gate, w->shared_up,
+                                GLM5_RANK_MID, 10.0f, 1.0f) &&
+           ds4_gpu_matmul_q8_0_kslice_tensor(
+               w->shared_out, ctx->model_map, ctx->model_size, f->down_shexp,
+               GLM5_ROUTED_MID, base, GLM5_RANK_MID,
+               GLM5_WIDTH, w->shared_mid, 0u);
+}
+
 static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
                         uint32_t token_ordinal,
                         const ds4_gpu_tensor *selected,
                         const ds4_gpu_tensor *weights,
                         const ds4_gpu_tensor *logits,
-                        const ds4_gpu_tensor *hidden) {
+                        const ds4_gpu_tensor *hidden,
+                        ds4_glm5_next_workspace *early_shared) {
     int32_t ids[GLM5_EXPERTS_USED];
     float route_weights[GLM5_EXPERTS_USED];
     if (!tp_context_valid(ctx)) {
@@ -1770,6 +1797,10 @@ static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     const uint64_t check_sequence = fnv64_continue(
         UINT64_C(1469598103934665603), sequence_fields,
         sizeof(sequence_fields));
+    if (early_shared && !shared_ffn_before_route_check(ctx, layer, early_shared)) {
+        ds4_tp_mark_failed(ctx->tp);
+        return 0;
+    }
     char error[256] = {0};
     const int rc = ds4_tp_hash_check(ctx->tp, check_sequence, hash,
                                      error, sizeof(error));
@@ -1780,6 +1811,25 @@ static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
         return 0;
     }
     return 1;
+}
+
+/* Return -1 for an invalid requested decode configuration, never silently
+ * substitute another schedule. The switch deliberately does not alter prefill. */
+static int shared_route_overlap_mode(const ds4_glm5_next_exec_ctx *ctx,
+                                      const ds4_glm5_next_workspace *w,
+                                      int q4_residency) {
+    const char *value = getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") != 0 || !ctx || !w) return -1;
+    if (!w->decode_phase) return 0;
+#ifdef DS4_ROCM_BUILD
+    const char *paired = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+    if (q4_residency == 1 && ctx->tp_rank < 2u && tp_context_valid(ctx) &&
+        (!paired || strcmp(paired, "0") == 0)) return 1;
+#else
+    (void)q4_residency;
+#endif
+    return -1;
 }
 
 static int route_batch_agrees(const ds4_glm5_next_exec_ctx *ctx,
@@ -3086,6 +3136,13 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
      * historical fence even when the diagnostic switch is enabled. */
     const int async_terminal = q4_residency == 1 &&
         glm5_decode_async_layer_enabled(w, 1u);
+    const int shared_route_overlap = shared_route_overlap_mode(ctx, w, q4_residency);
+    if (shared_route_overlap < 0) {
+        fprintf(stderr, "ds4: GLM5 shared route overlap unsupported configuration rank=%u\n",
+                ctx->tp_rank);
+        ds4_tp_mark_failed(ctx->tp);
+        return 0;
+    }
     int ok = ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
             ctx->model->rms_norm_eps);
@@ -3113,7 +3170,8 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at top-8 select rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
     ok = route_agrees(ctx, il, token_ordinal,
                       w->router_selected, w->router_weights,
-                      w->router_logits, w->ffn_hidden);
+                      w->router_logits, w->ffn_hidden,
+                      shared_route_overlap ? w : NULL);
     if (!ok) {
         route_failure_stats("after_attention", w->after_attention,
                             GLM5_HC_WIDTH);
@@ -3122,6 +3180,14 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         fprintf(stderr, "ds4: GLM5 routed layer %u failed at router prelude rank=%u\n",
                 il, ctx->tp_rank);
         goto routed_one_done;
+    }
+    if (shared_route_overlap) {
+        static int logged[2];
+        if (!logged[ctx->tp_rank]) {
+            fprintf(stderr, "ds4: GLM5 shared FFN queued before route agreement rank=%u weights=original cache_bytes=0\n",
+                    ctx->tp_rank);
+            logged[ctx->tp_rank] = 1;
+        }
     }
     if (q4_residency < 0) {
         fprintf(stderr,
@@ -3275,25 +3341,25 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank, mixed_q2 ? 1 : 0);
         goto routed_one_done;
     }
-    if (ok && !overlap_prefetched && shared_q8_pair_decode) ok =
+    if (ok && !shared_route_overlap && !overlap_prefetched && shared_q8_pair_decode) ok =
         ds4_gpu_matmul_q8_0_pair_tensor(
             w->shared_gate, w->shared_up, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID,
             w->ffn_hidden, 1u);
-    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok =
+    if (ok && !shared_route_overlap && !overlap_prefetched && !shared_q8_pair_decode) ok =
         ds4_gpu_matmul_q8_0_tensor(
             w->shared_gate, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared gate rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !shared_route_overlap && !overlap_prefetched && !shared_q8_pair_decode) ok = ds4_gpu_matmul_q8_0_tensor(
             w->shared_up, ctx->model_map, ctx->model_size,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared up rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
+    if (ok && !shared_route_overlap && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
             GLM5_RANK_MID, 10.0f, 1.0f);
     if (ok && !overlap_prefetched && shared_q8_pair_decode) {
@@ -3307,7 +3373,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         }
     }
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared SwiGLU rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_matmul_q8_0_kslice_tensor(
+    if (ok && !shared_route_overlap) ok = ds4_gpu_matmul_q8_0_kslice_tensor(
             w->shared_out, ctx->model_map, ctx->model_size, f->down_shexp,
             GLM5_ROUTED_MID, rank_mid_base, GLM5_RANK_MID,
             GLM5_WIDTH, w->shared_mid, 0u);

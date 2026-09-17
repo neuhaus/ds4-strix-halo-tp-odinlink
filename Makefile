@@ -715,6 +715,9 @@ tests/test_glm5_kda_binding: tests/test_glm5_kda_binding.c ds4_glm5_kda.c ds4_gl
 tests/test_glm5_next_runtime_offsets: tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm5_kda.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c $(LDLIBS)
 
+tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
+
 tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
 
