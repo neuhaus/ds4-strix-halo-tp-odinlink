@@ -2190,10 +2190,15 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         uint64_t weight_g_offset, uint64_t weight_beta_offset,
         uint64_t in_dim, uint64_t q_out_dim, uint64_t low_out_dim,
         uint64_t beta_out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    const char *selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Legacy alias retained for already-recorded diagnostic recipes. */
+    if (!decode_selector)
+        decode_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill_selector =
         getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
-    const int decode_enabled = selector && strcmp(selector, "1") == 0;
+    const int decode_enabled = decode_selector &&
+        strcmp(decode_selector, "1") == 0;
     const int prefill_enabled =
         prefill_selector && strcmp(prefill_selector, "1") == 0;
     const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96");

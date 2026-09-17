@@ -202,7 +202,13 @@ void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace) {
 }
 
 static int kda_six_workspace_requested(void) {
-    const char *decode = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Keep the old name as a source-compatible alias for existing diagnostic
+     * launchers.  New launchers use the explicit decode selector so enabling
+     * prefill fusion cannot implicitly alter decode workspace admission. */
+    if (!decode)
+        decode = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     return (decode && strcmp(decode, "1") == 0) ||
            (prefill && strcmp(prefill, "1") == 0);

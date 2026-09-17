@@ -399,8 +399,11 @@ static int rocm_glm5_kda_six_multiptr(
         const ds4_glm5_kda_device_args *args,
         uint32_t head_start, uint32_t n_heads,
         const ds4_gpu_tensor *input) {
-    const char *decode_selector =
-        getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Legacy alias keeps old, immutable diagnostic manifests replayable. */
+    if (!decode_selector)
+        decode_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill_selector =
         getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     const int prefill = args && args->n_tokens != 1u;

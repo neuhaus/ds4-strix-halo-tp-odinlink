@@ -337,6 +337,8 @@ GLM5_BF16_QKV_SHARED_A_PREFILL=0
 GLM5_BF16_QKV_SHARED_A_PREFILL_SEEN=0
 GLM5_BF16_KDA_SIX_MULTIPTR=0
 GLM5_BF16_KDA_SIX_MULTIPTR_SEEN=0
+GLM5_BF16_KDA_SIX_DECODE_MULTIPTR=0
+GLM5_BF16_KDA_SIX_DECODE_MULTIPTR_SEEN=0
 GLM5_BF16_KDA_SIX_PREFILL=0
 GLM5_BF16_KDA_SIX_PREFILL_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
@@ -403,6 +405,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       GLM5_BF16_KDA_SIX_MULTIPTR_SEEN=1
       [[ $GLM5_BF16_KDA_SIX_MULTIPTR == 0 || $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ]] || {
         echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR=*)
+      (( GLM5_BF16_KDA_SIX_DECODE_MULTIPTR_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_KDA_SIX_DECODE_MULTIPTR=${env_kv#*=}
+      GLM5_BF16_KDA_SIX_DECODE_MULTIPTR_SEEN=1
+      [[ $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 0 ||
+         $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -1191,6 +1206,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'glm5_bf16_qkv_decode_multiptr=%s\n' "$GLM5_BF16_QKV_DECODE_MULTIPTR"
   printf 'glm5_bf16_qkv_shared_a_prefill=%s\n' "$GLM5_BF16_QKV_SHARED_A_PREFILL"
   printf 'glm5_bf16_kda_six_multiptr=%s\n' "$GLM5_BF16_KDA_SIX_MULTIPTR"
+  printf 'glm5_bf16_kda_six_decode_multiptr=%s\n' "$GLM5_BF16_KDA_SIX_DECODE_MULTIPTR"
   printf 'glm5_bf16_kda_six_prefill=%s\n' "$GLM5_BF16_KDA_SIX_PREFILL"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
@@ -1488,10 +1504,12 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
 fi
 if [[ $GLM5_BF16_WMMA_HILO == 1 ||
       $GLM5_BF16_QKV_SHARED_A_PREFILL == 1 ||
+      $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 1 ||
       $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
       $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
   if [[ $MODEL_ARCH == glm5-next ]]; then
-    if [[ $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
+    if [[ $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 1 ||
+          $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
           $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
       # The six-pointer candidate owns Q/K/V plus f_a/g_a/beta.  Its
       # engagement is counted separately because it intentionally bypasses
