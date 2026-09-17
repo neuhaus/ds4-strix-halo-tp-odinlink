@@ -1035,6 +1035,53 @@ __global__ static void moe_count_sorted_pairs_kernel(
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
 
+/* GLM prefill preserves independent M256 occupancy domains. Absolute pair
+ * IDs still address the original activation/output buffers; only routing
+ * metadata has a group dimension. Physical weights remain shared. */
+__global__ static void moe_count_glm5_grouped_pairs_kernel(
+        uint32_t *counts, const int32_t *selected,
+        uint32_t pair_count, uint32_t n_expert) {
+    const uint32_t pair = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pair_count) return;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || expert >= 288) return;
+    const uint32_t group = pair / (256u * n_expert);
+    atomicAdd(counts + group * 288u + (uint32_t)expert, 1u);
+}
+
+__global__ static void moe_scatter_glm5_grouped_pairs_kernel(
+        uint32_t *pairs, const uint32_t *offsets,
+        const int32_t *selected, uint32_t n_expert) {
+    const uint32_t bucket = blockIdx.x;
+    const uint32_t expert = bucket % 288u;
+    const uint32_t first = (bucket / 288u) * 256u * n_expert;
+    uint32_t pos = offsets[bucket];
+    for (uint32_t pair = first; pair < first + 256u * n_expert; ++pair)
+        if (selected[pair] == (int32_t)expert) pairs[pos++] = pair;
+}
+
+__global__ static void moe_glm5_grouped_tile_offsets_kernel(
+        uint32_t *tile_offsets, uint32_t *tile_total,
+        const uint32_t *counts, uint32_t groups) {
+    uint32_t sum = 0u;
+    // Adjacent domains of one physical expert can reuse hardware caches.
+    for (uint32_t expert = 0u; expert < 288u; ++expert) {
+        for (uint32_t group = 0u; group < groups; ++group) {
+            const uint32_t bucket = group * 288u + expert;
+            tile_offsets[bucket] = sum;
+            sum += (counts[bucket] + 15u) / 16u;
+        }
+    }
+    tile_offsets[groups * 288u] = sum;
+    *tile_total = sum;
+}
+
+template <uint32_t PhysicalExperts>
+__device__ __forceinline__ static uint32_t moe_weight_expert(uint32_t bucket) {
+    if constexpr (PhysicalExperts != 0u) return bucket % PhysicalExperts;
+    else return bucket;
+}
+
 __global__ static void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
@@ -4699,7 +4746,7 @@ ds4_q4k_unpack_scales(const int32_t *scales, int32_t ksc) {
  * because production launches by scratch capacity rather than copying the
  * tile count back to the host.
  */
-template <int J>
+template <int J, uint32_t PhysicalExperts = 0u>
 __launch_bounds__(256)
 __global__ static void moe_q4K_routed_wmma_kernel(
         const char *weight_base,
@@ -4745,7 +4792,7 @@ __global__ static void moe_q4K_routed_wmma_kernel(
     float acc[J / 16][8] = {};
 
     const char *expert_weight_base =
-        weight_base + (uint64_t)expert * weight_expert_bytes;
+        weight_base + (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * weight_expert_bytes;
 
     for (uint32_t kb = 0; kb < xq_blocks; kb++) {
         /*
@@ -5462,7 +5509,7 @@ __global__ static void moe_gate_up_mid_iq2_i8_hotlist_wmma_kernel(
 
 /* Q4_K down projection over the same 16-pair routing descriptors as gate/up.
  * Activations are pair-major, unlike moe_q4K_routed_wmma_kernel above. */
-template <int J, bool ATOMIC_OUT>
+template <int J, bool ATOMIC_OUT, uint32_t PhysicalExperts = 0u>
 __launch_bounds__(256)
 __global__ static void moe_down_q4K_routed_wmma_kernel(
         float *out, const char *weight_base,
@@ -5485,7 +5532,8 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
     if (count < min_count) return;
     const uint32_t row0 = (uint32_t)blockIdx.x * I;
     float acc[J / 16][8] = {};
-    const char *expert_base = weight_base + (uint64_t)expert * weight_expert_bytes;
+    const char *expert_base = weight_base +
+        (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * weight_expert_bytes;
     for (uint32_t kb = 0; kb < xq_blocks; kb++) {
         if (wave < 8) {
             const int r = wave * 8 + lane / 4, tx = (lane % 4) * 8;
@@ -5578,6 +5626,7 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
 
 /* Cold-expert complement for the 16-wide stream; each tile is consumed as
  * two eight-pair DP4A halves. */
+template <uint32_t PhysicalExperts = 0u>
 __global__ static void moe_down_q4K_cold_tile16_kernel(
         float *out, const char *base, const cuda_block_q8_K *midq,
         const uint32_t *pairs, const uint32_t *offs, const uint32_t *counts,
@@ -5611,7 +5660,7 @@ __global__ static void moe_down_q4K_cold_tile16_kernel(
         for (uint32_t p = 0; p < np; p++) x[p] = sq[p];
         if (row < nrows) {
             const cuda_block_q4_K *wr = reinterpret_cast<const cuda_block_q4_K *>(
-                    base + (uint64_t)expert * expert_bytes + (uint64_t)row * row_bytes);
+                    base + (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * expert_bytes + (uint64_t)row * row_bytes);
             float acc[8] = {};
             for (uint32_t b = lane; b < xb; b += 8u)
                 dev_dot_q4_K_q8_K_block8(wr + b, x[0] ? x[0] + b : NULL,
@@ -5662,7 +5711,7 @@ __device__ static void dev_dot_q4_K_q8_K_cold_block5(
 /* Complementary half of the Stage-3 crossover.  The routing stream is built
  * in 16-pair tiles for WMMA; cold experts consume each tile as two instances
  * of the shipping eight-pair DP4A computation. */
-template <uint32_t StagedRows = 8u>
+template <uint32_t StagedRows = 8u, uint32_t PhysicalExperts = 0u>
 __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         float *gate_out,
         float *up_out,
@@ -5726,11 +5775,11 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         if (row < nrows) {
             const cuda_block_q4_K *gr =
                 (const cuda_block_q4_K *)(gate_base +
-                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * gate_expert_bytes +
                     (uint64_t)row * gate_row_bytes);
             const cuda_block_q4_K *ur =
                 (const cuda_block_q4_K *)(up_base +
-                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * gate_expert_bytes +
                     (uint64_t)row * gate_row_bytes);
             float gate[StagedRows] = {};
             float up[StagedRows] = {};

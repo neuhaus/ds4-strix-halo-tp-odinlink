@@ -191,6 +191,12 @@ test-rocm-glm5-q4k-cold-lds5-padding: tests/test_rocm_glm5_q4k_batch_partition
 		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --cold-lds5-pad; \
 	done
 
+.PHONY: test-rocm-glm5-q4k-grouped
+test-rocm-glm5-q4k-grouped: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 256 512 768 1000 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --grouped; \
+	done
+
 .PHONY: test-rocm-glm5-six-prefill-exact
 tests/test_rocm_glm5_six_prefill_exact.o: tests/test_rocm_glm5_six_prefill_exact.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
