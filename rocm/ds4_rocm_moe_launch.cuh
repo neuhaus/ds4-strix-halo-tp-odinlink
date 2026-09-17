@@ -97,6 +97,12 @@ static int routed_moe_glm5_cold_lds5_requested(void) {
     return strcmp(value, "1") == 0 ? 1 : -1;
 }
 
+static int routed_moe_glm5_cold_lds5_pad_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int routed_moe_q4k_wmma_pair_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -2225,7 +2231,12 @@ static int routed_moe_launch(
                                     xq_blocks == 16u && wmma_min_count <= 6u &&
                                     routed_moe_glm5_cold_lds5_requested() == 1;
                                 if (compact_cold) {
-                                    moe_gate_up_q4K_cold_tile16_kernel<5u><<<cold_grid, 256>>>(
+                                    // Allocation-only diagnostic: identical kernel
+                                    // instructions, larger LDS reservation.
+                                    const size_t cold_padding =
+                                        routed_moe_glm5_cold_lds5_pad_requested() == 1 ?
+                                        3u * 16u * sizeof(cuda_block_q8_K) : 0u;
+                                    moe_gate_up_q4K_cold_tile16_kernel<5u><<<cold_grid, 256, cold_padding>>>(
                                         (float *)gate->ptr, (float *)up->ptr,
                                         gate_w, up_w, xq, sorted_pairs, sorted_offsets,
                                         sorted_counts, tile_total, tile_experts, tile_starts,
@@ -2236,9 +2247,10 @@ static int routed_moe_launch(
                                     if (!reported) {
                                         fprintf(stderr, DS4_GPU_LOG_PREFIX
                                                 "GLM5 Q4_K cold LDS5 engaged "
-                                                "threshold=%u lds_bytes=%zu weights=original\n",
+                                                "threshold=%u lds_bytes=%zu padding_bytes=%zu weights=original\n",
                                                 wmma_min_count,
-                                                5u * 16u * sizeof(cuda_block_q8_K));
+                                                5u * 16u * sizeof(cuda_block_q8_K),
+                                                cold_padding);
                                         reported = 1;
                                     }
                                 } else {
@@ -4374,6 +4386,9 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (routed_moe_glm5_cold_lds5_requested() < 0 ||
+        routed_moe_glm5_cold_lds5_pad_requested() < 0 ||
+        (routed_moe_glm5_cold_lds5_pad_requested() == 1 &&
+         routed_moe_glm5_cold_lds5_requested() != 1) ||
         !cuda_q4k_kshard_enabled() ||
         n_tokens == 0u || !out || !gate || !up || !mid || !down ||
         !model_map || model_size == 0u || !selected || !weights || !x ||
