@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     REQUIRE(argc <= 3);
     const bool coalesced = argc == 3 && std::strcmp(argv[2],"--coalesced") == 0;
     const bool m96 = argc == 3 && std::strcmp(argv[2],"--exact-m96") == 0;
-    REQUIRE(argc != 3 || coalesced || m96);
+    const bool shared_a = argc == 3 && std::strcmp(argv[2],"--shared-a") == 0;
+    REQUIRE(argc != 3 || coalesced || m96 || shared_a);
     const bool compare_modes = coalesced || m96;
     if (m96) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96";
     const char *skinny = argc >= 2 ? argv[1] : "0";
@@ -63,6 +64,8 @@ int main(int argc, char **argv) {
     Glm5TestGGUF gguf;
     REQUIRE(gguf.open_file(model));
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL", "1", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
+                   shared_a ? "1" : "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE", "0", 1) == 0);
     if (m96) for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
             "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE", "DS4_ROCM_GLM5_BF16_LT_HILO",
@@ -87,7 +90,7 @@ int main(int argc, char **argv) {
             REQUIRE(gguf.tensor(name,{4096,full_widths[i]},30,offsets[i]));
         }
         // Layouts 0/1 are TP halves; layout 2 is the supported full-head API.
-        for (unsigned rank=0; rank<3; ++rank) for (unsigned rows : {256u,1024u}) {
+        for (unsigned rank=0; rank<3; ++rank) for (unsigned rows : {256u,1024u,2048u}) {
             if (rank == 2 && rows != 256 && !m96) continue;
             const uint32_t q_width = rank < 2 ? 4096u : 8192u;
             const uint32_t widths[] = {q_width,q_width,q_width,128,128,
@@ -198,6 +201,31 @@ int main(int argc, char **argv) {
                 total += count;
             }
             REQUIRE(exact);
+            if (shared_a && layer == 0u && rank < 2u) {
+                hipEvent_t begin, end;
+                REQUIRE(hipEventCreate(&begin) == hipSuccess);
+                REQUIRE(hipEventCreate(&end) == hipSuccess);
+                float elapsed[2] = {};
+                for (unsigned arm = 0u; arm < 2u; ++arm) {
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
+                                   arm ? "1" : "0", 1) == 0);
+                    REQUIRE(ds4_gpu_synchronize());
+                    REQUIRE(hipEventRecord(begin, nullptr) == hipSuccess);
+                    for (unsigned repeat = 0u; repeat < 5u; ++repeat)
+                        REQUIRE(launch() == 1);
+                    REQUIRE(hipEventRecord(end, nullptr) == hipSuccess);
+                    REQUIRE(hipEventSynchronize(end) == hipSuccess);
+                    REQUIRE(hipEventElapsedTime(&elapsed[arm], begin, end) ==
+                            hipSuccess);
+                    elapsed[arm] /= 5.0f;
+                }
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A", "1", 1) == 0);
+                std::printf("timing shared_a layer=%u rank=%u rows=%u baseline_ms=%.6f shared_ms=%.6f speedup=%.4f\n",
+                            layer, rank, rows, elapsed[0], elapsed[1],
+                            elapsed[0] / elapsed[1]);
+                REQUIRE(hipEventDestroy(begin) == hipSuccess);
+                REQUIRE(hipEventDestroy(end) == hipSuccess);
+            }
             if (coalesced) {
                 REQUIRE(ds4_gpu_matmul_bf16_wmma_hilo_tensor(candidate[0],
                     gguf.map,gguf.size,local[0],4096,q_width,input,rows) == 1);
