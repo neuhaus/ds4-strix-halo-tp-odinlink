@@ -18,7 +18,7 @@ extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
     std::fprintf(stderr, "FAIL line=%d: %s\n", __LINE__, #x); \
     std::exit(1); } } while (0)
 
-static constexpr const char *weight_selector =
+static const char *weight_selector =
     "DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT";
 
 template <typename Launch>
@@ -51,8 +51,11 @@ static void time_weight_modes(Launch launch, const char *role,
 
 int main(int argc, char **argv) {
     REQUIRE(argc <= 3);
-    const bool coalesced = argc == 3;
-    if (coalesced) REQUIRE(std::strcmp(argv[2],"--coalesced") == 0);
+    const bool coalesced = argc == 3 && std::strcmp(argv[2],"--coalesced") == 0;
+    const bool m96 = argc == 3 && std::strcmp(argv[2],"--exact-m96") == 0;
+    REQUIRE(argc != 3 || coalesced || m96);
+    const bool compare_modes = coalesced || m96;
+    if (m96) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96";
     const char *skinny = argc >= 2 ? argv[1] : "0";
     REQUIRE(std::strcmp(skinny,"0") == 0 || std::strcmp(skinny,"1") == 0);
     const char *model = std::getenv("DS4_GLM5_MODEL");
@@ -61,6 +64,10 @@ int main(int argc, char **argv) {
     REQUIRE(gguf.open_file(model));
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE", "0", 1) == 0);
+    if (m96) for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
+            "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE", "DS4_ROCM_GLM5_BF16_LT_HILO",
+            "DS4_ROCM_GLM5_BF16_WMMA_EXACT_M96"})
+        REQUIRE(setenv(name,"0",1) == 0);
     REQUIRE(setenv(weight_selector,"0",1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SKINNY_EXACT_TOKTILE", skinny, 1) == 0);
     REQUIRE(unsetenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") == 0);
@@ -81,7 +88,7 @@ int main(int argc, char **argv) {
         }
         // Layouts 0/1 are TP halves; layout 2 is the supported full-head API.
         for (unsigned rank=0; rank<3; ++rank) for (unsigned rows : {256u,1024u}) {
-            if (rank == 2 && rows != 256) continue;
+            if (rank == 2 && rows != 256 && !m96) continue;
             const uint32_t q_width = rank < 2 ? 4096u : 8192u;
             const uint32_t widths[] = {q_width,q_width,q_width,128,128,
                                       rank < 2 ? 32u : 64u};
@@ -121,7 +128,7 @@ int main(int argc, char **argv) {
                 candidate[4],candidate[5],gguf.map,gguf.size,
                 local[0],local[1],local[2],local[3],local[4],local[5],
                 4096,q_width,128,widths[5],input,rows); };
-            REQUIRE(setenv(weight_selector,coalesced ? "1" : "0",1) == 0);
+            REQUIRE(setenv(weight_selector,compare_modes ? "1" : "0",1) == 0);
             REQUIRE(launch() == 1);
             // No partial tile may reach the exact kernel or alter its output.
             REQUIRE(ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
@@ -129,11 +136,48 @@ int main(int argc, char **argv) {
                 candidate[4],candidate[5],gguf.map,gguf.size,
                 local[0],local[1],local[2],local[3],local[4],local[5],
                 4096,q_width,128,widths[5],input,rows-1u) == -1);
-            if (coalesced) {
+            if (compare_modes) {
                 // Invalid selectors must leave the recorded outputs intact.
                 REQUIRE(setenv(weight_selector,"invalid",1) == 0);
                 REQUIRE(launch() == 0);
                 REQUIRE(setenv(weight_selector,"1",1) == 0);
+            }
+            if (m96) {
+                for (const char *invalid : {"", "2"}) {
+                    REQUIRE(setenv(weight_selector,invalid,1) == 0);
+                    REQUIRE(launch() == 0);
+                }
+                REQUIRE(setenv(weight_selector,"1",1) == 0);
+                for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_NATIVE",
+                        "DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
+                        "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE", "DS4_ROCM_GLM5_BF16_LT_HILO"}) {
+                    REQUIRE(setenv(name,"1",1) == 0);
+                    REQUIRE(launch() == 0);
+                    REQUIRE(setenv(name,"0",1) == 0);
+                }
+                if (rows == 1024u) for (unsigned i=0; i<3; ++i) {
+                    local[i] += 2u;
+                    REQUIRE(launch() == 0);
+                    local[i] -= 2u;
+                }
+                auto *saved = candidate[0];
+                auto *short_out = ds4_gpu_tensor_view(saved,0,uint64_t(rows)*q_width*4u-4u);
+                REQUIRE(short_out);
+                candidate[0] = short_out;
+                REQUIRE(launch() == 0);
+                candidate[0] = saved;
+                ds4_gpu_tensor_free(short_out);
+                saved = candidate[1];
+                candidate[1] = candidate[0];
+                REQUIRE(launch() == 0);
+                candidate[1] = saved;
+                saved = input;
+                auto *short_in = ds4_gpu_tensor_view(input,0,x.size()*4u-4u);
+                REQUIRE(short_in);
+                input = short_in;
+                REQUIRE(launch() == 0);
+                input = saved;
+                ds4_gpu_tensor_free(short_in);
             }
             bool exact = true;
             for (unsigned i=0; i<6; ++i) {
@@ -169,7 +213,20 @@ int main(int argc, char **argv) {
                 std::printf("generic_weight_load layer=%u rank=%u rows=%u K=4096 N=%u values=%zu different=0\n",
                             layer,rank,rows,q_width,count);
             }
-            if (coalesced && layer == 0 && rank < 2)
+            if (m96) {
+                // Reusing the private activation scratch must not alter the
+                // incumbent path after the selector is removed.
+                REQUIRE(unsetenv(weight_selector) == 0);
+                REQUIRE(launch() == 1);
+                for (unsigned i=0; i<6; ++i) {
+                    const size_t count = size_t(rows)*widths[i];
+                    std::vector<float> a(count), b(count);
+                    REQUIRE(ds4_gpu_tensor_read(reference[i],0,a.data(),count*4u));
+                    REQUIRE(ds4_gpu_tensor_read(candidate[i],0,b.data(),count*4u));
+                    REQUIRE(std::memcmp(a.data(),b.data(),count*4u) == 0);
+                }
+            }
+            if (compare_modes && layer == 0 && rank < 2)
                 time_weight_modes(launch,"six",rank,rows);
             for (unsigned i=0; i<6; ++i) {
                 ds4_gpu_tensor_free(reference[i]);

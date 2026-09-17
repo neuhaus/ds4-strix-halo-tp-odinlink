@@ -1716,8 +1716,7 @@ static int matmul_bf16_f32_wmma_hilo_qkv_shared_a_launch(
                    "matmul_bf16 WMMA hi/lo QKV shared-A launch");
 }
 
-static int glm5_bf16_exact_m96_launch(float *out, const uint16_t *weight,
-        const float *x, uint32_t k, uint32_t n, uint32_t m) {
+static int glm5_bf16_exact_prepare(const float *x, uint32_t k, uint32_t m) {
     int device = -1;
     if (hipGetDevice(&device) != hipSuccess || device != 0) return 0;
     hipDeviceProp_t prop;
@@ -1730,7 +1729,12 @@ static int glm5_bf16_exact_m96_launch(float *out, const uint16_t *weight,
             "GLM BF16 exact activation allocation")) return 0;
     ds4_bf16_hilo_prepare_kernel<<<(count+255u)/256u,256>>>(
         g_glm5_bf16_exact_activations,x,count);
-    if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact activation preparation")) return 0;
+    return cuda_ok(cudaGetLastError(),"GLM BF16 exact activation preparation");
+}
+
+static int glm5_bf16_exact_m96_launch(float *out, const uint16_t *weight,
+        const float *x, uint32_t k, uint32_t n, uint32_t m) {
+    if (!glm5_bf16_exact_prepare(x,k,m)) return 0;
     matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true><<<
         dim3(n/32u,(m+95u)/96u),128>>>(out,weight,x,k,n,m,g_glm5_bf16_exact_activations);
     if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact M96 launch")) return 0;
@@ -2179,11 +2183,24 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
     const int decode_enabled = selector && strcmp(selector, "1") == 0;
     const int prefill_enabled =
         prefill_selector && strcmp(prefill_selector, "1") == 0;
+    const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96");
+    const bool exact = exact_selector && strcmp(exact_selector,"1") == 0;
+    if (n_tok != 1u && exact_selector && !exact && strcmp(exact_selector,"0") != 0)
+        return 0;
     if ((n_tok == 1u && !decode_enabled) ||
         (n_tok != 1u && !prefill_enabled)) return -1;
     const int coalesced = n_tok == 1u ? 0 :
         glm5_bf16_wmma_coalesced_weights_requested();
     if (coalesced < 0) return 0;
+    if (exact && n_tok != 1u) {
+        if (coalesced) return 0;
+        for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_NATIVE",
+                                "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE",
+                                "DS4_ROCM_GLM5_BF16_LT_HILO"}) {
+            const char *value = getenv(name);
+            if (value && strcmp(value,"0") != 0) return 0;
+        }
+    }
     /* M=1 uses the shared-x wave matvec.  Batched prefill uses the existing
      * 256-row hi/lo WMMA tile, extended to all six independent pointers. */
     if (!out_q || !out_k || !out_v || !out_f || !out_g || !out_beta ||
@@ -2262,6 +2279,15 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         q_out_dim, q_out_dim, q_out_dim, low_out_dim, low_out_dim,
         beta_out_dim,
     };
+    const bool exact_shape = exact && n_tok == 1024u &&
+        ((q_out_dim == 4096u && beta_out_dim == 32u) ||
+         (q_out_dim == 8192u && beta_out_dim == 64u));
+    if (exact_shape) {
+        if (x->device_id != 0) return 0;
+        for (uint32_t i=0; i<6u; ++i)
+            if (outs[i]->device_id != 0 || (i<3u &&
+                ((offsets[i] & 15u) || ((uintptr_t)outs[i]->ptr & 15u)))) return 0;
+    }
     uint64_t weight_bytes[6] = {};
     for (uint32_t i = 0u; i < 6u; ++i) {
         uint64_t elements = 0u;
@@ -2285,6 +2311,12 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             return 0;
         if (coalesced && i < 3u && ((uintptr_t)weights[i] & 3u) != 0u)
             return 0;
+        if (exact_shape) {
+            if (i<3u && ((uintptr_t)weights[i] & 15u)) return 0;
+            for (uint32_t j=0; j<6u; ++j)
+                if (cuda_u64_ranges_overlap((uint64_t)(uintptr_t)weights[i],weight_bytes[i],
+                        (uint64_t)(uintptr_t)outs[j]->ptr,out_sizes[j])) return 0;
+        }
         for (uint32_t j = 0u; j < i; ++j)
             if (cuda_u64_ranges_overlap(
                     (uint64_t)(uintptr_t)weights[i], weight_bytes[i],
@@ -2292,7 +2324,32 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
                 return -1;
     }
 
-    if (n_tok == 1u) {
+    if (exact_shape) {
+        if (!glm5_bf16_exact_prepare((const float *)x->ptr,(uint32_t)in_dim,(uint32_t)n_tok)) return 0;
+        matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true,true><<<
+            dim3(3u*(uint32_t)q_out_dim/32u,((uint32_t)n_tok+95u)/96u),128>>>(
+            (float *)out_q->ptr,(const uint16_t *)weights[0],(const float *)x->ptr,
+            (uint32_t)in_dim,(uint32_t)q_out_dim,(uint32_t)n_tok,g_glm5_bf16_exact_activations,
+            (float *)out_k->ptr,(float *)out_v->ptr,
+            (const uint16_t *)weights[1],(const uint16_t *)weights[2]);
+        if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact six QKV launch")) return 0;
+        matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<false,true><<<
+            dim3((uint32_t)low_out_dim+(uint32_t)beta_out_dim/2u,(uint32_t)n_tok/256u),512>>>(
+            (float *)out_q->ptr,(float *)out_k->ptr,(float *)out_v->ptr,
+            (float *)out_f->ptr,(float *)out_g->ptr,(float *)out_beta->ptr,
+            (const uint16_t *)weights[0],(const uint16_t *)weights[1],
+            (const uint16_t *)weights[2],(const uint16_t *)weights[3],
+            (const uint16_t *)weights[4],(const uint16_t *)weights[5],
+            (const float *)x->ptr,(uint32_t)in_dim,(uint32_t)q_out_dim,
+            (uint32_t)low_out_dim,(uint32_t)beta_out_dim,(uint32_t)n_tok);
+        if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact six skinny launch")) return 0;
+        static int reported;
+        if (!reported) {
+            fprintf(stderr,"ds4: ROCm GLM5 BF16 six exact M96 engaged activation_scratch_bytes=%zu weights=original weight_cache_bytes=0 gates=F32-exact\n",
+                    glm5_bf16_exact_scratch_bytes);
+            reported = 1;
+        }
+    } else if (n_tok == 1u) {
         matmul_bf16_f32_sharedx_kda_six_multiptr_decode_kernel<64u, false><<<
             (unsigned)((q_out_dim + 7u) / 8u), 27u * 32u,
             (size_t)in_dim * sizeof(float)>>>(
