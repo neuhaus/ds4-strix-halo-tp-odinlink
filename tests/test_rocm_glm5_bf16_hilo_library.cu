@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -99,6 +100,10 @@ int main(int argc, char **argv) {
                 std::fflush(stdout);
                 REQUIRE(chosen >= 0);
                 algorithm=heuristics[chosen];
+                std::printf("lt_identity index=%d solution=%s kernel=%s\n",
+                    hipblaslt_ext::getIndexFromAlgo(algorithm.algo),
+                    hipblaslt_ext::getSolutionNameFromAlgo(lt_handle,algorithm.algo).c_str(),
+                    hipblaslt_ext::getKernelNameFromAlgo(lt_handle,algorithm.algo).c_str());
                 if (algorithm.workspaceSize)
                     REQUIRE(hipMalloc(&workspace,algorithm.workspaceSize) == hipSuccess);
                 std::printf("lt_workspace_bytes=%zu\n",algorithm.workspaceSize);
