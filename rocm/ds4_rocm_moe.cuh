@@ -5634,6 +5634,7 @@ __global__ static void moe_down_q4K_cold_tile16_kernel(
 /* Complementary half of the Stage-3 crossover.  The routing stream is built
  * in 16-pair tiles for WMMA; cold experts consume each tile as two instances
  * of the shipping eight-pair DP4A computation. */
+template <uint32_t StagedRows = 8u>
 __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         float *gate_out,
         float *up_out,
@@ -5663,7 +5664,12 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
     const uint32_t row = (uint32_t)blockIdx.x * 32u +
                          ((uint32_t)threadIdx.x >> 3u);
     const uint32_t tile_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    static_assert(StagedRows == 8u || StagedRows == 5u,
+                  "cold staging supports the incumbent or bounded GLM tile");
+    // The five-row launcher requires wmma_min_count <= 6. The cold count
+    // guard above therefore bounds every staged row to [0, 5), while all
+    // used addresses and the original eight-pointer arithmetic stay intact.
+    __shared__ cuda_block_q8_K sxq[StagedRows][16];
 
     for (uint32_t half = 0; half < 2u; half++) {
         uint32_t pair[8] = {};

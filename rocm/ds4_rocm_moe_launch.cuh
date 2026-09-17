@@ -91,6 +91,12 @@ static int routed_moe_q4k_cold_tile4_enabled(void) {
     return enabled;
 }
 
+static int routed_moe_glm5_cold_lds5_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int routed_moe_q4k_wmma_pair_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -2212,13 +2218,38 @@ static int routed_moe_launch(
                                              "routed_moe Q4_K DP4A cold tile4 launch");
                             }
                             if (ok) {
-                                moe_gate_up_q4K_cold_tile16_kernel<<<cold_grid, 256>>>(
-                                    (float *)gate->ptr, (float *)up->ptr,
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets,
-                                    sorted_counts, tile_total, tile_experts, tile_starts,
-                                    gate_expert_bytes, gate_row_bytes, xq_blocks,
-                                    expert_mid_dim, n_expert, wmma_min_count,
-                                    cold_tile4);
+                                const bool compact_cold = force_halfk_down4 &&
+                                    direct_gate_w && direct_up_w && direct_down_w &&
+                                    n_total_expert == 288u && n_expert == 8u &&
+                                    expert_in_dim == 4096u && expert_mid_dim == 1024u &&
+                                    xq_blocks == 16u && wmma_min_count <= 6u &&
+                                    routed_moe_glm5_cold_lds5_requested() == 1;
+                                if (compact_cold) {
+                                    moe_gate_up_q4K_cold_tile16_kernel<5u><<<cold_grid, 256>>>(
+                                        (float *)gate->ptr, (float *)up->ptr,
+                                        gate_w, up_w, xq, sorted_pairs, sorted_offsets,
+                                        sorted_counts, tile_total, tile_experts, tile_starts,
+                                        gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                        expert_mid_dim, n_expert, wmma_min_count,
+                                        cold_tile4);
+                                    static int reported;
+                                    if (!reported) {
+                                        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                                "GLM5 Q4_K cold LDS5 engaged "
+                                                "threshold=%u lds_bytes=%zu weights=original\n",
+                                                wmma_min_count,
+                                                5u * 16u * sizeof(cuda_block_q8_K));
+                                        reported = 1;
+                                    }
+                                } else {
+                                    moe_gate_up_q4K_cold_tile16_kernel<8u><<<cold_grid, 256>>>(
+                                        (float *)gate->ptr, (float *)up->ptr,
+                                        gate_w, up_w, xq, sorted_pairs, sorted_offsets,
+                                        sorted_counts, tile_total, tile_experts, tile_starts,
+                                        gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                        expert_mid_dim, n_expert, wmma_min_count,
+                                        cold_tile4);
+                                }
                             }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K DP4A cold launch");
@@ -4342,7 +4373,8 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         uint32_t layer_index, uint32_t n_tokens,
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
-    if (!cuda_q4k_kshard_enabled() ||
+    if (routed_moe_glm5_cold_lds5_requested() < 0 ||
+        !cuda_q4k_kshard_enabled() ||
         n_tokens == 0u || !out || !gate || !up || !mid || !down ||
         !model_map || model_size == 0u || !selected || !weights || !x ||
         n_total_expert == 0u || n_expert == 0u ||

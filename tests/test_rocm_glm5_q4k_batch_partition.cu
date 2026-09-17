@@ -7,6 +7,7 @@ extern "C" {
 #include "ds4_tp.h"
 }
 #include "glm5_gguf_test.hpp"
+#include <hip/hip_runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,8 +22,10 @@ extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
 int main(int argc, char **argv) {
     constexpr uint32_t width = 4096, mid_width = 1024;
     uint32_t rows = 1024;
-    REQUIRE(argc <= 2);
-    if (argc == 2) {
+    REQUIRE(argc <= 3);
+    const bool cold_lds5 = argc == 3;
+    if (cold_lds5) REQUIRE(std::strcmp(argv[2], "--cold-lds5") == 0);
+    if (argc >= 2) {
         char *end = nullptr;
         const unsigned long count = std::strtoul(argv[1], &end, 10);
         REQUIRE(end != argv[1] && *end == '\0' && count > 0 && count <= 1024);
@@ -44,6 +47,8 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT", "6", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_FUSE_MID", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_Q4K_COLD_TILE4", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED", "1", 1) == 0);
     ds4_gpu_config config = {};
     config.n_gpus = 1;
@@ -69,6 +74,13 @@ int main(int argc, char **argv) {
                      std::cos(double(i)*0.031)*0.11);
     for (unsigned r=0; r<rows; ++r) for (unsigned s=0; s<used; ++s) {
         selected[r*used+s] = s<7 ? int(s) : 7+int(r%128);
+        if (cold_lds5 && s == 7u) {
+            // Each M256 domain includes experts used 1,2,...,7 times,
+            // exercising every cold count and both sides of threshold6.
+            unsigned within = (r % tile) % 28u, group = 0u;
+            while (within >= group + 1u) within -= ++group;
+            selected[r*used+s] = int(7u + ((r % tile) / 28u) * 7u + group);
+        }
         weights[r*used+s] = float(1+(r+s)%7)/16.0f;
     }
     REQUIRE(ds4_gpu_tensor_write(t[7],0,x.data(),rows*strides[7]));
@@ -97,6 +109,7 @@ int main(int argc, char **argv) {
                 10.0f,v[7],3,count,&half_mid);
             return ok && !half_mid;
         };
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "0", 1) == 0);
         for (unsigned first=0; first<rows; first+=tile) {
             const unsigned count = rows-first < tile ? rows-first : tile;
@@ -111,6 +124,7 @@ int main(int argc, char **argv) {
         REQUIRE(ds4_gpu_tensor_read(t[0],0,reference.data(),rows*strides[0]));
         REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "256", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_lds5 ? "1" : "0", 1) == 0);
         REQUIRE(call(t,rows));
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         size_t different=0;
@@ -124,6 +138,36 @@ int main(int argc, char **argv) {
                     rank,rows,actual.size(),different,max_abs);
         std::fflush(stdout);
         REQUIRE(different == 0);
+        if (cold_lds5) {
+            // Warm both full-MoE arms before timing. These are GPU-event
+            // microbenchmarks with synthetic routes, not model throughput.
+            hipEvent_t begin, end;
+            REQUIRE(hipEventCreate(&begin) == hipSuccess);
+            REQUIRE(hipEventCreate(&end) == hipSuccess);
+            for (const char *mode : {"0", "1"}) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", mode, 1) == 0);
+                REQUIRE(call(t,rows));
+            }
+            REQUIRE(ds4_gpu_synchronize());
+            for (unsigned pair = 0; pair < 3u; ++pair) {
+                for (unsigned arm = 0; arm < 2u; ++arm) {
+                    const unsigned mode = arm ^ (pair & 1u);
+                    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", mode ? "1" : "0", 1) == 0);
+                    REQUIRE(hipEventRecord(begin, nullptr) == hipSuccess);
+                    for (unsigned repeat = 0; repeat < 5u; ++repeat)
+                        REQUIRE(call(t,rows));
+                    REQUIRE(hipEventRecord(end, nullptr) == hipSuccess);
+                    REQUIRE(hipEventSynchronize(end) == hipSuccess);
+                    float ms = 0.0f;
+                    REQUIRE(hipEventElapsedTime(&ms, begin, end) == hipSuccess);
+                    REQUIRE(std::isfinite(ms) && ms > 0.0f);
+                    std::printf("microbench rank=%u rows=%u pair=%u lds5=%u moe_ms=%.6f\n",
+                                rank, rows, pair, mode, ms / 5.0f);
+                }
+            }
+            REQUIRE(hipEventDestroy(begin) == hipSuccess);
+            REQUIRE(hipEventDestroy(end) == hipSuccess);
+        }
         // Invalid outer capacity must be rejected before writing earlier tiles.
         REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
         ds4_gpu_tensor *short_out = ds4_gpu_tensor_view(
@@ -136,6 +180,13 @@ int main(int argc, char **argv) {
         ds4_gpu_tensor_free(short_out);
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         for (float value:actual) REQUIRE(std::isnan(value));
+        if (cold_lds5) {
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "invalid", 1) == 0);
+            REQUIRE(!call(t,rows));
+            REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+            for (float value:actual) REQUIRE(std::isnan(value));
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
+        }
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION", "invalid", 1) == 0);
         REQUIRE(!call(t,rows));
         REQUIRE(ds4_gpu_synchronize());
