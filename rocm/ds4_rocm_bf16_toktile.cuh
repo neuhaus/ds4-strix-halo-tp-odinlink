@@ -183,6 +183,83 @@ static void matmul_bf16_f32_wmma_hilo_m256_kernel(
     }
 }
 
+// Wider N and deeper staging for the same hi/lo arithmetic. Each wave owns
+// M16/N64, with K32 staged once and consumed as K16 high/residual pairs in
+// exactly the incumbent order. No prepared weight or activation allocation.
+__global__ __launch_bounds__(8u * 32u, 1)
+static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t tokens) {
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u;
+    constexpr uint32_t MTile = 128u, KStage = 32u, NTilesN = 4u;
+    constexpr uint32_t NThreads = 256u;
+    __shared__ uint16_t sh_a_hi[MTile * KStage];
+    __shared__ uint16_t sh_a_lo[MTile * KStage];
+    __shared__ uint16_t sh_b[NTilesN * KStage * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t mt = tid >> 5u;
+    const uint32_t nbase = blockIdx.x * NTilesN * BN;
+    const uint32_t mbase = blockIdx.y * MTile;
+    if (mbase >= tokens) return;
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                   Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                   Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    FragA a_hi, a_lo;
+    FragB b;
+    FragC acc[NTilesN];
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt)
+        rocwmma::fill_fragment(acc[nt], 0.0f);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += KStage) {
+        for (uint32_t j = tid; j < MTile * KStage; j += NThreads) {
+            const uint32_t m = mbase + j / KStage;
+            const uint32_t kk = j % KStage;
+            const float xv = m < tokens ? x[(uint64_t)m * in_dim + k0 + kk] : 0.0f;
+            const uint16_t hi = ds4_bf16_rne_bits(xv);
+            sh_a_hi[j] = hi;
+            sh_a_lo[j] = ds4_bf16_rne_bits(
+                xv - __uint_as_float((uint32_t)hi << 16u));
+        }
+        // Contiguous K words in global memory; transpose only inside LDS.
+        for (uint32_t j = tid; j < NTilesN * KStage * BN; j += NThreads) {
+            const uint32_t nlocal = j / KStage;
+            const uint32_t kk = j % KStage;
+            const uint32_t nt = nlocal / BN;
+            const uint32_t nn = nlocal % BN;
+            const uint32_t n = nbase + nlocal;
+            sh_b[nt * KStage * BN + kk * BN + nn] = n < out_dim ?
+                weight[(uint64_t)n * in_dim + k0 + kk] : 0u;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t ks = 0u; ks < KStage; ks += BK) {
+            rocwmma::load_matrix_sync(a_hi, reinterpret_cast<const Bf16 *>(
+                sh_a_hi + mt * BM * KStage + ks), KStage);
+            rocwmma::load_matrix_sync(a_lo, reinterpret_cast<const Bf16 *>(
+                sh_a_lo + mt * BM * KStage + ks), KStage);
+#pragma unroll
+            for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+                rocwmma::load_matrix_sync(b, reinterpret_cast<const Bf16 *>(
+                    sh_b + nt * KStage * BN + ks * BN), BN);
+                rocwmma::mma_sync(acc[nt], a_hi, b, acc[nt]);
+                rocwmma::mma_sync(acc[nt], a_lo, b, acc[nt]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+        const uint32_t n = nbase + nt * BN;
+        if (n < out_dim && mbase + mt * BM < tokens)
+            rocwmma::store_matrix_sync(
+                out + (uint64_t)(mbase + mt * BM) * out_dim + n,
+                acc[nt], out_dim, rocwmma::mem_row_major);
+    }
+}
+
 /* Collapse the three equal-shape GLM KDA Q/K/V projections into one grid.
  * Each workgroup retains the validated single-projection arithmetic and owns
  * exactly one weight/output pointer; removing the two kernel boundaries lets

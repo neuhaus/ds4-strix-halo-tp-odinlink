@@ -1664,10 +1664,20 @@ static int glm5_bf16_wmma_coalesced_weights_requested(void) {
     return strcmp(value, "1") == 0 ? 1 : -1;
 }
 
+static int glm5_bf16_wmma_wide_tile_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int matmul_bf16_f32_wmma_hilo_m256_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    if (glm5_bf16_wmma_coalesced_weights_requested() == 1) {
+    if (glm5_bf16_wmma_wide_tile_requested() == 1) {
+        matmul_bf16_f32_wmma_hilo_m128n64k32_kernel<<<
+                dim3((out_dim + 63u) / 64u, (n_tok + 127u) / 128u),
+                8u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    } else if (glm5_bf16_wmma_coalesced_weights_requested() == 1) {
         matmul_bf16_f32_wmma_hilo_m256_kernel<2u, false, true><<<
                 dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
                 16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
@@ -1717,7 +1727,9 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const char *native_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE");
     const bool native = native_selector && strcmp(native_selector, "1") == 0;
     const int coalesced = glm5_bf16_wmma_coalesced_weights_requested();
-    if (coalesced < 0 || (coalesced && native)) return 0;
+    const int wide_tile = glm5_bf16_wmma_wide_tile_requested();
+    if (coalesced < 0 || wide_tile < 0 || (coalesced && native) ||
+        (wide_tile && (native || coalesced))) return 0;
     if (native_selector && !native && strcmp(native_selector, "0") != 0)
         return 0;
     if (native && (g_quality_mode || cuda_runtime_config()->graph_dump))
@@ -1748,7 +1760,8 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
-    if (coalesced && ((uintptr_t)wptr & 3u) != 0u) return 0;
+    if ((wide_tile && (uintptr_t)wptr % alignof(uint16_t) != 0u) ||
+        (coalesced && ((uintptr_t)wptr & 3u) != 0u)) return 0;
     const int result = native
         ? matmul_bf16_f32_wmma_native_m256_launch(
               (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
@@ -1756,6 +1769,15 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         : matmul_bf16_f32_wmma_hilo_m256_launch(
               (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    if (result > 0 && wide_tile) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 WMMA wide tile engaged M128 N64 K32 "
+                    "arithmetic=hilo weights=original scratch=unchanged\n");
+            reported = 1;
+        }
+    }
     if (result > 0 && coalesced) {
         static int reported;
         if (!reported) {
