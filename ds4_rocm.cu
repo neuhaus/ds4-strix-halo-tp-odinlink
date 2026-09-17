@@ -77,18 +77,7 @@ typedef struct {
     uint16_t dmin;
 } cuda_block_q2_K;
 
-typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t scales[12];
-    uint8_t qs[CUDA_QK_K / 2];
-} cuda_block_q4_K;
-
-typedef struct {
-    float d;
-    int8_t qs[CUDA_QK_K];
-    int16_t bsums[CUDA_QK_K / 16];
-} cuda_block_q8_K;
+#include "rocm/ds4_rocm_q4k_types.cuh"
 
 typedef struct {
     uint16_t d;

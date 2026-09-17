@@ -275,6 +275,19 @@ tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 test-rocm-moe-wave-plan: tests/test_rocm_moe_wave_plan
 	./tests/test_rocm_moe_wave_plan
 
+tests/glm5_q4k_integer_block_kernels.o: tests/glm5_q4k_integer_block_kernels.cu tests/glm5_q4k_integer_block_test.hpp rocm/ds4_rocm_q4k_types.cuh rocm/ds4_rocm_q4k_dot.cuh ds4_rocm.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm5_q4k_integer_block.o: tests/test_glm5_q4k_integer_block.cu tests/glm5_q4k_integer_block_test.hpp tests/glm5_gguf_test.hpp rocm/ds4_rocm_q4k_types.cuh
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm5_q4k_integer_block: tests/test_glm5_q4k_integer_block.o tests/glm5_q4k_integer_block_kernels.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^
+
+.PHONY: test-glm5-q4k-integer-block
+test-glm5-q4k-integer-block: tests/test_glm5_q4k_integer_block
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_glm5_q4k_integer_block
+
 tests/test_rocm_glm5_kda_ref.o: tests/test_rocm_glm5_kda_ref.cu ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
 
