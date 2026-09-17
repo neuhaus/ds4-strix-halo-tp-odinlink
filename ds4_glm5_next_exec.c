@@ -1826,9 +1826,9 @@ static int shared_route_overlap_mode(const ds4_glm5_next_exec_ctx *ctx,
     const char *paired = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
     const char *window_overlap = getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
     const char *window_scratch = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
-    /* Both modes enqueue work ahead of the route barrier and use the same
-     * layer-scoped scratch lifetime.  Refuse the combination explicitly so a
-     * future recipe cannot queue either shared path twice. */
+    /* This schedule is qualified only for resident experts. Reject the
+     * separate window/scratch overlap recipe explicitly rather than letting
+     * residency silently mask an untested combination of scheduling modes. */
     if (window_overlap && strcmp(window_overlap, "1") == 0 &&
         window_scratch && strcmp(window_scratch, "1") == 0) return -1;
     if (q4_residency == 1 && ctx->tp_rank < 2u && tp_context_valid(ctx) &&
