@@ -273,7 +273,7 @@ static void matmul_bf16_f32_wmma_hilo_m128n64k32_kernel(
 // Test-only smaller workgroup geometry. Each wave owns three independent
 // 16x16 output tiles. Retain the incumbent K16 high/residual update sequence,
 // including at M96 panel tails. Caller admits whole M16/N32/K32 multiples.
-template <bool Prepared = false>
+template <bool Prepared = false, uint32_t LdsPad = 0u>
 __global__ __launch_bounds__(128, 1)
 static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
         float *out, const uint16_t *weight, const float *x,
@@ -281,9 +281,11 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
         const uint32_t *prepared = nullptr) {
     constexpr uint32_t BM = 16u, BN = 16u, BK = 16u;
     constexpr uint32_t MTile = 96u, NTile = 32u, KStage = 32u;
+    constexpr uint32_t Ld = KStage+LdsPad;
+    static_assert(LdsPad == 0u || LdsPad == 16u,"measured LDS layouts only");
     constexpr uint32_t NThreads = 128u;
-    __shared__ uint16_t a_hi[MTile*KStage], a_lo[MTile*KStage];
-    __shared__ uint16_t b_tile[NTile*KStage];
+    __shared__ uint16_t a_hi[MTile*Ld], a_lo[MTile*Ld];
+    __shared__ uint16_t b_tile[NTile*Ld];
     const uint32_t tid = threadIdx.x, wave = tid >> 5u;
     const uint32_t wave_m = (wave & 1u)*3u, wave_n = wave >> 1u;
     const uint32_t mbase = blockIdx.y*MTile, nbase = blockIdx.x*NTile;
@@ -298,33 +300,34 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
     for (uint32_t k0=0; k0<in_dim; k0+=KStage) {
         for (uint32_t j=tid; j<MTile*KStage; j+=NThreads) {
             const uint32_t m = mbase+j/KStage, k = k0+j%KStage;
+            const uint32_t dest=(j/KStage)*Ld+j%KStage;
             if constexpr (Prepared) {
                 const uint32_t bits = m < tokens ? prepared[uint64_t(m)*in_dim+k] : 0u;
-                a_hi[j] = uint16_t(bits);
-                a_lo[j] = uint16_t(bits>>16u);
+                a_hi[dest] = uint16_t(bits);
+                a_lo[dest] = uint16_t(bits>>16u);
             } else {
                 const float value = m < tokens ? x[uint64_t(m)*in_dim+k] : 0.0f;
                 const uint16_t high = ds4_bf16_rne_bits(value);
-                a_hi[j] = high;
-                a_lo[j] = ds4_bf16_rne_bits(value-__uint_as_float(uint32_t(high)<<16u));
+                a_hi[dest] = high;
+                a_lo[dest] = ds4_bf16_rne_bits(value-__uint_as_float(uint32_t(high)<<16u));
             }
         }
         for (uint32_t j=tid; j<NTile*KStage; j+=NThreads) {
             const uint32_t n=nbase+j/KStage, k=k0+j%KStage;
-            b_tile[j] = n < out_dim ? weight[uint64_t(n)*in_dim+k] : 0u;
+            b_tile[(j/KStage)*Ld+j%KStage] = n < out_dim ? weight[uint64_t(n)*in_dim+k] : 0u;
         }
         __syncthreads();
 #pragma unroll 1
         for (uint32_t ks=0; ks<KStage; ks+=BK) {
             FragB b;
-            rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+wave_n*BN*KStage+ks),KStage);
+            rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+wave_n*BN*Ld+ks),Ld);
 #pragma unroll
             for (uint32_t t=0; t<3; ++t) {
                 const uint32_t mt=wave_m+t;
                 FragA a;
-                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_hi+mt*BM*KStage+ks),KStage);
+                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_hi+mt*BM*Ld+ks),Ld);
                 rocwmma::mma_sync(acc[t],a,b,acc[t]);
-                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_lo+mt*BM*KStage+ks),KStage);
+                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_lo+mt*BM*Ld+ks),Ld);
                 rocwmma::mma_sync(acc[t],a,b,acc[t]);
             }
         }
