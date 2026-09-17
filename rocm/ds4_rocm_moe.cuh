@@ -5631,6 +5631,34 @@ __global__ static void moe_down_q4K_cold_tile16_kernel(
     }
 }
 
+/* Same Q4_K block arithmetic as block8, with only the five possible cold
+ * pointers live. Caller supplies valid staged rows and bounds n to five. */
+__device__ static void dev_dot_q4_K_q8_K_cold_block5(
+        const cuda_block_q4_K *x,
+        const cuda_block_q8_K *const ys[5],
+        uint32_t b, uint32_t n, float acc[5]) {
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    int isum[5] = {};
+    int summs[5] = {};
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        for (uint32_t p = 0; p < n; p++) {
+            const cuda_block_q8_K *y = ys[p] + b;
+            summs[p] += (int)m * (int)(y->bsums[2u * j] + y->bsums[2u * j + 1u]);
+            isum[p] += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) {
+        const cuda_block_q8_K *y = ys[p] + b;
+        acc[p] += y->d * xd * (float)isum[p] - y->d * xmin * (float)summs[p];
+    }
+}
+
 /* Complementary half of the Stage-3 crossover.  The routing stream is built
  * in 16-pair tiles for WMMA; cold experts consume each tile as two instances
  * of the shipping eight-pair DP4A computation. */
@@ -5668,15 +5696,15 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
                   "cold staging supports the incumbent or bounded GLM tile");
     // The five-row launcher requires wmma_min_count <= 6. The cold count
     // guard above therefore bounds every staged row to [0, 5), while all
-    // used addresses and the original eight-pointer arithmetic stay intact.
+    // used addresses and each output's block/reduction order stay intact.
     __shared__ cuda_block_q8_K sxq[StagedRows][16];
 
-    for (uint32_t half = 0; half < 2u; half++) {
-        uint32_t pair[8] = {};
-        const cuda_block_q8_K *xqb[8] = {};
+    for (uint32_t half = 0; half < (StagedRows == 5u ? 1u : 2u); half++) {
+        uint32_t pair[StagedRows] = {};
+        const cuda_block_q8_K *xqb[StagedRows] = {};
         uint32_t np = 0;
         const uint32_t local_start = tile_start + half * 8u;
-        for (; np < 8u; np++) {
+        for (; np < StagedRows; np++) {
             const uint32_t local_pair = local_start + np;
             if (local_pair >= count) break;
             pair[np] = sorted_pairs[offsets[expert] + local_pair];
@@ -5704,27 +5732,32 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
                 (const cuda_block_q4_K *)(up_base +
                     (uint64_t)expert * gate_expert_bytes +
                     (uint64_t)row * gate_row_bytes);
-            float gate[8] = {};
-            float up[8] = {};
+            float gate[StagedRows] = {};
+            float up[StagedRows] = {};
             for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-                dev_dot_q4_K_q8_K_block8(
-                    gr + b, xqb[0] ? xqb[0] + b : NULL,
-                    xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL,
-                    xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL,
-                    xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL,
-                    xqb[7] ? xqb[7] + b : NULL, np, gate);
-                dev_dot_q4_K_q8_K_block8(
-                    ur + b, xqb[0] ? xqb[0] + b : NULL,
-                    xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL,
-                    xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL,
-                    xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL,
-                    xqb[7] ? xqb[7] + b : NULL, np, up);
+                if constexpr (StagedRows == 5u) {
+                    dev_dot_q4_K_q8_K_cold_block5(gr + b, xqb, b, np, gate);
+                    dev_dot_q4_K_q8_K_cold_block5(ur + b, xqb, b, np, up);
+                } else {
+                    dev_dot_q4_K_q8_K_block8(
+                        gr + b, xqb[0] ? xqb[0] + b : NULL,
+                        xqb[1] ? xqb[1] + b : NULL,
+                        xqb[2] ? xqb[2] + b : NULL,
+                        xqb[3] ? xqb[3] + b : NULL,
+                        xqb[4] ? xqb[4] + b : NULL,
+                        xqb[5] ? xqb[5] + b : NULL,
+                        xqb[6] ? xqb[6] + b : NULL,
+                        xqb[7] ? xqb[7] + b : NULL, np, gate);
+                    dev_dot_q4_K_q8_K_block8(
+                        ur + b, xqb[0] ? xqb[0] + b : NULL,
+                        xqb[1] ? xqb[1] + b : NULL,
+                        xqb[2] ? xqb[2] + b : NULL,
+                        xqb[3] ? xqb[3] + b : NULL,
+                        xqb[4] ? xqb[4] + b : NULL,
+                        xqb[5] ? xqb[5] + b : NULL,
+                        xqb[6] ? xqb[6] + b : NULL,
+                        xqb[7] ? xqb[7] + b : NULL, np, up);
+                }
             }
             for (uint32_t p = 0; p < np; p++) {
                 gate[p] = quarter_warp_sum_f32(gate[p], lane);
