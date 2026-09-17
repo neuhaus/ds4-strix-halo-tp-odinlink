@@ -109,6 +109,12 @@ static int routed_moe_glm5_grouped_requested(void) {
     return strcmp(value, "1") == 0 ? 1 : -1;
 }
 
+static int routed_moe_glm5_grouped_cold_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int routed_moe_glm5_decode_gate_rows(void) {
     const char *value = getenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS");
     if (!value || strcmp(value, "0") == 0 || strcmp(value, "128") == 0)
@@ -1360,7 +1366,8 @@ static int routed_moe_launch(
         bool glm5_grouped = false,
         uint32_t glm5_decode_rows = 128u,
         bool glm5_decode_bounded_dot = false,
-        bool glm5_decode_cooperative_dot = false) {
+        bool glm5_decode_cooperative_dot = false,
+        bool glm5_grouped_cold = false) {
     if (add_fused_out) *add_fused_out = 0;
     if (gate_type == 39u || down_type == 39u) {
         if (gate_type != 39u || down_type != 39u) {
@@ -1710,6 +1717,8 @@ static int routed_moe_launch(
              compact_selected || batch_stream_selected || batch_stream_split_selected)) {
             return 0;
         }
+        if (glm5_grouped_cold &&
+            (!glm5_grouped || routed_moe_q4k_wmma_min_count() != 6u)) return 0;
         const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
@@ -1728,6 +1737,11 @@ static int routed_moe_launch(
         uint32_t *tile16_total = NULL;
         uint32_t *tile16_experts = NULL;
         uint32_t *tile16_starts = NULL;
+        uint32_t *cold_counts = NULL, *cold_offsets = NULL, *cold_pairs = NULL;
+        uint32_t *cold_total = NULL, *cold_experts = NULL, *cold_starts = NULL;
+        const uint32_t cold_pair_capacity = glm5_grouped_cold ? n_tokens / 256u * 5u : 0u;
+        const uint32_t cold_tile_capacity = glm5_grouped_cold ?
+            288u * ((cold_pair_capacity + 15u) / 16u) : 0u;
         ds4_q8_1_mmq_block *q4k_q81 = NULL;
         ds4_q8_1_mmq_block *down_q81 = NULL;
         uint32_t *iq2_gate_hot_dev = NULL;
@@ -1900,6 +1914,10 @@ static int routed_moe_launch(
             const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
             const uint64_t iq2_gate_hot_off = tile16_starts_off + tile16_starts_bytes;
             const uint64_t iq2_gate_hot_bytes = (uint64_t)bucket_count * sizeof(uint32_t);
+            const uint64_t cold_metadata_off = iq2_gate_hot_off + iq2_gate_hot_bytes;
+            const uint64_t cold_metadata_bytes = glm5_grouped_cold ?
+                (288u + 289u + 288u * cold_pair_capacity + 289u + 1u +
+                 2u * cold_tile_capacity) * sizeof(uint32_t) : 0u;
             uint64_t q81_off = 0;
             uint64_t q81_count = 0;
             uint64_t q81_bytes = 0;
@@ -1907,7 +1925,7 @@ static int routed_moe_launch(
             uint64_t down_q81_count = 0;
             uint64_t down_q81_bytes = 0;
             uint64_t scratch_bytes = 0;
-            if (!routed_moe_align256_checked(iq2_gate_hot_off + iq2_gate_hot_bytes,
+            if (!routed_moe_align256_checked(cold_metadata_off + cold_metadata_bytes,
                                              &q81_off) ||
                 (need_x_q81 &&
                  (!cuda_u64_mul_checked(n_tokens, (uint64_t)xq_blocks * 2u,
@@ -1944,6 +1962,16 @@ static int routed_moe_launch(
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
                 iq2_gate_hot_dev = (uint32_t *)(scratch + iq2_gate_hot_off);
+                uint32_t *cold_tile_offsets = NULL;
+                if (glm5_grouped_cold) {
+                    cold_counts = (uint32_t *)(scratch + cold_metadata_off);
+                    cold_offsets = cold_counts + 288u;
+                    cold_pairs = cold_offsets + 289u;
+                    cold_tile_offsets = cold_pairs + 288u * cold_pair_capacity;
+                    cold_total = cold_tile_offsets + 289u;
+                    cold_experts = cold_total + 1u;
+                    cold_starts = cold_experts + cold_tile_capacity;
+                }
                 q4k_q81 = need_x_q81 ?
                     (ds4_q8_1_mmq_block *)(scratch + q81_off) : NULL;
                 down_q81 = use_q4k_wmma ?
@@ -1981,6 +2009,23 @@ static int routed_moe_launch(
                             bucket_count);
                     }
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
+                }
+                if (ok && glm5_grouped_cold) {
+                    moe_glm5_gather_cold_pairs_kernel<<<2u, 256u>>>(
+                        cold_counts, cold_offsets, cold_pairs, counts, offsets,
+                        sorted_pairs, n_tokens / 256u);
+                    ok = cuda_ok(cudaGetLastError(), "GLM5 grouped cold gather");
+                }
+                if (ok && glm5_grouped_cold) {
+                    moe_build_expert_tile_offsets_kernel<<<1u, 1u>>>(
+                        cold_tile_offsets, cold_total, cold_counts, 16u, 288u);
+                    ok = cuda_ok(cudaGetLastError(), "GLM5 grouped cold offsets");
+                }
+                if (ok && glm5_grouped_cold) {
+                    moe_build_expert_tiles_kernel<<<2u, 256u>>>(
+                        cold_experts, cold_starts, cold_tile_offsets, cold_counts,
+                        16u, 288u);
+                    ok = cuda_ok(cudaGetLastError(), "GLM5 grouped cold tiles");
                 }
                 if (ok && use_expert_tiles) {
                     if (glm5_grouped) {
@@ -2312,7 +2357,19 @@ static int routed_moe_launch(
                                     expert_in_dim == 4096u && expert_mid_dim == 1024u &&
                                     xq_blocks == 16u && wmma_min_count <= 6u &&
                                     routed_moe_glm5_cold_lds5_requested() == 1;
-                                if (glm5_grouped) {
+                                if (glm5_grouped_cold) {
+                                    // These pairs already passed the unchanged
+                                    // per-domain threshold6 classifier. The
+                                    // larger bound admits only their union.
+                                    moe_gate_up_q4K_cold_tile16_kernel<8u><<<
+                                        dim3((expert_mid_dim + 31u) / 32u,
+                                             cold_tile_capacity), 256>>>(
+                                        (float *)gate->ptr, (float *)up->ptr,
+                                        gate_w, up_w, xq, cold_pairs, cold_offsets,
+                                        cold_counts, cold_total, cold_experts, cold_starts,
+                                        gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                        expert_mid_dim, n_expert, cold_pair_capacity + 1u, 0u);
+                                } else if (glm5_grouped) {
                                     moe_gate_up_q4K_cold_tile16_kernel<8u, 288u><<<cold_grid, 256>>>(
                                         (float *)gate->ptr, (float *)up->ptr,
                                         gate_w, up_w, xq, sorted_pairs, sorted_offsets,
@@ -4550,6 +4607,7 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (routed_moe_glm5_grouped_requested() < 0 ||
+        routed_moe_glm5_grouped_cold_requested() < 0 ||
         routed_moe_glm5_cold_lds5_requested() < 0 ||
         routed_moe_glm5_cold_lds5_pad_requested() < 0 ||
         (routed_moe_glm5_cold_lds5_pad_requested() == 1 &&
@@ -4578,6 +4636,11 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
     if (partition && strcmp(partition, "0") != 0 &&
         strcmp(partition, "256") != 0) return 0;
     const bool grouped_requested = routed_moe_glm5_grouped_requested() == 1;
+    const bool cold_requested = routed_moe_glm5_grouped_cold_requested() == 1;
+    if (cold_requested && (!grouped_requested ||
+        routed_moe_q4k_wmma_min_count() != 6u ||
+        routed_moe_glm5_cold_lds5_requested() != 0 ||
+        routed_moe_glm5_cold_lds5_pad_requested() != 0)) return 0;
     if (grouped_requested &&
         (!partition || strcmp(partition, "256") != 0 ||
          n_total_expert != 288u || n_expert != 8u || n_tokens > 1024u)) return 0;
@@ -4676,7 +4739,17 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         selected, weights, n_total_expert, n_expert, clamp, x, NULL, NULL,
         layer_index, n_tokens, false,
         (const char *)gate_w, (const char *)up_w, (const char *)down_w,
-        true, false, false, grouped);
+        true, false, false, grouped, 128u, false, false, grouped && cold_requested);
+    if (rc && grouped && cold_requested) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 Q4_K grouped cold coalescing engaged rows=%u "
+                    "groups=%u gate_threshold=6 down_order=unchanged weights=original\n",
+                    n_tokens, n_tokens / 256u);
+            reported = 1;
+        }
+    }
     if (rc && grouped) {
         static int reported;
         if (!reported) {

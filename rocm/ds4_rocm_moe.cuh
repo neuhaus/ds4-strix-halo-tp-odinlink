@@ -1124,6 +1124,30 @@ __global__ static void moe_glm5_grouped_tile_offsets_kernel(
     *tile_total = sum;
 }
 
+/* Merge only already-cold gate/up routes across M256 domains. Hot buckets
+ * and all down-projection metadata retain their original row positions.
+ * The launcher binds threshold=6 and groups in [2,4], so capacity<=20. */
+__global__ static void moe_glm5_gather_cold_pairs_kernel(
+        uint32_t *cold_counts, uint32_t *cold_offsets, uint32_t *cold_pairs,
+        const uint32_t *counts, const uint32_t *offsets,
+        const uint32_t *pairs, uint32_t groups) {
+    const uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= 288u) return;
+    const uint32_t capacity = groups * 5u;
+    const uint32_t first = expert * capacity;
+    uint32_t count = 0u;
+    for (uint32_t group = 0u; group < groups; ++group) {
+        const uint32_t bucket = group * 288u + expert;
+        const uint32_t n = counts[bucket];
+        if (n >= 6u) continue;
+        for (uint32_t p = 0u; p < n; ++p)
+            cold_pairs[first + count++] = pairs[offsets[bucket] + p];
+    }
+    cold_counts[expert] = count;
+    cold_offsets[expert] = first;
+    if (expert == 287u) cold_offsets[288u] = 288u * capacity;
+}
+
 template <uint32_t PhysicalExperts>
 __device__ __forceinline__ static uint32_t moe_weight_expert(uint32_t bucket) {
     if constexpr (PhysicalExperts != 0u) return bucket % PhysicalExperts;
