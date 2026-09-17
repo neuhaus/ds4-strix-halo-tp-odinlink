@@ -2239,6 +2239,13 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         strcmp(shared_a_selector, "1") == 0;
     if (shared_a_selector && !shared_a &&
         strcmp(shared_a_selector, "0") != 0) return 0;
+    const char *fused_shared_a_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A");
+    const int fused_shared_a = fused_shared_a_selector &&
+        strcmp(fused_shared_a_selector, "1") == 0;
+    if (fused_shared_a_selector && !fused_shared_a &&
+        strcmp(fused_shared_a_selector, "0") != 0) return 0;
+    if (fused_shared_a && shared_a) return 0;
     const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96");
     const bool exact = exact_selector && strcmp(exact_selector,"1") == 0;
     if (n_tok != 1u && exact_selector && !exact && strcmp(exact_selector,"0") != 0)
@@ -2286,6 +2293,11 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
          * original input pointer; no concatenated weight or persistent
          * activation panel is introduced. */
         if (shared_a && coalesced) return 0;
+        if (fused_shared_a && (coalesced || n_tok < 1024u ||
+                               (n_tok % 256u) != 0u ||
+                               in_dim != 4096u || q_out_dim != 4096u ||
+                               low_out_dim != 128u || beta_out_dim != 32u))
+            return 0;
     }
 
     uint64_t input_row_bytes = 0u;
@@ -2456,6 +2468,27 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
                     "QKV=shared activation, skinny=F32 exact "
                     "weights=original cache_bytes=0\n");
             shared_a_reported = 1;
+        }
+    } else if (fused_shared_a) {
+        matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel<<<
+            dim3(q_blocks, ((uint32_t)n_tok + 255u) / 256u),
+            16u * 32u>>>(
+            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+            (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+            (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+            (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+            (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+            (uint32_t)low_out_dim, (uint32_t)beta_out_dim, (uint32_t)n_tok);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM BF16 six fused shared-A launch")) return 0;
+        static int fused_shared_a_reported;
+        if (!fused_shared_a_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 KDA six fused shared-A prefill engaged "
+                    "QKV=shared activation skinny=exact pointers=independent "
+                    "cache_bytes=0\n");
+            fused_shared_a_reported = 1;
         }
     } else {
         const uint32_t total_blocks =

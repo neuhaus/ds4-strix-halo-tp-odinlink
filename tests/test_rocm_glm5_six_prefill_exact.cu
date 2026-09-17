@@ -54,7 +54,9 @@ int main(int argc, char **argv) {
     const bool coalesced = argc == 3 && std::strcmp(argv[2],"--coalesced") == 0;
     const bool m96 = argc == 3 && std::strcmp(argv[2],"--exact-m96") == 0;
     const bool shared_a = argc == 3 && std::strcmp(argv[2],"--shared-a") == 0;
-    REQUIRE(argc != 3 || coalesced || m96 || shared_a);
+    const bool fused_shared_a = argc == 3 &&
+        std::strcmp(argv[2],"--fused-shared-a") == 0;
+    REQUIRE(argc != 3 || coalesced || m96 || shared_a || fused_shared_a);
     const bool compare_modes = coalesced || m96;
     if (m96) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96";
     const char *skinny = argc >= 2 ? argv[1] : "0";
@@ -66,6 +68,8 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
                    shared_a ? "1" : "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                   "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE", "0", 1) == 0);
     if (m96) for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
             "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE", "DS4_ROCM_GLM5_BF16_LT_HILO",
@@ -131,8 +135,19 @@ int main(int argc, char **argv) {
                 candidate[4],candidate[5],gguf.map,gguf.size,
                 local[0],local[1],local[2],local[3],local[4],local[5],
                 4096,q_width,128,widths[5],input,rows); };
+            const bool fused_eligible = fused_shared_a && rank < 2u &&
+                rows >= 1024u;
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                           fused_eligible ? "1" : "0", 1) == 0);
             REQUIRE(setenv(weight_selector,compare_modes ? "1" : "0",1) == 0);
             REQUIRE(launch() == 1);
+            if (fused_eligible) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                               "invalid", 1) == 0);
+                REQUIRE(launch() == 0);
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                               "1", 1) == 0);
+            }
             // No partial tile may reach the exact kernel or alter its output.
             REQUIRE(ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
                 candidate[0],candidate[1],candidate[2],candidate[3],
@@ -221,6 +236,35 @@ int main(int argc, char **argv) {
                 }
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A", "1", 1) == 0);
                 std::printf("timing shared_a layer=%u rank=%u rows=%u baseline_ms=%.6f shared_ms=%.6f speedup=%.4f\n",
+                            layer, rank, rows, elapsed[0], elapsed[1],
+                            elapsed[0] / elapsed[1]);
+                REQUIRE(hipEventDestroy(begin) == hipSuccess);
+                REQUIRE(hipEventDestroy(end) == hipSuccess);
+            }
+            if (fused_eligible && layer == 0u && rank < 2u) {
+                hipEvent_t begin, end;
+                REQUIRE(hipEventCreate(&begin) == hipSuccess);
+                REQUIRE(hipEventCreate(&end) == hipSuccess);
+                float elapsed[2] = {};
+                for (unsigned arm = 0u; arm < 2u; ++arm) {
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                                   arm ? "1" : "0", 1) == 0);
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
+                                   "0", 1) == 0);
+                    REQUIRE(ds4_gpu_synchronize());
+                    REQUIRE(hipEventRecord(begin, nullptr) == hipSuccess);
+                    for (unsigned repeat = 0u; repeat < 5u; ++repeat)
+                        REQUIRE(launch() == 1);
+                    REQUIRE(hipEventRecord(end, nullptr) == hipSuccess);
+                    REQUIRE(hipEventSynchronize(end) == hipSuccess);
+                    REQUIRE(hipEventElapsedTime(&elapsed[arm], begin, end) ==
+                            hipSuccess);
+                    elapsed[arm] /= 5.0f;
+                }
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                               "1", 1) == 0);
+                std::printf("timing fused_shared_a layer=%u rank=%u rows=%u "
+                            "baseline_ms=%.6f fused_ms=%.6f speedup=%.4f\n",
                             layer, rank, rows, elapsed[0], elapsed[1],
                             elapsed[0] / elapsed[1]);
                 REQUIRE(hipEventDestroy(begin) == hipSuccess);
