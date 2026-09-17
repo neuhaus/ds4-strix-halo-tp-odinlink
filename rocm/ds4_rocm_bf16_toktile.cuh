@@ -283,6 +283,7 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
     __shared__ uint16_t a_hi[MTile*KStage], a_lo[MTile*KStage];
     __shared__ uint16_t b_tile[NTile*KStage];
     const uint32_t tid = threadIdx.x, wave = tid >> 5u;
+    const uint32_t wave_m = (wave & 1u)*3u, wave_n = wave >> 1u;
     const uint32_t mbase = blockIdx.y*MTile, nbase = blockIdx.x*NTile;
     if (mbase >= tokens) return;
     using Bf16 = rocwmma::bfloat16_t;
@@ -307,23 +308,23 @@ static void matmul_bf16_f32_wmma_hilo_m96n32k32_kernel(
         __syncthreads();
 #pragma unroll
         for (uint32_t ks=0; ks<KStage; ks+=BK) {
+            FragB b;
+            rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+wave_n*BN*KStage+ks),KStage);
 #pragma unroll
             for (uint32_t t=0; t<3; ++t) {
-                const uint32_t tile=wave+4u*t, mt=tile%6u, nt=tile/6u;
-                FragA high, low;
-                FragB b;
-                rocwmma::load_matrix_sync(high,reinterpret_cast<const Bf16 *>(a_hi+mt*BM*KStage+ks),KStage);
-                rocwmma::load_matrix_sync(low,reinterpret_cast<const Bf16 *>(a_lo+mt*BM*KStage+ks),KStage);
-                rocwmma::load_matrix_sync(b,reinterpret_cast<const Bf16 *>(b_tile+nt*BN*KStage+ks),KStage);
-                rocwmma::mma_sync(acc[t],high,b,acc[t]);
-                rocwmma::mma_sync(acc[t],low,b,acc[t]);
+                const uint32_t mt=wave_m+t;
+                FragA a;
+                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_hi+mt*BM*KStage+ks),KStage);
+                rocwmma::mma_sync(acc[t],a,b,acc[t]);
+                rocwmma::load_matrix_sync(a,reinterpret_cast<const Bf16 *>(a_lo+mt*BM*KStage+ks),KStage);
+                rocwmma::mma_sync(acc[t],a,b,acc[t]);
             }
         }
         __syncthreads();
     }
 #pragma unroll
     for (uint32_t t=0; t<3; ++t) {
-        const uint32_t tile=wave+4u*t, m=mbase+(tile%6u)*BM, n=nbase+(tile/6u)*BN;
+        const uint32_t m=mbase+(wave_m+t)*BM, n=nbase+wave_n*BN;
         if (m < tokens && n < out_dim)
             rocwmma::store_matrix_sync(out+uint64_t(m)*out_dim+n,acc[t],out_dim,rocwmma::mem_row_major);
     }
