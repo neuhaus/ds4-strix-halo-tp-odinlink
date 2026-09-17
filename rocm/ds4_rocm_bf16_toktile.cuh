@@ -740,10 +740,12 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
     }
 }
 
-/* One-launch six-pointer KDA prefill candidate.  It keeps the validated
- * QKV hi/lo WMMA arithmetic and applies the same tile to the two low-rank and
- * beta matrices.  Projection ranges are laid out consecutively in the grid,
- * while every physical GGUF weight remains an independent pointer. */
+/* One-launch six-pointer KDA prefill candidate. QKV keeps hi/lo WMMA;
+ * f_a/g_a/beta retain the incumbent 256-lane F32 chains and butterfly.
+ * Those small recurrent gates must not silently inherit WMMA arithmetic.
+ * Each exact workgroup handles two output rows and reuses each weight over
+ * eight tokens. Its reduction storage aliases the existing WMMA panels.
+ * All physical GGUF weights remain independent, unchanged pointers. */
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -761,8 +763,8 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
     constexpr uint32_t NTilesN = 2u;
     constexpr uint32_t NThreads = MTiles * 32u;
     const uint32_t q_blocks = (q_rows + 31u) / 32u;
-    const uint32_t low_blocks = (low_rows + 31u) / 32u;
-    const uint32_t beta_blocks = (beta_rows + 31u) / 32u;
+    const uint32_t low_blocks = (low_rows + 1u) / 2u;
+    const uint32_t beta_blocks = (beta_rows + 1u) / 2u;
     const uint32_t bx = blockIdx.x;
     uint32_t projection = 0u;
     uint32_t nblock = 0u;
@@ -801,6 +803,52 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
     const uint32_t mbase = blockIdx.y * MTile;
     if (mbase >= tokens) return;
 
+    union alignas(16) Shared {
+        struct {
+            uint16_t a_hi[MTile * BK];
+            uint16_t a_lo[MTile * BK];
+            uint16_t b[NTilesN * BK * BN];
+        } wmma;
+        float exact[8u][NThreads];
+    };
+    static_assert(sizeof(Shared) ==
+                  (2u * MTile * BK + NTilesN * BK * BN) * sizeof(uint16_t),
+                  "exact recurrent gates must not grow the WMMA LDS footprint");
+    __shared__ Shared tile;
+    if (projection >= 3u) {
+        const uint32_t lane = tid & 255u;
+        const uint32_t row = nblock * 2u + (tid >> 8u);
+        for (uint32_t first = 0u; first < MTile; first += 8u) {
+            float sums[8] = {};
+            for (uint32_t k = lane; k < in_dim; k += 256u) {
+                const float w = row < out_dim ? __uint_as_float(
+                    (uint32_t)weight[(uint64_t)row * in_dim + k] << 16u) : 0.0f;
+#pragma unroll
+                for (uint32_t t = 0u; t < 8u; ++t)
+                    sums[t] += w * x[(uint64_t)(mbase + first + t) * in_dim + k];
+            }
+#pragma unroll
+            for (uint32_t t = 0u; t < 8u; ++t) tile.exact[t][tid] = sums[t];
+            __syncthreads();
+            for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+                if (lane < stride) {
+#pragma unroll
+                    for (uint32_t t = 0u; t < 8u; ++t)
+                        tile.exact[t][tid] += tile.exact[t][tid + stride];
+                }
+                __syncthreads();
+            }
+            if (lane == 0u && row < out_dim) {
+#pragma unroll
+                for (uint32_t t = 0u; t < 8u; ++t)
+                    out[(uint64_t)(mbase + first + t) * out_dim + row] =
+                        tile.exact[t][tid];
+            }
+            __syncthreads();
+        }
+        return;
+    }
+
     using Bf16 = rocwmma::bfloat16_t;
     using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
                                      Bf16, rocwmma::row_major>;
@@ -808,9 +856,9 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
                                      Bf16, rocwmma::row_major>;
     using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
                                      float>;
-    __shared__ uint16_t sh_a_hi[MTile * BK];
-    __shared__ uint16_t sh_a_lo[MTile * BK];
-    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    uint16_t *sh_a_hi = tile.wmma.a_hi;
+    uint16_t *sh_a_lo = tile.wmma.a_lo;
+    uint16_t *sh_b = tile.wmma.b;
     FragA a;
     FragB b;
     FragC acc[NTilesN];

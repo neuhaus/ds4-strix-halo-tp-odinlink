@@ -2173,8 +2173,8 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             (uint32_t)low_out_dim, (uint32_t)beta_out_dim);
     } else {
         const uint32_t q_blocks = ((uint32_t)q_out_dim + 31u) / 32u;
-        const uint32_t low_blocks = ((uint32_t)low_out_dim + 31u) / 32u;
-        const uint32_t beta_blocks = ((uint32_t)beta_out_dim + 31u) / 32u;
+        const uint32_t low_blocks = ((uint32_t)low_out_dim + 1u) / 2u;
+        const uint32_t beta_blocks = ((uint32_t)beta_out_dim + 1u) / 2u;
         const uint32_t total_blocks =
             3u * q_blocks + 2u * low_blocks + beta_blocks;
         matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<<<
