@@ -206,6 +206,11 @@ static void refusal_and_failure(ds4_glm5_next_exec_ctx &x) {
     REQUIRE(!ds4_glm5_next_layer_verify(&x,0,&state.s,batch,scalar,input,output,4));
     REQUIRE(state.s.valid && x.tp->calls==before);
     x.tp->capable=true;
+    const unsigned reserved_rank=x.tp_rank;
+    x.tp_rank=x.tp->rank=1u-reserved_rank;
+    REQUIRE(!ds4_glm5_next_layer_verify(&x,0,&state.s,batch,scalar,input,output,4));
+    REQUIRE(state.s.valid && x.tp->calls==before);
+    x.tp_rank=x.tp->rank=reserved_rank;
     for (unsigned fail=1;fail<=2;++fail) {
         x.tp->failed=false;
         REQUIRE(ds4_glm5_next_state_reset(&state.s));

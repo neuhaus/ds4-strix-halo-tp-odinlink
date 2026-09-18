@@ -263,8 +263,19 @@ static int test_replay_allocation_lifecycle(void) {
             CHECK(ds4_glm5_kda_replay_bytes(s) == 393728u &&
                   ds4_glm5_kda_replay_reserve(s, 4, 1) && alloc_calls == 11,
                   "bounded journal reuse does not allocate again");
+            CHECK(ds4_glm5_kda_verify_ready(s, 2, 1) &&
+                  ds4_glm5_kda_verify_ready(s, 4, 1) &&
+                  !ds4_glm5_kda_verify_ready(s, 4, 0) &&
+                  !ds4_glm5_kda_verify_ready(s, 8, 1) &&
+                  !ds4_glm5_kda_verify_ready(s, 3, 1) &&
+                  !ds4_glm5_kda_verify_ready(NULL, 4, 1),
+                  "readiness binds reserved rank and batch capacity");
+            s->pending_tokens = 1;
+            CHECK(!ds4_glm5_kda_verify_ready(s, 4, 1), "pending ordinary work excludes verify");
+            s->pending_tokens = 0;
             ds4_glm5_kda_layer_state foreign = *s;
             CHECK(!ds4_glm5_kda_replay_reserve(&foreign, 4, 1) &&
+                  !ds4_glm5_kda_verify_ready(&foreign, 4, 1) &&
                   !ds4_glm5_kda_verify_finish(&foreign, 0) &&
                   ds4_glm5_kda_replay_bytes(&foreign) == 0,
                   "copied layer cannot borrow journal ownership");

@@ -323,10 +323,17 @@ static int test_mla_replay(void) {
           ds4_glm5_next_mla_replay_reserve(s, 4u) &&
           !ds4_glm5_next_mla_replay_reserve(s, 8u), "fixed bounded reservation");
     const int reserved_allocs = alloc_calls;
+    CHECK(ds4_glm5_next_mla_verify_ready(s, 2u) &&
+          ds4_glm5_next_mla_verify_ready(s, 4u) &&
+          !ds4_glm5_next_mla_verify_ready(s, 8u) &&
+          !ds4_glm5_next_mla_verify_ready(s, 3u) &&
+          !ds4_glm5_next_mla_verify_ready(NULL, 4u), "MLA readiness bounds");
     CHECK(!ds4_glm5_next_mla_verify_begin(s, 8u, &view) && !view &&
           ds4_glm5_next_mla_verify_begin(s, 4u, &view) &&
           view != s && state.pending_mla_verifications == 1u &&
           !ds4_glm5_next_mla_verify_begin(s, 4u, &view), "single pending view");
+    CHECK(!ds4_glm5_next_mla_verify_ready(s, 4u) &&
+          !ds4_glm5_next_mla_verify_ready(view, 4u), "active and borrowed views are not ready");
     CHECK(!ds4_glm5_next_mla_append_commit(s) &&
           !ds4_glm5_next_mla_append_commit(&state.mla[7]) &&
           !ds4_glm5_next_mla_append_commit(view) &&
