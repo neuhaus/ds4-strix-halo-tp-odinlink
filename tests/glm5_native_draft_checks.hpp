@@ -5,6 +5,39 @@
 // independently; singleton attention needs no query/indexer selection.
 static constexpr uint64_t native_row=4096u*4u, native_vocab=154880u*4u;
 
+// Normalize bounded teacher tiles from a large target workspace without
+// reducing the target's prefill batch or allocating another weight copy.
+static void native_hidden_tile_checks(ds4_glm5_next_exec_ctx &x) {
+    Workspace large(1024), scalar(1);
+    Tensor hc(256u*hc_row), output(258u*native_row), reference(native_row);
+    std::vector<float> host(256u*16384u);
+    for(size_t i=0;i<host.size();++i) host[i]=float(int((i*193u+17u)%997u)-498)/501.3f;
+    REQUIRE(ds4_gpu_tensor_write(hc,0,host.data(),host.size()*4));
+    for(unsigned n : {1u,2u,17u,255u,256u}) {
+        REQUIRE(ds4_gpu_tensor_fill_f32(output,-17.0f,258u*4096u));
+        auto *in=ds4_gpu_tensor_view(hc,0,n*hc_row);
+        auto *out=ds4_gpu_tensor_view(output,native_row,n*native_row); REQUIRE(in && out);
+        const unsigned gates=x.tp->calls; const uint64_t sequence=*x.tp_sequence;
+        REQUIRE(ds4_glm5_next_draft_target_hidden_rows(&x,large,in,out,n));
+        REQUIRE(!ds4_glm5_next_draft_target_hidden(&x,large,in,out));
+        REQUIRE(!ds4_glm5_next_draft_target_hidden_rows(&x,large,in,out,0));
+        REQUIRE(!ds4_glm5_next_draft_target_hidden_rows(&x,large,in,out,1025));
+        for(unsigned t=0;t<n;++t) {
+            auto *h=ds4_gpu_tensor_view(hc,t*hc_row,hc_row);
+            auto *got=ds4_gpu_tensor_view(out,t*native_row,native_row); REQUIRE(h && got);
+            REQUIRE(ds4_glm5_next_draft_target_hidden(&x,scalar,h,reference));
+            equal("teacher-hidden-tile-scalar",got,reference,4096);
+            ds4_gpu_tensor_free(h); ds4_gpu_tensor_free(got);
+        }
+        const auto guarded=read(output,258u*4096u);
+        for(unsigned i=0;i<4096;++i) REQUIRE(guarded[i]==-17.0f);
+        for(unsigned i=(n+1)*4096u;i<258u*4096u;++i) REQUIRE(guarded[i]==-17.0f);
+        REQUIRE(x.tp->calls==gates && *x.tp_sequence==sequence);
+        ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out); ++cases;
+        std::printf("NATIVE_HIDDEN_TILE rank=%u workspace=1024 rows=%u scalar_exact=1 guards=1 payload_calls=0\n",x.tp_rank,n);
+    }
+}
+
 static void warm_difference(const char *name,ds4_gpu_tensor *a,ds4_gpu_tensor *b,uint64_t count) {
     auto av=read(a,count),bv=read(b,count);
     double square=0,ref_square=0,max_abs=0; uint64_t different=0;

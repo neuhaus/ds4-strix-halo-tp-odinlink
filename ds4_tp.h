@@ -52,7 +52,21 @@ enum {
     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
     /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
     DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
+    /* 0=disabled, 1/2/3 encode native GLM5 target widths 2/4/8. */
+    DS4_TP_CONFIG_GLM5_NATIVE_SHIFT = 37,
 };
+
+static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
+    if (!value || !value[0] || (value[0] == '0' && !value[1])) return 0u;
+    if (value[1]) return UINT32_MAX;
+    return value[0] == '2' ? 2u : value[0] == '4' ? 4u :
+           value[0] == '8' ? 8u : UINT32_MAX;
+}
+
+static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
+    const uint32_t code = (uint32_t)(config >> DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) & 3u;
+    return code ? 1u << code : 0u;
+}
 
 static inline uint64_t ds4_tp_prefill_config_encode(
         uint32_t min_attn,
@@ -573,7 +587,15 @@ typedef enum {
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_LOGITS_TOP2 = 18,
+    DS4_TP_FRAME_GLM5_NATIVE = 19,
+    DS4_TP_FRAME_GLM5_NATIVE_AGREE = 20,
 } ds4_tp_frame_type;
+
+typedef struct {
+    uint64_t session_id, cycle;
+    uint32_t prefix, rows;
+    int32_t root, eos;
+} ds4_tp_native_cycle;
 
 typedef struct {
     int32_t id[2];
@@ -589,7 +611,24 @@ typedef struct {
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    ds4_tp_native_cycle native;
 } ds4_tp_command;
+
+/* Native control carries IDs/status only; all tensor payloads stay on RDMA.
+ * Phases 0=ready, 1..7=proposal, 8=verified prefix, 9=committed/refreshed.
+ * Both ranks submit matching cycle/phase/count/token arrays and local success.
+ * Any disagreement/failure closes the control direction and poisons the link.
+ * Successful agreement alone never commits or publishes session state. */
+int ds4_tp_send_native_cycle(ds4_tp *tp, const ds4_tp_native_cycle *cycle);
+int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
+                         uint32_t phase, uint32_t accepted,
+                         const uint32_t tokens[8], int local_ok,
+                         char *err, size_t errlen);
+#ifdef DS4_TP_TEST_HOOKS
+/* Socket-only control fixture: no RDMA payload capability is manufactured. */
+ds4_tp *ds4_tp_test_control_create(int fd, int rank);
+void ds4_tp_test_control_destroy(ds4_tp *tp);
+#endif
 
 int ds4_tp_recv_command(
         ds4_tp *tp,

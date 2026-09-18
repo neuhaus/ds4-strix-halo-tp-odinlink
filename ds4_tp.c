@@ -3453,6 +3453,12 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
     return 1;
 }
 
+static int tp_native_cycle_valid(const ds4_tp_native_cycle *c) {
+    return c && c->session_id && c->cycle && c->prefix &&
+        (c->rows == 2u || c->rows == 4u || c->rows == 8u) &&
+        c->prefix <= UINT32_MAX - c->rows && c->root >= 0 && c->eos >= -1;
+}
+
 int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
                         char *err, size_t errlen) {
     memset(command, 0, sizeof(*command));
@@ -3500,6 +3506,12 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         command->value = msg.token;
         break;
     }
+    case DS4_TP_FRAME_GLM5_NATIVE:
+        if (bytes != sizeof(command->native)) { ok = 0; break; }
+        memcpy(&command->native, payload, sizeof(command->native));
+        ok = tp_native_cycle_valid(&command->native);
+        command->session_id = command->native.session_id;
+        break;
     case DS4_TP_FRAME_EVAL_BATCH: {
         ds4_tp_batch_command_header h;
         if (bytes < sizeof(h)) { ok = 0; break; }
@@ -3630,6 +3642,89 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
     return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
                                  drafts, n);
 }
+
+static int tp_native_fail(ds4_tp *tp, char *err, size_t errlen) {
+    ds4_tp_mark_failed(tp);
+    if (tp && tp->control_fd >= 0) shutdown(tp->control_fd, SHUT_RDWR);
+    tp_set_err(err, errlen, "tp: native cycle agreement failed");
+    return 0;
+}
+
+/* One deadline covers the complete phase, including send backpressure. Do not
+ * change shared socket options used by ordinary commands. */
+static int tp_native_io(int fd, void *data, size_t bytes, int writing, double deadline) {
+    size_t done = 0;
+    while (done < bytes) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0) return 0;
+        struct pollfd pfd = { .fd = fd, .events = writing ? POLLOUT : POLLIN };
+        const int ready = poll(&pfd, 1, (int)ceil(remaining * 1000.0));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return 0;
+        int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+        if (writing) flags |= MSG_NOSIGNAL;
+#endif
+        const ssize_t n = writing ? send(fd, (char *)data + done, bytes - done, flags) :
+            recv(fd, (char *)data + done, bytes - done, flags);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n <= 0) return 0;
+        done += (size_t)n;
+    }
+    return 1;
+}
+
+static int tp_native_send(int fd, uint32_t type, const void *payload,
+                          uint32_t bytes, double deadline) {
+    ds4_tp_frame_header header = {DS4_TP_MAGIC, type, bytes};
+    return tp_native_io(fd, &header, sizeof(header), 1, deadline) &&
+        tp_native_io(fd, (void *)payload, bytes, 1, deadline);
+}
+
+int ds4_tp_send_native_cycle(ds4_tp *tp, const ds4_tp_native_cycle *cycle) {
+    if (!tp || ds4_tp_failed(tp) || !tp_native_cycle_valid(cycle) ||
+        !tp_native_send(tp->control_fd, DS4_TP_FRAME_GLM5_NATIVE, cycle,
+                        sizeof(*cycle), tp_now_sec() + 30.0))
+        return tp_native_fail(tp, NULL, 0);
+    return 1;
+}
+
+int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
+                         uint32_t phase, uint32_t accepted,
+                         const uint32_t tokens[8], int local_ok,
+                         char *err, size_t errlen) {
+    struct {
+        ds4_tp_native_cycle cycle;
+        uint32_t phase, accepted, failed, reserved, tokens[8];
+    } mine = {0}, theirs = {0};
+    if (!tp || !tp_native_cycle_valid(cycle) || phase > 9u ||
+        accepted > cycle->rows || !tokens) return tp_native_fail(tp, err, errlen);
+    mine.cycle = *cycle; mine.phase = phase; mine.accepted = accepted;
+    mine.failed = !local_ok || ds4_tp_failed(tp);
+    memcpy(mine.tokens, tokens, sizeof(mine.tokens));
+    /* Symmetric send then read, with bounded failure even on a stalled peer. */
+    const double deadline = tp_now_sec() + 30.0;
+    ds4_tp_frame_header header = {0};
+    if (!tp_native_send(tp->control_fd, DS4_TP_FRAME_GLM5_NATIVE_AGREE, &mine, sizeof(mine), deadline) ||
+        !tp_native_io(tp->control_fd, &header, sizeof(header), 0, deadline) ||
+        header.magic != DS4_TP_MAGIC || header.type != DS4_TP_FRAME_GLM5_NATIVE_AGREE ||
+        header.bytes != sizeof(theirs) ||
+        !tp_native_io(tp->control_fd, &theirs, sizeof(theirs), 0, deadline) ||
+        mine.failed || theirs.failed || memcmp(&mine, &theirs, sizeof(mine)))
+        return tp_native_fail(tp, err, errlen);
+    return 1;
+}
+
+#ifdef DS4_TP_TEST_HOOKS
+ds4_tp *ds4_tp_test_control_create(int fd, int rank) {
+    ds4_tp *tp = calloc(1, sizeof(*tp));
+    if (tp) { tp->control_fd = fd; tp->data_fd = -1; tp->rank = rank; atomic_init(&tp->failed, false); }
+    return tp;
+}
+void ds4_tp_test_control_destroy(ds4_tp *tp) {
+    if (tp) { close(tp->control_fd); free(tp); }
+}
+#endif
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n) {
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
@@ -3875,6 +3970,13 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         } else if (command.type == DS4_TP_FRAME_EVAL) {
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
+                rc = 1;
+            }
+        } else if (command.type == DS4_TP_FRAME_GLM5_NATIVE) {
+            const ds4_tp_native_cycle *c = &command.native;
+            if (ds4_session_tp_glm5_native_cycle(session, c->session_id, c->cycle, c->prefix,
+                    c->root, c->rows, c->eos, err, sizeof(err)) != 0) {
+                ds4_log(stderr, DS4_LOG_ERROR, "tp worker native cycle: %s", err);
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {

@@ -4570,15 +4570,22 @@ static int draft_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
 
 int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_workspace *w, const ds4_gpu_tensor *hc, ds4_gpu_tensor *hidden) {
-    const uint32_t n = w ? w->capacity_tokens : 0u;
-    if (!context_valid(ctx) || !n ||
+    return ds4_glm5_next_draft_target_hidden_rows(ctx, w, hc, hidden,
+        w ? w->capacity_tokens : 0u);
+}
+
+int ds4_glm5_next_draft_target_hidden_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *hc,
+        ds4_gpu_tensor *hidden, uint32_t n) {
+    if (!context_valid(ctx) || !w || !n || n > w->capacity_tokens ||
         ds4_gpu_tensor_bytes(hc) != (uint64_t)n * GLM5_HC_WIDTH * sizeof(float) ||
         ds4_gpu_tensor_bytes(hidden) != (uint64_t)n * GLM5_WIDTH * sizeof(float) ||
         !target_buffers_disjoint((ds4_gpu_tensor *)hc, hidden)) return 0;
     ds4_gpu_tensor *means = ds4_gpu_tensor_view(n == 1u ? w->hc_mean_weights : w->hc_flat,
         0, (uint64_t)n * GLM5_HC * sizeof(float));
-    ds4_gpu_tensor *contracted = n == 1u ? w->output_hidden : w->collapsed;
-    int ok = means && (n == 1u || ds4_gpu_tensor_fill_f32(means,
+    ds4_gpu_tensor *contracted = n == 1u ? w->output_hidden :
+        ds4_gpu_tensor_view(w->collapsed, 0, (uint64_t)n * GLM5_WIDTH * sizeof(float));
+    int ok = means && contracted && (n == 1u || ds4_gpu_tensor_fill_f32(means,
         1.0f / GLM5_HC, (uint64_t)n * GLM5_HC));
     if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(contracted, hc, means,
             GLM5_WIDTH, GLM5_HC) &&
@@ -4588,6 +4595,7 @@ int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_rms_norm_weight_rows_tensor(hidden, contracted,
             ctx->model_map, ctx->model_size, ctx->model->output_norm,
             GLM5_WIDTH, n, ctx->model->rms_norm_eps));
+    if (n != 1u) ds4_gpu_tensor_free(contracted);
     ds4_gpu_tensor_free(means);
     return ok;
 }

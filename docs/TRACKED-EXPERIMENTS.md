@@ -128,3 +128,12 @@ donors `fa09e19` and `519cf21` from the retained September 14 successor; they do
 not merge that track. The adaptation, primary-source references and test scope
 are recorded in the same dossier under `research/native-draft-step-plan-20260918.md`.
 This step alone does not enable session drafting or establish acceptance/speed.
+
+The default-off `DS4_GLM5_NATIVE_DRAFT=2/4/8` session experiment connects native
+drafting, exact target verification and accepted-prefix refresh. Both ranks
+negotiate the width and agree before history publication; failures invalidate
+both states. Socket and controlled-arithmetic tests exercise orchestration,
+including 8K frontiers, but do not establish actual RoCE, 8K model quality,
+representative acceptance or whole-model speed. See the same dossier's
+`research/native-session-plan-91508e1.md` and associated result report. Do not
+enable this experiment for deployment before those checks and advisor review.

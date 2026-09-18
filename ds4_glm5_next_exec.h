@@ -96,6 +96,12 @@ ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create_rows(
 int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_workspace *workspace, const ds4_gpu_tensor *hc_hidden,
         ds4_gpu_tensor *normalized_hidden);
+/* Bounded view of the same conversion, using 1..workspace-capacity rows.
+ * Exact-size input/output tiles let teacher warming stay bounded independently
+ * of the target prefill batch. Allocates view metadata only, no GPU storage. */
+int ds4_glm5_next_draft_target_hidden_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *workspace, const ds4_gpu_tensor *hc_hidden,
+        ds4_gpu_tensor *normalized_hidden, uint32_t rows);
 /* Consume shifted teacher rows into live private KV/index state only. No
  * attention query/output, FFN, vocabulary head, payload exchange or proposal
  * selection. Exact-size normalized predecessor rows and host token IDs.

@@ -534,7 +534,7 @@ int main(int argc,char **argv) {
         const unsigned end_rank=resident?resident_rank+1u:2u;
         if (native) {
             peer.rank=x.tp_rank=resident_rank;
-            if (refresh) native_refresh_checks(x);
+            if (refresh) { native_hidden_tile_checks(x); native_refresh_checks(x); }
             if (warm) native_warm_checks(x);
             if (!refresh) native_draft_checks(x);
         } else if (profile) {

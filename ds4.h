@@ -439,6 +439,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
+/* Explicit worker command for GLM5-next's native draft/target transaction. */
+int ds4_session_tp_glm5_native_cycle(ds4_session *s, uint64_t session_id, uint64_t cycle,
+                                     uint32_t prefix, int root, uint32_t rows,
+                                     int eos, char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

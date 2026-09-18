@@ -768,6 +768,16 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o tests/ds4_g
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
 
+tests/test_tp_native_cycle: tests/test_tp_native_cycle.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_native_cycle.c tests/ds4_tp_hello_test.o $(LDLIBS)
+
+.PHONY: test-tp-native-cycle
+test-tp-native-cycle: tests/test_tp_native_cycle
+	./tests/test_tp_native_cycle
+
+tests/test_glm5_native_session: tests/test_glm5_native_session.c ds4_glm5_native_session.inc tests/ds4_tp_hello_test.o ds4_tp.h ds4.h ds4_glm5_next_exec.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_glm5_native_session.c tests/ds4_tp_hello_test.o $(LDLIBS)
+
 tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 	$(HIPCC) -O2 -o $@ $< -libverbs
 
@@ -1038,7 +1048,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_glm5_kda.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -1107,7 +1117,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -1158,7 +1168,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/ds4_glm5_kda_schedule.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -1498,7 +1508,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -1558,7 +1568,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_glm5_native_session \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
@@ -1568,6 +1578,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello \
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_tp_hello
+	./tests/test_tp_native_cycle
+	./tests/test_glm5_native_session
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
