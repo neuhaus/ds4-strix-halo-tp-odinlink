@@ -3356,12 +3356,18 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             (!w->decode_phase && persist_prefill &&
              strcmp(persist_prefill, "1") == 0);
         if (ok && use_scratch && il < DS4_GLM5_NEXT_LAYER_COUNT) {
+            const char *reuse = getenv("DS4_GLM5_NATIVE_WINDOW_REUSE");
+            const bool reuse_native = native && reuse && strcmp(reuse, "1") == 0;
             if (!w->q4_window_scratch)
                 w->q4_window_scratch =
                     ds4_gpu_q4k_window_cache_create(&config);
-            else
+            else if (!reuse_native)
                 ok = ds4_gpu_q4k_window_cache_rebind(
                     w->q4_window_scratch, &config);
+            /* A native workspace is bound to immutable layer45/model/rank
+             * before entry and its previous consumer has synchronized.
+             * Keep the same eight slots; prepare handles routing changes.
+             * Generic scratch workspaces still rebind across trunk layers. */
             cache = w->q4_window_scratch;
         } else if (ok && persist_this_call &&
             il < DS4_GLM5_NEXT_LAYER_COUNT) {
@@ -4534,6 +4540,8 @@ static int target_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
 }
 
 static int native_draft_settings(void) {
+    const char *reuse = getenv("DS4_GLM5_NATIVE_WINDOW_REUSE");
+    if (reuse && strcmp(reuse, "0") != 0 && strcmp(reuse, "1") != 0) return 0;
     const char *disabled[] = {"DS4_ROCM_GLM5_WINDOW_PERSIST",
         "DS4_ROCM_GLM5_WINDOW_PERSIST_PREFILL", "DS4_ROCM_GLM5_WINDOW_SCRATCH",
         "DS4_ROCM_GLM5_WINDOW_ASYNC", "DS4_ROCM_GLM5_WINDOW_OVERLAP"};

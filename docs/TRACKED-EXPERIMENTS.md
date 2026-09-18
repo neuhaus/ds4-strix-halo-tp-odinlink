@@ -144,3 +144,10 @@ sends, retaining the registered slab and RDMA payload path. The small-payload
 RoCE fixture is `tests/test_tp_bulk_small`; model evidence and protocol review
 are still required. See `research/bulk-receive-ready-plan-3bfefc5.md` in the
 same candidate dossier.
+
+`DS4_GLM5_NATIVE_WINDOW_REUSE=1` separately retains matching original Q4_K
+expert entries in the native workspace's existing eight-slot window. Its
+54MiB capacity is unchanged; generic trunk window rebinding is unaffected.
+This remains default-off, with native owner/model/rank binding and terminal
+consumer synchronization required. The rationale and validation scope are in
+`research/native-window-reuse-plan-48bb294.md` in the same dossier.
