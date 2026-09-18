@@ -242,6 +242,23 @@ static void replay_cases(const Glm5TestGGUF &g) {
         };
         warm(control); warm(candidate);
         const auto before=full_state(candidate);
+        if (accepted==0) {
+            auto *short_input=ds4_gpu_tensor_view(group,0,(uint64_t)m*4096u*4u-4u);
+            auto *short_output=ds4_gpu_tensor_view(output,0,(uint64_t)m*4096u*4u-4u);
+            REQUIRE(short_input && short_output);
+            REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+                short_input,output,m,1.0e-5f));
+            REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+                group,short_output,m,1.0e-5f));
+            REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+                group,output,1,1.0e-5f));
+            auto mixed=weights;
+            mixed.k_type=8;
+            REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&mixed,g.map,g.size,
+                group,output,m,1.0e-5f));
+            REQUIRE(live.valid && !live.pending_tokens && !candidate.slot.pending_verifications);
+            ds4_gpu_tensor_free(short_output); ds4_gpu_tensor_free(short_input);
+        }
         REQUIRE(ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
             group,output,m,1.0e-5f));
         REQUIRE(live.token_count==prefix && live.pending_tokens==m &&
@@ -265,6 +282,11 @@ static void replay_cases(const Glm5TestGGUF &g) {
         for (size_t i=(size_t)m*4096u;i<guarded.size();++i) REQUIRE(guarded[i]==12345.0f);
         warm(control);
         for (unsigned t=0;t<accepted;++t) step(control,prefix+t);
+        // The caller reuses one batch workspace for later layers. Poison all
+        // its projections before commit to prove the owned journal survives.
+        for (auto *scratch : {batch.norm,batch.q,batch.k,batch.v,batch.f_low,
+                              batch.g_low,batch.forget,batch.beta,batch.recurrent_out})
+            REQUIRE(ds4_gpu_tensor_fill_f32(scratch,NAN,ds4_gpu_tensor_bytes(scratch)/4u));
         REQUIRE(ds4_glm5_kda_verify_finish(&live,accepted));
         REQUIRE(live.token_count==prefix+accepted && live.pending_tokens==0 &&
             candidate.slot.pending_verifications==0);
