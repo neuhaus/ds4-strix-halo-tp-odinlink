@@ -447,6 +447,10 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
             unsetenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE")==0);
         std::puts("TARGET_VERIFY invalid shared selector and incompatible paired arithmetic refuse PASS");
     }
+    // Each failure above represents a terminated session. A following case
+    // uses a new logical echo peer; do not carry its poisoned link forward.
+    REQUIRE(!x.tp->handoff_pending);
+    x.tp->failed=false;
 }
 
 static void target_handoff_failure(ds4_glm5_next_exec_ctx &x) {
