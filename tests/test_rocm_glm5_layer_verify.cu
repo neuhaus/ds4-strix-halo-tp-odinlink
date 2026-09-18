@@ -573,8 +573,8 @@ int main(int argc,char **argv) {
     }
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
-        cases,(unsigned long long)compared_values,!native && (target||timing)?1:0,
-        timing||resident_both||native?1:0);
+        cases,(unsigned long long)compared_values,refresh || (!native && (target||timing))?1:0,
+        timing||resident_both||(native&&!refresh)?1:0);
     if (resident) ds4_gpu_q4k_kshard_release();
     ds4_gpu_cleanup();
     return 0;
