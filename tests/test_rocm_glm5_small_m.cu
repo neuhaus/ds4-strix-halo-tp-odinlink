@@ -111,18 +111,21 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_set_model_map(gguf.map,gguf.size));
     uint64_t exact_values = 0;
     for (unsigned layer : {0u,1u,44u}) for (const char *role : {
-            "q","k","v","output","f_a","g_a","beta","f_b","g_b"}) {
+            "q","k","v","output","f_a","g_a","beta","f_b","g_b","head"}) {
         if (baseline && (layer != 0u || (std::strcmp(role,"q") && std::strcmp(role,"output")))) continue;
+        const bool head = std::strcmp(role,"head") == 0;
+        if (head && layer != 0u) continue;
         const bool output = std::strcmp(role,"output") == 0;
         const bool lowrank = std::strcmp(role,"f_b")==0 || std::strcmp(role,"g_b")==0;
         const bool shared = std::strcmp(role,"f_a")==0 || std::strcmp(role,"g_a")==0;
         const bool beta = std::strcmp(role,"beta")==0;
         const uint32_t k = output ? 8192u : lowrank ? 128u : 4096u;
-        const uint32_t n = output ? 2048u : shared ? 128u : beta ? 32u : 4096u;
+        const uint32_t n = head ? 154880u : output ? 2048u : shared ? 128u : beta ? 32u : 4096u;
         char name[80];
-        std::snprintf(name,sizeof(name),"blk.%u.kda_%s.weight",layer,role);
+        if (head) std::snprintf(name,sizeof(name),"output.weight");
+        else std::snprintf(name,sizeof(name),"blk.%u.kda_%s.weight",layer,role);
         uint64_t weight;
-        REQUIRE(gguf.tensor(name,{k,shared ? n : 2u*n},30u,weight));
+        REQUIRE(gguf.tensor(name,{k,shared || head ? n : 2u*n},30u,weight));
         for (unsigned rank=0;rank<2u;++rank) for (unsigned m : {2u,4u,8u}) {
             std::vector<float> host_x((size_t)m*k), ref((size_t)m*n), got(ref.size()+16u);
             for (size_t i=0;i<host_x.size();++i)
@@ -139,7 +142,7 @@ int main(int argc, char **argv) {
                 ys[t]=ds4_gpu_tensor_view(y,(uint64_t)t*n*4u,(uint64_t)n*4u);
                 REQUIRE(xs[t] && ys[t]);
             }
-            const uint64_t offset=weight+(shared ? 0u : (uint64_t)rank*k*n*2u);
+            const uint64_t offset=weight+(shared || head ? 0u : (uint64_t)rank*k*n*2u);
             auto launch=[&](unsigned arm) {
                 if (arm == 0u) {
                     for (unsigned t=0;t<m;++t)
@@ -204,7 +207,7 @@ int main(int argc, char **argv) {
                 }
                 std::puts("PASS unsupported M3/M7 keep incumbent dispatch");
             }
-            if (layer==0u && (output || std::strcmp(role,"q")==0)) {
+            if (layer==0u && (head || output || std::strcmp(role,"q")==0)) {
                 hipEvent_t begin,end;
                 REQUIRE(hipEventCreate(&begin)==hipSuccess && hipEventCreate(&end)==hipSuccess);
                 std::vector<double> times[3];

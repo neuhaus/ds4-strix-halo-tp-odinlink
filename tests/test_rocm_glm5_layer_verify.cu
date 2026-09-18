@@ -373,14 +373,16 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     std::puts("TARGET_VERIFY injected mid-pass exchange failure invalidates whole state PASS");
 }
 
-static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
-    std::printf("TARGET_BUDGET begin rank=%u m=%u simulated_peer=echo\n",x.tp_rank,m);
+static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false) {
+    std::printf("%s begin rank=%u m=%u simulated_peer=echo\n",
+        heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m);
     std::fflush(stdout);
     constexpr uint64_t logit_row=154880u*4u;
     const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
     State serial(*x.model), candidate(*x.model);
     Workspace scalar(1), batch(m);
     Tensor scratch(hc_row), hidden(hc_row), logits(logit_row);
+    Tensor head_candidate(logit_row);
     Tensor prefix_hidden(hc_row), prefix_logits(logit_row);
     Tensor batch_scratch(m*hc_row), batch_hidden(m*hc_row), batch_logits(m*logit_row);
     REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&candidate.s,m));
@@ -393,8 +395,10 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
         for (unsigned t=0;t<3;++t)
             serial_target_reserved(x,state,scalar,991+t,scratch,prefix_hidden,prefix_logits);
         REQUIRE(ds4_gpu_synchronize());
+        if (heads_only)
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD",arm?"1":"0",1)==0);
         const auto start=std::chrono::steady_clock::now();
-        if (arm) {
+        if (arm || heads_only) {
             REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,m,
                 batch_scratch,batch_hidden,batch_logits));
             REQUIRE(ds4_glm5_next_target_verify_finish(&x,&state.s,m));
@@ -403,20 +407,26 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
         REQUIRE(ds4_gpu_synchronize());
         const double ms=std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-start).count();
+        if (heads_only) REQUIRE(ds4_gpu_tensor_copy(arm?head_candidate.p:logits.p,0,
+            batch_logits,(m-1)*logit_row,logit_row));
         if (sample>=4) {
             times[arm].push_back(ms);
-            std::printf("TARGET_BUDGET_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
-                x.tp_rank,m,sample-4,arm?"verify_commit":"serial",ms);
+            std::printf("%s_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
+                heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m,sample-4,
+                arm?"verify_commit":heads_only?"scalar_head_verify":"serial",ms);
             std::fflush(stdout);
         }
     }
     equal_target(serial,candidate);
-    auto *last=ds4_gpu_tensor_view(batch_logits,(m-1)*logit_row,logit_row);
+    auto *last=heads_only?ds4_gpu_tensor_view(head_candidate,0,logit_row):
+        ds4_gpu_tensor_view(batch_logits,(m-1)*logit_row,logit_row);
     REQUIRE(last); equal("timed_final_logits",logits,last,154880); ds4_gpu_tensor_free(last);
     for (auto &v:times) std::sort(v.begin(),v.end());
-    std::printf("TARGET_BUDGET rank=%u m=%u samples=9 serial_median_ms=%.6f "
+    std::printf("%s rank=%u m=%u samples=9 control_median_ms=%.6f "
         "verify_commit_median_ms=%.6f simulated_peer=echo network_test=0 drafting_test=0\n",
-        x.tp_rank,m,times[0][4],times[1][4]); std::fflush(stdout);
+        heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m,times[0][4],times[1][4]);
+    std::fflush(stdout);
+    if (heads_only) REQUIRE(setenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD","1",1)==0);
 }
 
 static void target_profile(ds4_glm5_next_exec_ctx &x) {
@@ -515,6 +525,7 @@ int main(int argc,char **argv) {
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
                 if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
+                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true);
             }
         } else if (smoke) run_case(x,0,4,3,2);
         else {

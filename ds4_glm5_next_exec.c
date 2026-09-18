@@ -4449,6 +4449,33 @@ static int target_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
         v->prefill_config == ds4_tp_prefill_config(ctx->tp);
 }
 
+static int target_output_logits_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                    ds4_glm5_next_workspace *batch_w,
+                                    ds4_glm5_next_workspace *scalar_w,
+                                    const ds4_gpu_tensor *hc_hidden,
+                                    ds4_gpu_tensor *logits, uint32_t tokens) {
+    const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t norm_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    /* Trunk execution has finished. Reuse its collapsed activation scratch;
+     * journals own their replay inputs independently of this workspace.
+     * Collapse and normalization retain scalar dispatch and arithmetic. */
+    for (uint32_t t = 0; t < tokens; ++t) {
+        ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_hidden, t * row, row);
+        ds4_gpu_tensor *norm = ds4_gpu_tensor_view(batch_w->collapsed, t * norm_row, norm_row);
+        const int ok = hidden && norm &&
+            ds4_gpu_hc_weighted_sum_tensor(scalar_w->output_hidden, hidden,
+                scalar_w->hc_mean_weights, GLM5_WIDTH, GLM5_HC) &&
+            ds4_gpu_rms_norm_weight_tensor(norm, scalar_w->output_hidden,
+                ctx->model_map, ctx->model_size, ctx->model->output_norm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps);
+        ds4_gpu_tensor_free(norm);
+        ds4_gpu_tensor_free(hidden);
+        if (!ok) return 0;
+    }
+    return ds4_gpu_matmul_bf16_tensor(logits, ctx->model_map, ctx->model_size,
+        ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, batch_w->collapsed, tokens);
+}
+
 int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_glm5_next_state *state,
                                 ds4_glm5_next_workspace *batch_w,
@@ -4459,6 +4486,9 @@ int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_gpu_tensor *logits_out) {
     const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     const uint64_t logits_row = (uint64_t)GLM5_VOCAB * sizeof(float);
+    const char *head_option = getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
+    if (head_option && strcmp(head_option, "0") != 0 &&
+        strcmp(head_option, "1") != 0) return 0;
     if (!input_tokens || !target_verify_ready(ctx, state, tokens) ||
         !batch_w || !scalar_w || batch_w == scalar_w || !scalar_w->decode_phase ||
         scalar_w->capacity_tokens != 1u || batch_w->capacity_tokens != tokens ||
@@ -4505,7 +4535,11 @@ int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
     }
     const double trunk_sec = profile ? glm5_exec_now_sec() : 0.0;
     /* The 45-layer trunk is odd: final hidden rows are always in hc_out. */
-    for (uint32_t t = 0; ok && t < tokens; ++t) {
+    const bool batch_head = head_option && strcmp(head_option, "1") == 0 &&
+        ctx->model->output_type == 30u;
+    if (ok && batch_head)
+        ok = target_output_logits_rows(ctx, batch_w, scalar_w, hc_out, logits_out, tokens);
+    for (uint32_t t = 0; ok && !batch_head && t < tokens; ++t) {
         ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_out, t * row, row);
         ds4_gpu_tensor *logits = ds4_gpu_tensor_view(logits_out, t * logits_row, logits_row);
         ok = hidden && logits && ds4_glm5_next_output_logits(ctx, scalar_w, hidden, logits);

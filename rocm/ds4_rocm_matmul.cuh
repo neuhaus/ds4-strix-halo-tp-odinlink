@@ -2709,7 +2709,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     if (!wptr) return 0;
     const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 8u) &&
         ((in_dim == 4096u &&
-          (out_dim == 4096u || out_dim == 128u || out_dim == 32u)) ||
+          (out_dim == 4096u || out_dim == 128u || out_dim == 32u ||
+           out_dim == 154880u)) ||
          (in_dim == 128u && out_dim == 4096u) ||
          (in_dim == 8192u && out_dim == 2048u));
     if (small_m_shape) {
@@ -2725,6 +2726,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             // The skinny and low-rank prefill tiles preserve the generic
             // 256-lane batch order, not the one-wave M1 order. Include these
             // KDA gate shapes here so verification also preserves recurrence.
+            // The vocabulary head shares this M1 order and original BF16
+            // pointer; only its output width is larger (still divisible by 8).
 #define DS4_SMALL_M_EXACT(T, K) \
             matmul_bf16_f32_small_m_exact_kernel<T, K><<<out_dim / 8u, 256u>>>( \
                 (float *)out->ptr, (const uint16_t *)wptr, \

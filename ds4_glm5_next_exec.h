@@ -212,7 +212,10 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
  * Any rank failure, disagreement or lost acknowledgement invalidates BOTH
  * sequence states; a local success alone never permits publication.
  * Session history, EOS, drafting and coordinator acceptance are caller work;
- * these APIs alone do not enable speculative session execution. */
+ * these APIs alone do not enable speculative session execution.
+ * DS4_ROCM_GLM5_BF16_VERIFY_HEAD=1 opts into exact batched BF16 vocabulary
+ * projection, reusing batch activation scratch. Other head types stay scalar;
+ * the ordinary single-token output API is unchanged. */
 int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
                                         ds4_glm5_next_state *state,
                                         uint32_t capacity);
