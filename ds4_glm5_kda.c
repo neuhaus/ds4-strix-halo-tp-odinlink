@@ -170,6 +170,15 @@ uint64_t ds4_glm5_kda_replay_bytes(const ds4_glm5_kda_layer_state *s) {
     return s && s->replay && s->replay->owner == s ? s->replay->bytes : 0;
 }
 
+int ds4_glm5_kda_verify_ready(const ds4_glm5_kda_layer_state *s,
+                               uint32_t tokens, uint32_t rank) {
+    return replay_matches(s) && !s->replay->active && !s->pending_tokens &&
+        rank == s->replay->rank &&
+        s->owner_slot->pending_verifications < s->owner_slot->kda_count &&
+        (tokens == 2u || tokens == 4u || tokens == 8u) &&
+        tokens <= s->replay->capacity && s->token_count <= UINT64_MAX - tokens;
+}
+
 int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *s,
                               ds4_glm5_kda_workspace *workspace,
                               const ds4_glm5_kda_weight_offsets *weights,
@@ -177,12 +186,9 @@ int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *s,
                               const ds4_gpu_tensor *input,
                               ds4_gpu_tensor *gated_output,
                               uint32_t tokens, float norm_eps) {
-    if (!replay_matches(s) || s->replay->active || s->pending_tokens ||
-        s->owner_slot->pending_verifications >= s->owner_slot->kda_count ||
+    if (!s || !s->replay || !ds4_glm5_kda_verify_ready(s, tokens, s->replay->rank) ||
         !workspace || !weights || !model_map || !model_size ||
-        (tokens != 2u && tokens != 4u && tokens != 8u) ||
-        tokens > s->replay->capacity || tokens > workspace->capacity_tokens ||
-        s->token_count > UINT64_MAX - tokens || norm_eps != 1.0e-5f ||
+        tokens > workspace->capacity_tokens || norm_eps != 1.0e-5f ||
         ds4_gpu_tensor_bytes(input) < (uint64_t)tokens * 4096u * 4u ||
         ds4_gpu_tensor_bytes(gated_output) < (uint64_t)tokens * 4096u * 4u)
         return 0;

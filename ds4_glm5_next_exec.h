@@ -44,6 +44,10 @@ typedef struct {
     /* Transport-global, monotonically increasing big-gate sequence.  It is
      * deliberately not reset with a model sequence while the TP link lives. */
     uint64_t *tp_sequence;
+    /* Internal verifier phase: every payload uses the registered bulk path.
+     * Scalar decode's auxiliary receive is paired with its latency gate and
+     * cannot service batched verification. Zero preserves ordinary dispatch. */
+    bool force_bulk_gates;
 } ds4_glm5_next_exec_ctx;
 
 /* The default workspace preserves the one-token decode ABI.  Prefill callers
@@ -153,6 +157,31 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         const ds4_gpu_tensor *hc_in,
         ds4_gpu_tensor *hc_out,
         uint32_t n_tokens);
+
+/* Research target verifier. Explicit reservations precede execution; no
+ * journal allocation is performed by layer_verify. Batch only the proven
+ * serial-exact KDA projections/recurrence; other stages retain scalar decode
+ * arithmetic. KDA requires BF16, SMALL_M_EXACT=1 and TP output row sharding.
+ * Success leaves a pending layer with live state unchanged. The all-layer
+ * caller must coordinate one accepted input count, then finish every layer;
+ * on any failed pass invalidate the whole state instead of accepting it.
+ * This interface does not draft tokens or commit session/logit history. */
+int ds4_glm5_next_layer_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
+                                       uint32_t layer,
+                                       ds4_glm5_next_state *state,
+                                       uint32_t capacity);
+int ds4_glm5_next_layer_verify(const ds4_glm5_next_exec_ctx *ctx,
+                               uint32_t layer,
+                               ds4_glm5_next_state *state,
+                               ds4_glm5_next_workspace *batch_workspace,
+                               ds4_glm5_next_workspace *scalar_workspace,
+                               const ds4_gpu_tensor *hc_in,
+                               ds4_gpu_tensor *hc_out,
+                               uint32_t n_tokens);
+int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
+                                      uint32_t layer,
+                                      ds4_glm5_next_state *state,
+                                      uint32_t accepted_inputs);
 
 #ifdef DS4_TP_TEST_HOOKS
 /* Test-only decomposition gate for KDA batch recurrence. It commits exactly

@@ -133,13 +133,19 @@ uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *s) {
     return s && s->replay && s->replay->owner == s ? s->replay->bytes : 0u;
 }
 
-int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *s,
-                                    uint32_t tokens,
-                                    ds4_glm5_next_mla_state **view) {
-    if (!view || !mla_replay_matches(s) || s->replay->active ||
+int ds4_glm5_next_mla_verify_ready(const ds4_glm5_next_mla_state *s,
+                                    uint32_t tokens) {
+    if (!mla_replay_matches(s) || s->replay->active ||
         (tokens != 2u && tokens != 4u && tokens != 8u) ||
         tokens > s->replay->capacity || tokens > s->capacity_tokens - s->token_count ||
         s->owner->pending_mla_verifications >= s->owner->mla_count) return 0;
+    return 1;
+}
+
+int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *s,
+                                    uint32_t tokens,
+                                    ds4_glm5_next_mla_state **view) {
+    if (!view || !ds4_glm5_next_mla_verify_ready(s, tokens)) return 0;
     struct ds4_glm5_next_mla_replay *r = s->replay;
     const uint64_t tail = 4u * DS4_GLM5_NEXT_INDEX_WIDTH * sizeof(float);
     if (!ds4_gpu_tensor_copy(r->key_tail, 0, s->index_tail, 0, tail) ||

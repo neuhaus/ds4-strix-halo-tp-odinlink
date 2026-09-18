@@ -191,6 +191,8 @@ int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
 int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
                                      uint32_t capacity);
 uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *mla);
+int ds4_glm5_next_mla_verify_ready(const ds4_glm5_next_mla_state *mla,
+                                    uint32_t tokens);
 int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *mla,
                                     uint32_t tokens,
                                     ds4_glm5_next_mla_state **view);
