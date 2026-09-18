@@ -136,6 +136,10 @@ int ds4_glm5_kda_replay_reserve(ds4_glm5_kda_layer_state *state,
 uint64_t ds4_glm5_kda_replay_bytes(const ds4_glm5_kda_layer_state *state);
 int ds4_glm5_kda_verify_ready(const ds4_glm5_kda_layer_state *state,
                                uint32_t n_tokens, uint32_t rank);
+/* Nonmutating all-layer commit preflight: require this exact pending pass. */
+int ds4_glm5_kda_verify_pending(const ds4_glm5_kda_layer_state *state,
+                                 uint64_t frontier, uint32_t n_tokens,
+                                 uint32_t rank);
 int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *state,
                               ds4_glm5_kda_workspace *workspace,
                               const ds4_glm5_kda_weight_offsets *weights,

@@ -93,6 +93,24 @@ typedef struct {
 
 struct ds4_glm5_next_state;
 struct ds4_glm5_next_mla_replay;
+struct ds4_tp;
+
+/* Host-only ownership/progress for an explicit full-target transaction.
+ * A nonzero tokens field excludes ordinary execution. All bound resources
+ * must remain alive and immutable until finish or state reset/invalidation. */
+typedef struct {
+    const ds4_glm5_next_model_offsets *model;
+    const void *model_map;
+    uint64_t model_size;
+    struct ds4_tp *tp;
+    ds4_gpu_tensor *tp_slab, *tp_big_out, *tp_big_in;
+    void *tp_big_out_host, *tp_big_in_host;
+    uint64_t *tp_sequence;
+    uint64_t sequence_end, prefill_config, frontier;
+    uint32_t rank, runtime_features, tokens, next_layer;
+    uint32_t input_tokens[8];
+    bool complete;
+} ds4_glm5_next_verification;
 
 typedef struct {
     ds4_gpu_tensor *compact_kv;
@@ -128,6 +146,7 @@ typedef struct ds4_glm5_next_state {
     uint32_t mla_count;
     uint64_t bytes;
     uint32_t pending_mla_verifications;
+    ds4_glm5_next_verification verification;
     bool valid;
 } ds4_glm5_next_state;
 
@@ -193,6 +212,9 @@ int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
 uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *mla);
 int ds4_glm5_next_mla_verify_ready(const ds4_glm5_next_mla_state *mla,
                                     uint32_t tokens);
+/* Nonmutating all-layer commit preflight, including staged-tail completeness. */
+int ds4_glm5_next_mla_verify_pending(const ds4_glm5_next_mla_state *mla,
+                                      uint32_t frontier, uint32_t tokens);
 int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *mla,
                                     uint32_t tokens,
                                     ds4_glm5_next_mla_state **view);

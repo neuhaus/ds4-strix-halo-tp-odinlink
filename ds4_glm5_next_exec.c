@@ -9,6 +9,9 @@
 
 #include "ds4_gpu.h"
 #include "ds4_tp.h"
+#ifdef DS4_ROCM_BUILD
+#include "ds4_gpu_mgpu.h"
+#endif
 
 enum {
     GLM5_WIDTH = 4096,
@@ -4237,7 +4240,8 @@ int ds4_glm5_next_layer_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t il,
                                        ds4_glm5_next_state *state,
                                        uint32_t capacity) {
-    if (!verify_layer_valid(ctx, il, state) || state->kda.pending_verifications ||
+    if (!verify_layer_valid(ctx, il, state) || state->verification.tokens ||
+        state->kda.pending_verifications ||
         state->pending_mla_verifications ||
         (capacity != 2u && capacity != 4u && capacity != 8u)) return 0;
     if (ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA)
@@ -4281,7 +4285,7 @@ static int verify_kda_attention(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
         hc_in, w->hc_split, GLM5_WIDTH, GLM5_HC);
 }
 
-int ds4_glm5_next_layer_verify(const ds4_glm5_next_exec_ctx *ctx,
+static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
                                uint32_t il, ds4_glm5_next_state *state,
                                ds4_glm5_next_workspace *batch_w,
                                ds4_glm5_next_workspace *scalar_w,
@@ -4343,13 +4347,185 @@ int ds4_glm5_next_layer_verify(const ds4_glm5_next_exec_ctx *ctx,
     return ok;
 }
 
+int ds4_glm5_next_layer_verify(const ds4_glm5_next_exec_ctx *ctx,
+                               uint32_t il, ds4_glm5_next_state *state,
+                               ds4_glm5_next_workspace *batch_w,
+                               ds4_glm5_next_workspace *scalar_w,
+                               const ds4_gpu_tensor *hc_in,
+                               ds4_gpu_tensor *hc_out, uint32_t n_tokens) {
+    return state && !state->verification.tokens &&
+        layer_verify_run(ctx, il, state, batch_w, scalar_w, hc_in, hc_out, n_tokens);
+}
+
 int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
                                       uint32_t il, ds4_glm5_next_state *state,
                                       uint32_t accepted_inputs) {
-    if (!verify_layer_valid(ctx, il, state)) return 0;
+    if (!verify_layer_valid(ctx, il, state) || state->verification.tokens) return 0;
     return ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
         ds4_glm5_kda_verify_finish(&state->kda.layer[il], accepted_inputs) :
         ds4_glm5_next_mla_verify_finish(&state->mla[il], accepted_inputs);
+}
+
+static int target_verify_ready(const ds4_glm5_next_exec_ctx *ctx,
+                                 const ds4_glm5_next_state *state,
+                                 uint32_t tokens) {
+    if (!verify_layer_valid(ctx, 0u, state) || state->verification.tokens ||
+        state->kda.pending_verifications || state->pending_mla_verifications ||
+        state->kda.kda_count != 34u || state->mla_count != DS4_GLM5_NEXT_MLA_COUNT ||
+        (tokens != 2u && tokens != 4u && tokens != 8u) || ctx->trace_prefix ||
+        !tp_context_valid_bytes(ctx, (uint64_t)tokens * GLM5_WIDTH * sizeof(float)))
+        return 0;
+    const uint64_t frontier = state->kda.layer[0].token_count;
+    if (frontier > state->context_capacity || tokens > state->context_capacity - frontier)
+        return 0;
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA) {
+            if (state->kda.layer[il].token_count != frontier ||
+                !verify_kda_layout(ctx, il) ||
+                !ds4_glm5_kda_verify_ready(&state->kda.layer[il], tokens, ctx->tp_rank))
+                return 0;
+        } else if (state->mla[il].token_count != frontier ||
+                   !ds4_glm5_next_mla_verify_ready(&state->mla[il], tokens)) return 0;
+    }
+    return 1;
+}
+
+int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
+                                        ds4_glm5_next_state *state,
+                                        uint32_t capacity) {
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il)
+        if (!ds4_glm5_next_layer_verify_reserve(ctx, il, state, capacity)) return 0;
+    return target_verify_ready(ctx, state, capacity);
+}
+
+static int target_buffers_disjoint(ds4_gpu_tensor *a, ds4_gpu_tensor *b) {
+#ifdef DS4_ROCM_BUILD
+    /* The ROCm tensor ABI exposes addresses as host metadata. contents()
+     * synchronizes the device; alias preflight must not add those fences. */
+    const uintptr_t ap = a ? (uintptr_t)a->ptr : 0u;
+    const uintptr_t bp = b ? (uintptr_t)b->ptr : 0u;
+#else
+    const uintptr_t ap = (uintptr_t)ds4_gpu_tensor_contents(a);
+    const uintptr_t bp = (uintptr_t)ds4_gpu_tensor_contents(b);
+#endif
+    if (!ap || !bp) return 0;
+    return ap <= bp ? ds4_gpu_tensor_bytes(a) <= bp - ap :
+                     ds4_gpu_tensor_bytes(b) <= ap - bp;
+}
+
+static int target_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
+                                    const ds4_glm5_next_state *state) {
+    if (!verify_layer_valid(ctx, 0u, state)) return 0;
+    const ds4_glm5_next_verification *v = &state->verification;
+    return v->tokens && v->model == ctx->model && v->model_map == ctx->model_map &&
+        v->model_size == ctx->model_size && v->tp == ctx->tp && v->rank == ctx->tp_rank &&
+        v->tp_slab == ctx->tp_slab && v->tp_big_out == ctx->tp_big_out &&
+        v->tp_big_in == ctx->tp_big_in && v->tp_big_out_host == ctx->tp_big_out_host &&
+        v->tp_big_in_host == ctx->tp_big_in_host && v->tp_sequence == ctx->tp_sequence &&
+        tp_context_valid_bytes(ctx, (uint64_t)v->tokens * GLM5_WIDTH * sizeof(float)) &&
+        v->sequence_end == *ctx->tp_sequence &&
+        v->runtime_features == ds4_tp_runtime_features(ctx->tp) &&
+        v->prefill_config == ds4_tp_prefill_config(ctx->tp);
+}
+
+int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
+                                ds4_glm5_next_state *state,
+                                ds4_glm5_next_workspace *batch_w,
+                                ds4_glm5_next_workspace *scalar_w,
+                                const uint32_t *input_tokens, uint32_t tokens,
+                                ds4_gpu_tensor *hc_scratch,
+                                ds4_gpu_tensor *hc_out,
+                                ds4_gpu_tensor *logits_out) {
+    const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t logits_row = (uint64_t)GLM5_VOCAB * sizeof(float);
+    if (!input_tokens || !target_verify_ready(ctx, state, tokens) ||
+        !batch_w || !scalar_w || batch_w == scalar_w || !scalar_w->decode_phase ||
+        scalar_w->capacity_tokens != 1u || batch_w->capacity_tokens != tokens ||
+        scalar_w->sparse_pool_capacity < state->context_capacity / 4u +
+            (state->context_capacity % 4u != 0u) ||
+        ds4_gpu_tensor_bytes(hc_scratch) != tokens * row ||
+        ds4_gpu_tensor_bytes(hc_out) != tokens * row ||
+        ds4_gpu_tensor_bytes(logits_out) != tokens * logits_row ||
+        !target_buffers_disjoint(hc_scratch, hc_out) ||
+        !target_buffers_disjoint(hc_scratch, logits_out) ||
+        !target_buffers_disjoint(hc_out, logits_out)) return 0;
+    ds4_gpu_tensor *buffers[] = {hc_scratch, hc_out, logits_out};
+    for (uint32_t i = 0; i < 3u; ++i)
+        if (!target_buffers_disjoint(buffers[i], ctx->tp_big_out) ||
+            !target_buffers_disjoint(buffers[i], ctx->tp_big_in) ||
+            (ctx->tp_slab && !target_buffers_disjoint(buffers[i], ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < tokens; ++t) if (input_tokens[t] >= GLM5_VOCAB) return 0;
+    ds4_glm5_next_verification *v = &state->verification;
+    *v = (ds4_glm5_next_verification){
+        .model=ctx->model, .model_map=ctx->model_map, .model_size=ctx->model_size,
+        .tp=ctx->tp, .tp_slab=ctx->tp_slab, .tp_big_out=ctx->tp_big_out,
+        .tp_big_in=ctx->tp_big_in, .tp_big_out_host=ctx->tp_big_out_host,
+        .tp_big_in_host=ctx->tp_big_in_host, .tp_sequence=ctx->tp_sequence,
+        .prefill_config=ds4_tp_prefill_config(ctx->tp),
+        .runtime_features=ds4_tp_runtime_features(ctx->tp), .rank=ctx->tp_rank,
+        .frontier=state->kda.layer[0].token_count, .tokens=tokens,
+    };
+    memcpy(v->input_tokens, input_tokens, tokens * sizeof(*input_tokens));
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < tokens; ++t) {
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_scratch, t * row, row);
+        ok = out && ds4_glm5_next_embed_token(ctx, v->input_tokens[t], out);
+        ds4_gpu_tensor_free(out);
+    }
+    ds4_gpu_tensor *in = hc_scratch, *out = hc_out;
+    for (uint32_t il = 0; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        ok = layer_verify_run(ctx, il, state, batch_w, scalar_w, in, out, tokens);
+        if (ok) v->next_layer = il + 1u;
+        ds4_gpu_tensor *swap = in; in = out; out = swap;
+    }
+    /* The 45-layer trunk is odd: final hidden rows are always in hc_out. */
+    for (uint32_t t = 0; ok && t < tokens; ++t) {
+        ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_out, t * row, row);
+        ds4_gpu_tensor *logits = ds4_gpu_tensor_view(logits_out, t * logits_row, logits_row);
+        ok = hidden && logits && ds4_glm5_next_output_logits(ctx, scalar_w, hidden, logits);
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(hidden);
+    }
+    if (ok) ok = ds4_gpu_synchronize();
+    if (!ok) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    v->sequence_end = *ctx->tp_sequence;
+    v->complete = true;
+    return 1;
+}
+
+int ds4_glm5_next_target_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
+                                       ds4_glm5_next_state *state,
+                                       uint32_t accepted) {
+    if (!target_binding_matches(ctx, state)) return 0;
+    const ds4_glm5_next_verification *v = &state->verification;
+    if (!v->complete || v->next_layer != DS4_GLM5_NEXT_TRUNK_COUNT ||
+        accepted > v->tokens || state->kda.pending_verifications != 34u ||
+        state->pending_mla_verifications != DS4_GLM5_NEXT_MLA_COUNT) return 0;
+    /* Check every journal before a single committed counter or byte changes. */
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const int ready = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
+            ds4_glm5_kda_verify_pending(&state->kda.layer[il], v->frontier, v->tokens, v->rank) :
+            ds4_glm5_next_mla_verify_pending(&state->mla[il], (uint32_t)v->frontier, v->tokens);
+        if (!ready) return 0;
+    }
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const int ok = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
+            ds4_glm5_kda_verify_finish(&state->kda.layer[il], accepted) :
+            ds4_glm5_next_mla_verify_finish(&state->mla[il], accepted);
+        if (!ok) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    memset(&state->verification, 0, sizeof(state->verification));
+    return 1;
 }
 
 int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
@@ -4360,7 +4536,8 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_gpu_tensor *hc_out) {
     const uint64_t hc_bytes = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !w || !hc_in ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out ||
         ds4_gpu_tensor_bytes(hc_in) < hc_bytes ||
         ds4_gpu_tensor_bytes(hc_out) < hc_bytes ||
@@ -4400,7 +4577,8 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
     const uint64_t hc_row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !w || !hc_in ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         (uint64_t)n_tokens > UINT64_MAX / hc_row_bytes ||
@@ -4444,7 +4622,8 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         ds4_gpu_tensor *hc_out,
         uint32_t n_tokens) {
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !batch_w ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !batch_w ||
         !scalar_w || batch_w == scalar_w || !hc_in || !hc_out ||
         hc_in == hc_out || n_tokens == 0u ||
         batch_w->capacity_tokens != n_tokens ||
@@ -4680,7 +4859,8 @@ int ds4_glm5_next_kda_attention_forward_test(
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !w || !hc_in ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens || il >= ctx->model->trunk_count ||
         ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_KDA ||
@@ -4709,7 +4889,8 @@ int ds4_glm5_next_mla_attention_forward_test(
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !w || !hc_in ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         il >= ctx->model->trunk_count ||
@@ -4771,7 +4952,8 @@ int ds4_glm5_next_mla_sparse_attention_forward_test(
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     if (!context_valid(ctx) || !state || !state->valid ||
-        state->pending_mla_verifications || state->kda.pending_verifications || !w || !hc_in ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || w->capacity_tokens != 1u ||
         il >= ctx->model->trunk_count || top_k == 0u ||
         top_k > DS4_GLM5_NEXT_INDEX_TOP_K ||

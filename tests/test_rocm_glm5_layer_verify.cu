@@ -223,9 +223,126 @@ static void refusal_and_failure(ds4_glm5_next_exec_ctx &x) {
     x.tp->failed=false;
 }
 
+static void serial_target(ds4_glm5_next_exec_ctx &x,State &s,Workspace &w,
+                          unsigned token,ds4_gpu_tensor *hidden,ds4_gpu_tensor *logits) {
+    Tensor scratch(hc_row);
+    REQUIRE(ds4_glm5_next_embed_token(&x,token,scratch));
+    ds4_gpu_tensor *in=scratch, *out=hidden;
+    for (unsigned il=0;il<45;++il) {
+        REQUIRE(ds4_glm5_next_layer_forward(&x,il,&s.s,w,in,out));
+        auto *swap=in; in=out; out=swap;
+    }
+    REQUIRE(ds4_glm5_next_output_logits(&x,w,hidden,logits) && ds4_gpu_synchronize());
+}
+
+static void equal_target(State &a,State &b) {
+    for (unsigned il=0;il<45;++il) equal_layer(a,b,il);
+}
+
+static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,unsigned accepted) {
+    std::printf("TARGET_VERIFY begin rank=%u m=%u prefix=%u accepted=%u simulated_peer=echo\n",
+        x.tp_rank,m,prefix,accepted); std::fflush(stdout);
+    constexpr uint64_t logit_row=154880u*4u;
+    const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
+    State base(*x.model), reference(*x.model), candidate(*x.model);
+    Workspace scalar(1), batch(m);
+    Tensor scratch(m*hc_row), got(m*hc_row), logits(m*logit_row);
+    Tensor serial(m*hc_row), serial_logits(m*logit_row);
+    Tensor next_a(hc_row), next_b(hc_row), logit_a(logit_row), logit_b(logit_row);
+    // Match even physically inactive tail entries without changing model data.
+    for (unsigned il=3;il<45;il+=4) {
+        seed_mla(base,il,0); seed_mla(reference,il,0); seed_mla(candidate,il,0);
+    }
+    for (unsigned t=0;t<prefix;++t) {
+        serial_target(x,base,scalar,991+t,next_a,logit_a);
+        serial_target(x,reference,scalar,991+t,next_a,logit_a);
+        serial_target(x,candidate,scalar,991+t,next_a,logit_a);
+    }
+    REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&candidate.s,m));
+    const auto frontier=candidate.s.kda.layer[0].token_count;
+    const auto before=x.tp->calls;
+    uint32_t bad[8]; std::memcpy(bad,tokens,sizeof(bad)); bad[m-1]=154880;
+    REQUIRE(!ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,bad,m,scratch,got,logits));
+    REQUIRE(candidate.s.valid && x.tp->calls==before && !candidate.s.verification.tokens);
+    candidate.s.kda.layer[44].token_count++;
+    REQUIRE(!ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    candidate.s.kda.layer[44].token_count--;
+    REQUIRE(x.tp->calls==before);
+    auto *alias=ds4_gpu_tensor_view(scratch,0,m*hc_row); REQUIRE(alias);
+    REQUIRE(!ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,alias,logits));
+    ds4_gpu_tensor_free(alias);
+    const auto aux_before=x.tp->aux_calls;
+    REQUIRE(ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    REQUIRE(candidate.s.verification.complete && candidate.s.verification.next_layer==45 &&
+        candidate.s.kda.pending_verifications==34 && candidate.s.pending_mla_verifications==11 &&
+        x.tp->aux_calls==aux_before);
+    const auto sequence_after=*x.tp_sequence;
+    REQUIRE(!std::memcmp(candidate.s.verification.input_tokens,tokens,m*4));
+    equal_target(base,candidate);
+    REQUIRE(!ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    REQUIRE(!ds4_glm5_next_layer_verify_finish(&x,0,&candidate.s,accepted));
+    REQUIRE(!ds4_glm5_next_layer_forward(&x,0,&candidate.s,scalar,next_a,next_b));
+    ds4_glm5_next_exec_ctx other=x;
+    auto other_model=*x.model; other.model=&other_model;
+    REQUIRE(!ds4_glm5_next_target_verify_finish(&other,&candidate.s,accepted));
+    other=x; uint64_t other_sequence=*x.tp_sequence; other.tp_sequence=&other_sequence;
+    REQUIRE(!ds4_glm5_next_target_verify_finish(&other,&candidate.s,accepted));
+    other=x; other.tp_rank=1-x.tp_rank;
+    REQUIRE(!ds4_glm5_next_target_verify_finish(&other,&candidate.s,accepted));
+    candidate.s.kda.layer[44].pending_tokens=1;
+    REQUIRE(!ds4_glm5_next_target_verify_finish(&x,&candidate.s,accepted));
+    candidate.s.kda.layer[44].pending_tokens=m;
+    REQUIRE(candidate.s.valid && candidate.s.kda.layer[0].token_count==frontier);
+    REQUIRE(ds4_glm5_next_target_verify_finish(&x,&candidate.s,accepted));
+    REQUIRE(*x.tp_sequence==sequence_after && !candidate.s.verification.tokens);
+    // The simulated transport is shared by these local independent states;
+    // run references only after finish so they cannot interleave a TP pass.
+    for (unsigned t=0;t<m;++t) {
+        auto *h=ds4_gpu_tensor_view(serial,t*hc_row,hc_row);
+        auto *l=ds4_gpu_tensor_view(serial_logits,t*logit_row,logit_row);
+        REQUIRE(h && l); serial_target(x,base,scalar,tokens[t],h,l);
+        ds4_gpu_tensor_free(h); ds4_gpu_tensor_free(l);
+    }
+    equal("target_hidden",serial,got,m*16384u);
+    equal("target_logits",serial_logits,logits,m*154880u);
+    for (unsigned t=0;t<accepted;++t)
+        serial_target(x,reference,scalar,tokens[t],next_a,logit_a);
+    equal_target(reference,candidate);
+    for (unsigned t=0;t<2;++t) {
+        serial_target(x,reference,scalar,789+t,next_a,logit_a);
+        serial_target(x,candidate,scalar,789+t,next_b,logit_b);
+        equal("target_continuation_hidden",next_a,next_b,16384);
+        equal("target_continuation_logits",logit_a,logit_b,154880);
+        equal_target(reference,candidate);
+    }
+    ++cases;
+    std::printf("TARGET_VERIFY rank=%u m=%u prefix=%u accepted=%u PASS\n",
+        x.tp_rank,m,prefix,accepted); std::fflush(stdout);
+}
+
+static void target_failure(ds4_glm5_next_exec_ctx &x) {
+    State state(*x.model);
+    Workspace scalar(1), batch(2);
+    Tensor scratch(2*hc_row), hidden(2*hc_row), logits(2u*154880*4u);
+    const uint32_t tokens[2]={300,1234};
+    REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&state.s,2));
+    // Three exchanges per KDA layer (two attention, one FFN): fail after
+    // several journals have succeeded, including the first MLA layer.
+    x.tp->fail_call=x.tp->calls+20;
+    REQUIRE(!ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,2,scratch,hidden,logits));
+    REQUIRE(!state.s.valid && !state.s.verification.tokens && !state.s.kda.pending_verifications &&
+        !state.s.pending_mla_verifications && !ds4_glm5_next_target_verify_finish(&x,&state.s,0));
+    x.tp->fail_call=0; x.tp->failed=false;
+    REQUIRE(ds4_glm5_next_state_reset(&state.s));
+    std::puts("TARGET_VERIFY injected mid-pass exchange failure invalidates whole state PASS");
+}
+
 int main(int argc,char **argv) {
-    REQUIRE(argc==1 || (argc==2 && std::strcmp(argv[1],"--smoke")==0));
-    const bool smoke=argc==2;
+    const bool target=argc==2 && (!std::strcmp(argv[1],"--target") ||
+        !std::strcmp(argv[1],"--target-smoke"));
+    const bool smoke=argc==2 && (!std::strcmp(argv[1],"--smoke") ||
+        !std::strcmp(argv[1],"--target-smoke"));
+    REQUIRE(argc==1 || target || smoke);
     const char *path=std::getenv("DS4_GLM5_MODEL");
     REQUIRE(path && std::getenv("DS4_RESEARCH_ROOT"));
     setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1);
@@ -242,7 +359,16 @@ int main(int argc,char **argv) {
         x.tp_slab=slab; x.tp_big_out=out; x.tp_big_in=in;
         x.tp_big_out_host=ds4_gpu_tensor_contents(out); x.tp_big_in_host=ds4_gpu_tensor_contents(in);
         x.tp_sequence=&sequence;
-        if (smoke) run_case(x,0,4,3,2);
+        if (target) {
+            for (unsigned rank=0;rank<(smoke?1u:2u);++rank) {
+                peer.rank=x.tp_rank=rank;
+                if (smoke) target_case(x,2,0,1);
+                else for (unsigned m : {2u,4u,8u})
+                    for (unsigned accepted : {0u,m/2u,m})
+                        target_case(x,m,m==2?0u:3u,accepted);
+                target_failure(x);
+            }
+        } else if (smoke) run_case(x,0,4,3,2);
         else {
             for (unsigned rank=0;rank<2;++rank) {
                 peer.rank=x.tp_rank=rank;
@@ -254,10 +380,10 @@ int main(int argc,char **argv) {
                         run_case(x,3,4,prefix,accepted);
             }
         }
-        refusal_and_failure(x);
+        if (!target) refusal_and_failure(x);
     }
-    std::printf("PASS target-layer verification cases=%u compared_float_values=%llu simulated_peer=echo "
-        "network_test=0 full_target_test=0 quality_test=0\n",cases,(unsigned long long)compared_values);
+    std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
+        "network_test=0 full_target_test=%u quality_test=0\n",cases,(unsigned long long)compared_values,target?1:0);
     ds4_gpu_cleanup();
     return 0;
 }

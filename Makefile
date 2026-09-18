@@ -745,6 +745,11 @@ tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm
 tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
 
+# Retain only the production target-commit path; unused GPU executor entry
+# points are discarded so this host failure-injection fixture needs no GPU.
+tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+	$(CC) $(CFLAGS) -DDS4_GLM5_TARGET_COMMIT_TEST -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
+
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
 

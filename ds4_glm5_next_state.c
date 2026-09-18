@@ -194,12 +194,23 @@ int ds4_glm5_next_mla_verify_record(ds4_glm5_next_mla_state *s,
     return 1;
 }
 
+static int mla_commit_ready(const ds4_glm5_next_mla_state *s) {
+    if (!mla_replay_matches(s) || !mla_view_valid(&s->replay->view)) return 0;
+    const struct ds4_glm5_next_mla_replay *r = s->replay;
+    return r->recorded == r->tokens &&
+        r->view.token_count == r->frontier + r->tokens;
+}
+
+int ds4_glm5_next_mla_verify_pending(const ds4_glm5_next_mla_state *s,
+                                      uint32_t frontier, uint32_t tokens) {
+    return mla_commit_ready(s) && s->replay->frontier == frontier &&
+        s->replay->tokens == tokens;
+}
+
 int ds4_glm5_next_mla_verify_finish(ds4_glm5_next_mla_state *s,
                                      uint32_t accepted) {
-    if (!mla_replay_matches(s) || !mla_view_valid(&s->replay->view)) return 0;
+    if (!mla_commit_ready(s) || accepted > s->replay->tokens) return 0;
     struct ds4_glm5_next_mla_replay *r = s->replay;
-    if (accepted > r->tokens || r->recorded != r->tokens ||
-        r->view.token_count != r->frontier + r->tokens) return 0;
     const uint64_t row = DS4_GLM5_NEXT_INDEX_WIDTH * sizeof(float);
     /* Only the last four writes to the ring survive. Unwritten slots retain
      * their committed bytes, including physically inactive tail entries. */
@@ -274,6 +285,7 @@ void ds4_glm5_next_state_invalidate(ds4_glm5_next_state *state) {
     if (!state) return;
     state->valid = false;
     state->pending_mla_verifications = 0u;
+    memset(&state->verification, 0, sizeof(state->verification));
     ds4_glm5_kda_slot_invalidate(&state->kda);
     for (uint32_t il = 0u; il < DS4_GLM5_NEXT_LAYER_COUNT; ++il) {
         mla_replay_discard(&state->mla[il]);
@@ -306,6 +318,7 @@ int ds4_glm5_next_state_reset(ds4_glm5_next_state *state) {
     }
     uint32_t live_mla = 0u;
     state->pending_mla_verifications = 0u;
+    memset(&state->verification, 0, sizeof(state->verification));
     for (uint32_t il = 0u; il < state->layer_count; ++il) {
         ds4_glm5_next_mla_state *mla = &state->mla[il];
         mla_replay_discard(mla);
@@ -397,7 +410,7 @@ int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla) {
 static int state_is_empty(const ds4_glm5_next_state *state) {
     if (!state || state->layer_count || state->context_capacity ||
         state->mla_count || state->bytes || state->valid || state->kda.layer ||
-        state->pending_mla_verifications)
+        state->pending_mla_verifications || state->verification.tokens)
         return 0;
     for (uint32_t il = 0u; il < DS4_GLM5_NEXT_LAYER_COUNT; ++il) {
         if (state->mla[il].compact_kv || state->mla[il].index_pool ||

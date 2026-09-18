@@ -217,13 +217,23 @@ int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *s,
     return 1;
 }
 
+static int replay_commit_ready(const ds4_glm5_kda_layer_state *s) {
+    return replay_matches(s) && s->replay->active &&
+        s->owner_slot->pending_verifications &&
+        s->pending_tokens == s->replay->tokens &&
+        s->token_count == s->replay->frontier;
+}
+
+int ds4_glm5_kda_verify_pending(const ds4_glm5_kda_layer_state *s,
+                                 uint64_t frontier, uint32_t tokens,
+                                 uint32_t rank) {
+    return replay_commit_ready(s) && s->replay->frontier == frontier &&
+        s->replay->tokens == tokens && s->replay->rank == rank;
+}
+
 int ds4_glm5_kda_verify_finish(ds4_glm5_kda_layer_state *s,
                                uint32_t accepted) {
-    if (!replay_matches(s) || !s->replay->active ||
-        !s->owner_slot->pending_verifications ||
-        s->pending_tokens != s->replay->tokens ||
-        s->token_count != s->replay->frontier || accepted > s->replay->tokens)
-        return 0;
+    if (!replay_commit_ready(s) || accepted > s->replay->tokens) return 0;
     if (accepted && !ds4_rocm_glm5_kda_replay_commit(
             s, &s->replay->buffers, accepted, s->replay->rank)) {
         ds4_glm5_kda_layer_abort(s);

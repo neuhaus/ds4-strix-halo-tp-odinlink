@@ -183,6 +183,39 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
                                       ds4_glm5_next_state *state,
                                       uint32_t accepted_inputs);
 
+/* Research full-target transaction. Reserve every trunk journal first;
+ * partial reservation failure retains bounded storage owned/freed by state.
+ * Caller owns exact M-row hidden scratch, hidden output and vocabulary logits
+ * (M=2/4/8), plus distinct scalar/decode and M-row workspaces. No GPU allocation
+ * occurs in the pass. Buffers must not alias each other or workspace/TP storage.
+ * Input IDs are validated before any work; successful verification computes
+ * all 45 layers and every output head, synchronizes, and leaves live state
+ * pending at its original common frontier. The model, settings and transport
+ * resources must stay alive and unchanged through finish. Ordinary calls and
+ * individual layer verification/finish are excluded while active.
+ *
+ * Both ranks must supply the same accepted input count (root + accepted
+ * drafts); the correction/bonus prediction is not yet consumed. Zero discards
+ * a completed pass. Finish validates all journals before committing any;
+ * backend failure invalidates the whole sequence. Reset/invalidation discards
+ * an incomplete pass. Neither operation rewinds transport sequence counters.
+ * Session history, EOS, drafting and coordinator acceptance are caller work;
+ * these APIs alone do not enable speculative session execution. */
+int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
+                                        ds4_glm5_next_state *state,
+                                        uint32_t capacity);
+int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
+                                ds4_glm5_next_state *state,
+                                ds4_glm5_next_workspace *batch_workspace,
+                                ds4_glm5_next_workspace *scalar_workspace,
+                                const uint32_t *input_tokens, uint32_t n_tokens,
+                                ds4_gpu_tensor *hc_scratch,
+                                ds4_gpu_tensor *hc_out,
+                                ds4_gpu_tensor *logits_out);
+int ds4_glm5_next_target_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
+                                       ds4_glm5_next_state *state,
+                                       uint32_t accepted_inputs);
+
 #ifdef DS4_TP_TEST_HOOKS
 /* Test-only decomposition gate for KDA batch recurrence. It commits exactly
  * the KDA attention half and copies the expanded mHC rows to hc_out. */

@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef DS4_GLM5_TARGET_COMMIT_TEST
+#include "ds4_glm5_next_exec.h"
+#include "ds4_tp.h"
+#endif
+
 struct ds4_gpu_tensor {
     uint64_t bytes;
 };
@@ -334,6 +339,8 @@ static int test_mla_replay(void) {
           !ds4_glm5_next_mla_verify_begin(s, 4u, &view), "single pending view");
     CHECK(!ds4_glm5_next_mla_verify_ready(s, 4u) &&
           !ds4_glm5_next_mla_verify_ready(view, 4u), "active and borrowed views are not ready");
+    CHECK(!ds4_glm5_next_mla_verify_pending(s, 0u, 4u),
+          "unstaged pending view cannot commit");
     CHECK(!ds4_glm5_next_mla_append_commit(s) &&
           !ds4_glm5_next_mla_append_commit(&state.mla[7]) &&
           !ds4_glm5_next_mla_append_commit(view) &&
@@ -353,6 +360,11 @@ static int test_mla_replay(void) {
         CHECK(ds4_glm5_next_mla_append_commit(view), "advance private counters");
     CHECK(s->token_count == 0u && !ds4_glm5_next_mla_append_commit(view) &&
           !ds4_glm5_next_mla_verify_finish(s, 5u), "bound speculative frontier");
+    CHECK(ds4_glm5_next_mla_verify_pending(s, 0u, 4u) &&
+          !ds4_glm5_next_mla_verify_pending(s, 1u, 4u) &&
+          !ds4_glm5_next_mla_verify_pending(s, 0u, 2u) &&
+          !ds4_glm5_next_mla_verify_pending(view, 0u, 4u),
+          "commit preflight binds owner, frontier and tokens");
     CHECK(ds4_glm5_next_mla_verify_finish(s, 3u) && s->token_count == 3u &&
           s->tail_count == 3u && !state.pending_mla_verifications &&
           !ds4_glm5_next_mla_append_commit(view) &&
@@ -401,11 +413,145 @@ static int test_mla_replay(void) {
     return 1;
 }
 
+#ifdef DS4_GLM5_TARGET_COMMIT_TEST
+/* Exercise the production all-layer finish with deterministic host backend
+ * failures. This is lifecycle/atomicity evidence, not numerical GPU evidence. */
+struct ds4_tp { uint32_t rank; };
+static int replay_calls, fail_replay_call, fail_sync;
+int ds4_tp_rank(const ds4_tp *p) { return (int)p->rank; }
+bool ds4_tp_is_rdma(const ds4_tp *p) { return p != NULL; }
+bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *p) { return p != NULL; }
+bool ds4_tp_big_gate_is_direct(const ds4_tp *p, const void *a, const void *b, uint64_t n) {
+    return p && a && b && n;
+}
+uint32_t ds4_tp_runtime_features(const ds4_tp *p) { (void)p; return 0; }
+uint64_t ds4_tp_prefill_config(const ds4_tp *p) { (void)p; return 0; }
+int ds4_gpu_synchronize(void) { return !fail_sync; }
+int ds4_rocm_glm5_kda_verify_begin(const ds4_glm5_kda_device_args *a) { return a != NULL; }
+int ds4_rocm_glm5_kda_replay_commit(ds4_glm5_kda_layer_state *s,
+        const ds4_glm5_kda_replay_buffers *b, uint32_t n, uint32_t rank) {
+    (void)s; (void)b; (void)n; (void)rank;
+    return ++replay_calls != fail_replay_call;
+}
+
+static int stage_target(ds4_glm5_next_exec_ctx *ctx, ds4_glm5_next_state *s) {
+    const uint32_t n = 4;
+    ds4_glm5_kda_workspace w = {.capacity_tokens=n};
+    ds4_gpu_tensor input = {.bytes=4u*4096u*4u};
+    for (unsigned il = 0; il < 45; ++il) {
+        const int reserved = il % 4u != 3u ?
+            ds4_glm5_kda_replay_reserve(&s->kda.layer[il], n, ctx->tp_rank) :
+            ds4_glm5_next_mla_replay_reserve(&s->mla[il], n);
+        CHECK(reserved, "reserve all journals before beginning target");
+    }
+    for (unsigned il = 0; il < 45; ++il) {
+        if (il % 4u != 3u) {
+            CHECK(ds4_glm5_kda_verify_begin(&s->kda.layer[il], &w,
+                &ctx->model->layer[il].kda, ctx->model_map, ctx->model_size,
+                &input, &input, n, 1.0e-5f), "stage KDA with backend stub");
+            CHECK(ds4_glm5_kda_verify_pending(&s->kda.layer[il], 0, n, ctx->tp_rank) &&
+                !ds4_glm5_kda_verify_pending(&s->kda.layer[il], 1, n, ctx->tp_rank) &&
+                !ds4_glm5_kda_verify_pending(&s->kda.layer[il], 0, 2, ctx->tp_rank) &&
+                !ds4_glm5_kda_verify_pending(&s->kda.layer[il], 0, n, 1u-ctx->tp_rank),
+                "KDA commit preflight binds rank/frontier/tokens");
+        } else {
+            ds4_glm5_next_mla_state *live = &s->mla[il], *view = NULL;
+            CHECK(ds4_glm5_next_mla_verify_begin(live, n, &view), "stage MLA");
+            CHECK(ds4_glm5_next_mla_verify_record(view, 0, &input, 0, &input, 0, n), "record MLA");
+            for (unsigned t = 0; t < n; ++t)
+                CHECK(ds4_glm5_next_mla_append_commit(view), "advance private MLA view");
+        }
+    }
+    s->verification = (ds4_glm5_next_verification){
+        .model=ctx->model, .model_map=ctx->model_map, .model_size=ctx->model_size,
+        .tp=ctx->tp, .tp_slab=ctx->tp_slab, .tp_big_out=ctx->tp_big_out,
+        .tp_big_in=ctx->tp_big_in, .tp_big_out_host=ctx->tp_big_out_host,
+        .tp_big_in_host=ctx->tp_big_in_host, .tp_sequence=ctx->tp_sequence,
+        .sequence_end=*ctx->tp_sequence, .rank=ctx->tp_rank,
+        .tokens=n, .next_layer=45, .complete=true,
+    };
+    return 1;
+}
+
+static int test_target_commit(void) {
+    reset_fakes();
+    setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT", "1", 1);
+    ds4_glm5_next_model_offsets model;
+    make_valid(&model);
+    ds4_glm5_next_state state = {0};
+    FILE *quiet = fopen("/dev/null", "w");
+    CHECK(quiet && ds4_glm5_next_state_init(&state, &model, 8, quiet), "target state init");
+    ds4_tp peer = {0};
+    ds4_gpu_tensor out = {.bytes=65536}, in = {.bytes=65536};
+    uint64_t sequence = 81;
+    ds4_glm5_next_exec_ctx ctx = {
+        .model=&model, .model_map=&model, .model_size=1, .tp=&peer,
+        .tp_big_out=&out, .tp_big_in=&in, .tp_big_out_host=&out,
+        .tp_big_in_host=&in, .tp_sequence=&sequence,
+    };
+    for (unsigned accepted = 0; accepted <= 4; ++accepted) {
+        CHECK(stage_target(&ctx, &state), "complete pending target");
+        const int copies = copy_calls, commits = replay_calls;
+        state.kda.layer[44].pending_tokens = 2;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted) &&
+              state.valid && copy_calls == copies && replay_calls == commits,
+              "last-layer mismatch prevents every commit");
+        state.kda.layer[44].pending_tokens = 4;
+        state.mla[43].token_count = 1; state.mla[43].tail_count = 1;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted) &&
+              copy_calls == copies && replay_calls == commits, "late MLA mismatch prevents commit");
+        state.mla[43].token_count = state.mla[43].tail_count = 0;
+        state.verification.complete = false;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "incomplete logits refused");
+        state.verification.complete = true;
+        state.verification.next_layer = 44;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "incomplete trunk refused");
+        state.verification.next_layer = 45;
+        ctx.model_size++;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "changed source refused");
+        ctx.model_size--;
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, 5), "accepted bound");
+        CHECK(ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "uniform accepted prefix");
+        CHECK(!state.verification.tokens && !state.kda.pending_verifications &&
+              !state.pending_mla_verifications && sequence == 81, "retire without rewinding transport");
+        for (unsigned il = 0; il < 45; ++il)
+            CHECK((il % 4 == 3 ? state.mla[il].token_count : state.kda.layer[il].token_count) ==
+                  accepted, "every layer consumes the same prefix");
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "duplicate finish refused");
+        CHECK(ds4_glm5_next_state_reset(&state), "reset accepted target");
+    }
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        CHECK(stage_target(&ctx, &state), "stage failing target");
+        if (mode == 0) fail_replay_call = replay_calls + 4; /* after MLA layer 3 */
+        if (mode == 1) fail_copy_call = copy_calls + 1; /* after KDA layers 0..2 */
+        if (mode == 2) fail_sync = 1; /* every launch succeeded */
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, 2) &&
+              !state.valid && !state.kda.valid && !state.verification.tokens &&
+              !state.kda.pending_verifications && !state.pending_mla_verifications,
+              "partial commit or final async failure invalidates entire sequence");
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, 0), "failed state cannot be reused");
+        fail_replay_call = fail_copy_call = fail_sync = 0;
+        CHECK(ds4_glm5_next_state_reset(&state), "reset invalid target");
+    }
+    CHECK(stage_target(&ctx, &state) && ds4_glm5_next_state_reset(&state) &&
+          !state.verification.tokens && !ds4_glm5_next_target_verify_finish(&ctx, &state, 0),
+          "reset cancels pending full target");
+    ds4_glm5_next_state_free(&state);
+    CHECK(free_calls == alloc_calls, "all reserved journals freed");
+    fclose(quiet);
+    fprintf(stderr, "PASS full-target commit preflight and partial-failure atomicity (host stubs)\n");
+    return 1;
+}
+#endif
+
 int main(void) {
     int ok = test_bytes();
     ok &= test_lifecycle();
     ok &= test_partial_failure();
     ok &= test_mla_replay();
+#ifdef DS4_GLM5_TARGET_COMMIT_TEST
+    ok &= test_target_commit();
+#endif
     if (ok) fprintf(stderr, "PASS GLM5-next atomic resident state lifecycle\n");
     return ok ? 0 : 1;
 }
