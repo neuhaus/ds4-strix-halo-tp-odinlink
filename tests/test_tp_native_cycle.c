@@ -217,6 +217,17 @@ static void config_cases(void) {
         ++cases;
     }
     CHECK(ds4_tp_glm5_native_rows(ds4_tp_glm5_native_config(UINT32_MAX)) == UINT32_MAX);
+    for (unsigned width = 0; width < 5; ++width) for (unsigned handoff = 0; handoff < 2; ++handoff) {
+        const uint64_t base_config = ds4_tp_glm5_native_config(widths[width]) |
+            (handoff ? DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF : 0u);
+        const uint64_t with_mla = base_config | DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
+        char error[128];
+        CHECK(ds4_tp_test_hello_validate_prefill_config(with_mla, with_mla, error, sizeof(error)) ==
+            (width != 0 && handoff != 0));
+        CHECK(!ds4_tp_test_hello_validate_prefill_config(base_config, with_mla, error, sizeof(error)));
+        CHECK(!ds4_tp_test_hello_validate_prefill_config(with_mla, base_config, error, sizeof(error)));
+        ++cases;
+    }
     const uint32_t tails[] = {0u, 1u, 2u, 2u, 4u, 4u, 6u, 6u, 6u};
     for (unsigned i = 0; i < 9; ++i) {
         CHECK(ds4_tp_glm5_native_cycle_rows(6u, i) == tails[i]); ++cases;

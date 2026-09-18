@@ -51692,6 +51692,15 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     }
     const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
     const bool use_handoff = handoff && strcmp(handoff, "1") == 0;
+    const char *mla_handoff = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+    const bool use_mla_handoff = mla_handoff && strcmp(mla_handoff, "1") == 0;
+    if ((mla_handoff && strcmp(mla_handoff, "0") && strcmp(mla_handoff, "1")) ||
+        use_mla_handoff != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_handoff_config_valid(ds4_tp_prefill_config(e->tp.ctx))) {
+        fprintf(stderr, "ds4: native MLA FFN handoff requires matching hello, native draft and FFN handoff\n");
+        return 0;
+    }
     const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
     const bool handoff_modes_valid = !use_handoff || ds4_tp_glm5_handoff_modes_valid(
         getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE"),
@@ -54044,6 +54053,9 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
         const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
         if (handoff && strcmp(handoff, "1") == 0)
             config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+        const char *mla_handoff = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+        if (mla_handoff && strcmp(mla_handoff, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
     }
 #endif
     return config;

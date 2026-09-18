@@ -4574,7 +4574,14 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         fprintf(stderr, "ds4: invalid GLM5 shared Q8 verification selector\n");
         return 0;
     }
-    const bool batch_shared = is_kda && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
+    const char *mla_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+    const bool mla_requested = mla_option && strcmp(mla_option, "1") == 0;
+    const uint64_t config = ds4_tp_prefill_config(ctx->tp);
+    if ((mla_option && strcmp(mla_option, "0") && strcmp(mla_option, "1")) ||
+        mla_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_handoff_config_valid(config)) return 0;
+    const bool batch_mla = !is_kda && mla_requested;
+    const bool batch_shared = (is_kda || batch_mla) && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
         shared_option && strcmp(shared_option, "1") == 0;
     const char *handoff_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
     if (handoff_option && strcmp(handoff_option, "0") && strcmp(handoff_option, "1"))
@@ -4609,6 +4616,29 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     ds4_glm5_next_mla_state *mla = NULL;
     int ok = is_kda ? verify_kda_attention(&bulk, il, state, batch_w, hc_in, n_tokens) :
         ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
+    /* Each layer input is already available for every verification row. Its
+     * FFN does not feed the same layer's next attention row. Keep MLA append,
+     * pool selection and attention arithmetic serial, then save the complete
+     * residual before scalar scratch is reused by the next attention/FFN.
+     * These are private replay appends; accepted-prefix publication is still
+     * performed by target_verify_finish, after every layer succeeds. */
+    for (uint32_t t = 0u; ok && batch_mla && t < n_tokens; ++t) {
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * row, row);
+        uint32_t slot = 0u, pool = 0u, visible = 0u;
+        bool publish = false;
+        ok = in && ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
+        const bool dense = ds4_glm5_next_mla_dense_selection_visible(
+            mla->token_count, mla->capacity_tokens, &visible);
+        if (ok) ok = dense ? mla_dense_selection_attention(
+            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish) :
+            mla_sparse_selection_attention(&bulk, il, mla, scalar_w, in,
+                slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
+                bulk.tp_big_out, true, true);
+        if (ok) ok = ds4_gpu_tensor_copy(batch_w->after_attention, t * row,
+                scalar_w->after_attention, 0u, row) &&
+            ds4_glm5_next_mla_append_commit(mla);
+        ds4_gpu_tensor_free(in);
+    }
     if (profile) {
         if (ok) ok = ds4_gpu_synchronize();
         attention_sec += glm5_exec_now_sec() - phase_start;
@@ -4643,10 +4673,11 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
             (uint32_t)frontier, n_tokens, ok);
         if (profile) ffn_sec += glm5_exec_now_sec() - phase_start;
         if (ok) {
-            static int reported[2];
-            if (!reported[ctx->tp_rank]) {
-                fprintf(stderr, "ds4: native KDA FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0\n", ctx->tp_rank);
-                reported[ctx->tp_rank] = 1;
+            static int reported[2][2];
+            if (!reported[ctx->tp_rank][batch_mla]) {
+                fprintf(stderr, "ds4: native %s FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0\n",
+                    batch_mla ? "MLA" : "KDA", ctx->tp_rank);
+                reported[ctx->tp_rank][batch_mla] = 1;
             }
         }
     }

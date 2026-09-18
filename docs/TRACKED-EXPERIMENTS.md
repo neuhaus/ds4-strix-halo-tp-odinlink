@@ -178,3 +178,12 @@ waits also have deadlines and terminate both channels on failure. The optional
 without extra GPU fences. See `research/handoff-plan-927ae0e.md` in the same
 dossier. Echo-peer component fixtures and protocol tests do not establish
 whole-model speed, real RoCE correctness or promotion.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF=1` extends the native shared-Q8/FFN
+schedule to resident MLA trunk layers. It requires the existing handoff and
+shared-Q8 settings, a valid native width, and negotiated bit42. It preserves
+serial causal attention and saves each residual in existing batch scratch
+before the shared projection and one FFN handoff. Prefill, native drafting,
+model bytes and expert-window capacity are unchanged. Selector/configuration
+mismatch refuses. This is default-off Lane A research; the plan and measured
+results belong in `research/mla-ffn-handoff-plan-710f97e.md` in the dossier.

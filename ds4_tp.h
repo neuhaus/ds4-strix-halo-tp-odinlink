@@ -61,6 +61,9 @@ enum {
     /* Width six has its own canonical encoding: legacy width bits must be
      * zero. Bits39/40 already select independent transport behavior. */
     DS4_TP_CONFIG_GLM5_NATIVE_SIX = UINT64_C(1) << 41,
+    /* Extend exact shared-Q8/FFN handoff batching to native MLA verification.
+     * Attention remains causal M1; this changes the order of TP gates. */
+    DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF = UINT64_C(1) << 42,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
@@ -87,6 +90,12 @@ static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
     const uint32_t code = (uint32_t)(config >> DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) & 3u;
     if (config & DS4_TP_CONFIG_GLM5_NATIVE_SIX) return code ? UINT32_MAX : 6u;
     return code ? 1u << code : 0u;
+}
+
+static inline bool ds4_tp_glm5_mla_handoff_config_valid(uint64_t config) {
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) ||
+        (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
 }
 
 /* Three exact workspaces: 2, optionally 4, and configured maximum (6 or 8).
