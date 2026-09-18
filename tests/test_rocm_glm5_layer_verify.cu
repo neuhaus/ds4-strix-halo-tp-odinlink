@@ -386,6 +386,7 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
     Tensor prefix_hidden(hc_row), prefix_logits(logit_row);
     Tensor batch_scratch(m*hc_row), batch_hidden(m*hc_row), batch_logits(m*logit_row);
     REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&candidate.s,m));
+    if (heads_only) REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&serial.s,m));
     for (unsigned il=3;il<45;il+=4) { seed_mla(serial,il,0); seed_mla(candidate,il,0); }
     std::vector<double> times[2];
     for (unsigned sample=0;sample<13;++sample) for (unsigned turn=0;turn<2;++turn) {
