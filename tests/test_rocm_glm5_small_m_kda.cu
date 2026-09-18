@@ -113,6 +113,7 @@ static void time_kda(const Glm5TestGGUF &g,
     // Local warm-weight stage budget, not a target-verifier throughput test.
     for (unsigned rank=0;rank<2;++rank) for (unsigned m : {2u,4u,8u}) {
         HeadState state(rank);
+        REQUIRE(ds4_glm5_kda_replay_reserve(&state.slot.layer[0],m,rank));
         ds4_glm5_kda_workspace scalar = {}, batch = {};
         REQUIRE(ds4_glm5_kda_workspace_init(&scalar,1));
         REQUIRE(ds4_glm5_kda_workspace_init(&batch,m));
@@ -137,28 +138,36 @@ static void time_kda(const Glm5TestGGUF &g,
         };
         hipEvent_t start,end;
         REQUIRE(hipEventCreate(&start)==hipSuccess && hipEventCreate(&end)==hipSuccess);
-        std::vector<double> samples[3];
-        for (unsigned round=0;round<12;++round) for (unsigned j=0;j<3;++j) {
-            const unsigned arm=(round+j)%3u;
-            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm==2?"1":"0",1)==0);
+        // Four warmup rounds give every arm each rotation before the nine
+        // recorded samples. Arm 3 includes journal capture and full commit.
+        std::vector<double> samples[4];
+        for (unsigned round=0;round<13;++round) for (unsigned j=0;j<4;++j) {
+            const unsigned arm=(round+j)%4u;
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm>=2?"1":"0",1)==0);
             REQUIRE(ds4_glm5_kda_slot_reset(&state.slot));
             state.local.token_count=0;
             state.local.pending_tokens=0;
             state.local.valid=true;
             for (unsigned t=0;t<7;++t) run(rows[t],1,scalar);
+            state.slot.layer[0].token_count=state.local.token_count;
             REQUIRE(hipEventRecord(start,nullptr)==hipSuccess);
             if (arm==0) for (unsigned t=0;t<m;++t) run(rows[7+t],1,scalar);
-            else run(group,m,batch);
+            else if (arm<3) run(group,m,batch);
+            else {
+                REQUIRE(ds4_glm5_kda_verify_begin(&state.slot.layer[0],&batch,
+                    &weights,g.map,g.size,group,output,m,1.0e-5f));
+                REQUIRE(ds4_glm5_kda_verify_finish(&state.slot.layer[0],m));
+            }
             REQUIRE(hipEventRecord(end,nullptr)==hipSuccess && hipEventSynchronize(end)==hipSuccess);
             float ms=0;
             REQUIRE(hipEventElapsedTime(&ms,start,end)==hipSuccess && std::isfinite(ms) && ms>0);
-            if (round>=3) {
+            if (round>=4) {
                 samples[arm].push_back(ms);
                 std::printf("SMALL_M_KDA_SAMPLE rank=%u m=%u arm=%u round=%u ms=%.6f\n",
-                    rank,m,arm,round-3,ms);
+                    rank,m,arm,round-4,ms);
             }
         }
-        for (unsigned arm=0;arm<3;++arm) {
+        for (unsigned arm=0;arm<4;++arm) {
             std::sort(samples[arm].begin(),samples[arm].end());
             std::printf("SMALL_M_KDA_MEDIAN rank=%u m=%u arm=%u ms=%.6f\n",
                 rank,m,arm,samples[arm][4]);
