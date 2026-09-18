@@ -171,10 +171,137 @@ static void time_kda(const Glm5TestGGUF &g,
     }
 }
 
+static std::vector<float> full_state(const HeadState &s) {
+    const auto &layer=s.slot.layer[0];
+    std::vector<float> result;
+    for (const auto *t : {layer.q_history,layer.k_history,layer.v_history,layer.recurrent}) {
+        auto values=read(t,ds4_gpu_tensor_bytes(t)/4u);
+        result.insert(result.end(),values.begin(),values.end());
+    }
+    return result;
+}
+
+static void replay_cases(const Glm5TestGGUF &g) {
+    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1)==0);
+    uint64_t values=0;
+    unsigned cases=0;
+    auto exact=[&](const std::vector<float> &a,const std::vector<float> &b) {
+        REQUIRE(a.size()==b.size());
+        REQUIRE(std::memcmp(a.data(),b.data(),a.size()*4u)==0);
+        values+=a.size();
+    };
+    for (unsigned il : {0u,44u}) for (unsigned rank=0;rank<2;++rank)
+    for (unsigned m : {2u,4u,8u}) for (unsigned prefix : {0u,3u,7u})
+    for (unsigned accepted=0;accepted<=m;++accepted) {
+        const auto weights=bind(g,il);
+        HeadState control(rank), candidate(rank);
+        auto &live=candidate.slot.layer[0];
+        REQUIRE(ds4_glm5_kda_replay_bytes(&live)==0);
+        REQUIRE(ds4_glm5_kda_replay_reserve(&live,m,rank));
+        REQUIRE(ds4_glm5_kda_replay_bytes(&live)==(uint64_t)m*(6u*4096u+32u)*4u);
+        REQUIRE(ds4_glm5_kda_replay_reserve(&live,m,rank));
+        REQUIRE(!ds4_glm5_kda_replay_reserve(&live,m,rank^1u));
+        REQUIRE(!ds4_glm5_kda_replay_reserve(&candidate.local,m,rank));
+        std::vector<float> host((prefix+m+2u)*4096u);
+        for (size_t i=0;i<host.size();++i)
+            host[i]=(float)((int)((i*193u+(i/4096u)*761u+il*47u)%997u)-498)/
+                (1001.3f+(float)(i%7u));
+        auto *input=ds4_gpu_tensor_alloc(host.size()*4u);
+        auto *storage=ds4_gpu_tensor_alloc(((uint64_t)m*4096u+16u)*4u);
+        auto *output=ds4_gpu_tensor_view(storage,0,(uint64_t)m*4096u*4u);
+        auto *scalar_output=ds4_gpu_tensor_alloc(4096u*4u);
+        auto *group=ds4_gpu_tensor_view(input,(uint64_t)prefix*4096u*4u,(uint64_t)m*4096u*4u);
+        REQUIRE(input && storage && output && scalar_output && group);
+        REQUIRE(ds4_gpu_tensor_write(input,0,host.data(),host.size()*4u));
+        REQUIRE(ds4_gpu_tensor_fill_f32(storage,12345.0f,(uint64_t)m*4096u+16u));
+        ds4_glm5_kda_workspace scalar = {}, batch = {};
+        REQUIRE(ds4_glm5_kda_workspace_init(&scalar,1));
+        REQUIRE(ds4_glm5_kda_workspace_init(&batch,m));
+        auto step=[&](HeadState &s,unsigned t) {
+            s.local.token_count=s.slot.layer[0].token_count;
+            auto *row=ds4_gpu_tensor_view(input,(uint64_t)t*4096u*4u,4096u*4u);
+            REQUIRE(row && ds4_glm5_kda_layer_begin(&s.local,&scalar,&weights,
+                g.map,g.size,row,scalar_output,1,1.0e-5f,rank*32u,32u));
+            REQUIRE(ds4_glm5_kda_layer_commit(&s.local,1));
+            s.slot.layer[0].token_count=s.local.token_count;
+            ds4_gpu_tensor_free(row);
+        };
+        auto warm=[&](HeadState &s) {
+            REQUIRE(ds4_glm5_kda_slot_reset(&s.slot));
+            s.local.pending_tokens=0; s.local.valid=true;
+            for (unsigned t=0;t<prefix;++t) step(s,t);
+        };
+        warm(control); warm(candidate);
+        const auto before=full_state(candidate);
+        REQUIRE(ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+            group,output,m,1.0e-5f));
+        REQUIRE(live.token_count==prefix && live.pending_tokens==m &&
+            candidate.slot.pending_verifications==1);
+        exact(before,full_state(candidate));
+        REQUIRE(!ds4_glm5_kda_layer_begin(&candidate.local,&scalar,&weights,
+            g.map,g.size,group,scalar_output,1,1.0e-5f,rank*32u,32u));
+        REQUIRE(!ds4_glm5_kda_layer_commit(&live,m));
+        REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+            group,output,m,1.0e-5f));
+        REQUIRE(!ds4_glm5_kda_verify_finish(&live,m+1u));
+        REQUIRE(live.valid && candidate.slot.valid && live.pending_tokens==m);
+        std::vector<float> ordinary;
+        for (unsigned t=0;t<m;++t) {
+            step(control,prefix+t);
+            const auto row=read(scalar_output,4096);
+            ordinary.insert(ordinary.end(),row.begin(),row.end());
+        }
+        exact(ordinary,read(output,(uint64_t)m*4096u));
+        auto guarded=read(storage,(uint64_t)m*4096u+16u);
+        for (size_t i=(size_t)m*4096u;i<guarded.size();++i) REQUIRE(guarded[i]==12345.0f);
+        warm(control);
+        for (unsigned t=0;t<accepted;++t) step(control,prefix+t);
+        REQUIRE(ds4_glm5_kda_verify_finish(&live,accepted));
+        REQUIRE(live.token_count==prefix+accepted && live.pending_tokens==0 &&
+            candidate.slot.pending_verifications==0);
+        exact(full_state(control),full_state(candidate));
+        REQUIRE(!ds4_glm5_kda_verify_finish(&live,accepted));
+        for (unsigned t=0;t<2;++t) {
+            step(control,prefix+m+t);
+            const auto ref=read(scalar_output,4096);
+            step(candidate,prefix+m+t);
+            exact(ref,read(scalar_output,4096));
+        }
+        exact(full_state(control),full_state(candidate));
+        if (accepted==0) {
+            // Reset invalidates a sealed journal while retaining its allocation.
+            REQUIRE(ds4_glm5_kda_verify_begin(&live,&batch,&weights,g.map,g.size,
+                group,output,m,1.0e-5f));
+            REQUIRE(ds4_glm5_kda_slot_reset(&candidate.slot));
+            REQUIRE(!ds4_glm5_kda_verify_finish(&live,1));
+            REQUIRE(live.pending_tokens==0 && candidate.slot.pending_verifications==0);
+            // Failure after recurrence must not have written the live state.
+            const auto reset=full_state(candidate);
+            auto bad=weights;
+            bad.g_b=g.size-4u;
+            REQUIRE(!ds4_glm5_kda_verify_begin(&live,&batch,&bad,g.map,g.size,
+                group,output,m,1.0e-5f));
+            REQUIRE(!candidate.slot.valid && !live.valid && !live.pending_tokens &&
+                !candidate.slot.pending_verifications);
+            exact(reset,full_state(candidate));
+            REQUIRE(!ds4_glm5_kda_layer_begin(&candidate.local,&scalar,&weights,
+                g.map,g.size,group,scalar_output,1,1.0e-5f,rank*32u,32u));
+        }
+        ++cases;
+        std::printf("KDA_REPLAY_CASE layer=%u rank=%u m=%u prefix=%u accepted_inputs=%u exact=1 bytes=%llu\n",
+            il,rank,m,prefix,accepted,(unsigned long long)ds4_glm5_kda_replay_bytes(&live));
+        ds4_glm5_kda_workspace_free(&batch); ds4_glm5_kda_workspace_free(&scalar);
+        ds4_gpu_tensor_free(group); ds4_gpu_tensor_free(scalar_output);
+        ds4_gpu_tensor_free(output); ds4_gpu_tensor_free(storage); ds4_gpu_tensor_free(input);
+    }
+    std::printf("PASS KDA_REPLAY cases=%u exact_values=%llu\n",cases,(unsigned long long)values);
+}
+
 int main(int argc, char **argv) {
     const bool diagnostic=argc==2 && std::strcmp(argv[1],"--diagnostic")==0;
     const bool timing=argc==2 && std::strcmp(argv[1],"--timing")==0;
-    REQUIRE(argc==1 || diagnostic || timing);
+    const bool replay=argc==2 && std::strcmp(argv[1],"--replay")==0;
+    REQUIRE(argc==1 || diagnostic || timing || replay);
     const char *path=std::getenv("DS4_GLM5_MODEL");
     REQUIRE(path);
     Glm5TestGGUF g;
@@ -192,6 +319,7 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_init_multi(&config));
     REQUIRE(ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     REQUIRE(ds4_gpu_set_model_map(g.map,g.size));
+    if (replay) { replay_cases(g); return 0; }
     uint64_t candidate_different=0, candidate_values=0;
     for (unsigned il : {0u,1u,44u}) {
         const auto weights=bind(g,il);

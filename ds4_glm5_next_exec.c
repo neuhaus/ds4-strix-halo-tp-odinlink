@@ -844,6 +844,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
+    if (state->kda.pending_verifications) return 0;
     glm5_phase_trace(ctx, "kda_prefix_enter", il, n_tokens);
     const int prefix_ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
