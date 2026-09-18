@@ -249,6 +249,11 @@ int main(void) {
         2048u, 32u, true, false, true);
     ok &= check_prefill("hello equal-prefill-config",
                         prefill, prefill, 1, NULL);
+    ok &= check_prefill("hello equal-bulk-receive-ready",
+        prefill | DS4_TP_CONFIG_BULK_RECV_READY,
+        prefill | DS4_TP_CONFIG_BULK_RECV_READY, 1, NULL);
+    ok &= check_prefill("hello mismatched-bulk-receive-ready",
+        prefill | DS4_TP_CONFIG_BULK_RECV_READY, prefill, 0, NULL);
     ok &= check_prefill(
         "hello mismatched-prefill-config",
         prefill,

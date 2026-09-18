@@ -137,3 +137,10 @@ including 8K frontiers, but do not establish actual RoCE, 8K model quality,
 representative acceptance or whole-model speed. See the same dossier's
 `research/native-session-plan-91508e1.md` and associated result report. Do not
 enable this experiment for deployment before those checks and advisor review.
+
+`DS4_TP_BULK_RECV_READY=1` is a separate default-off transport experiment.
+It negotiates hello bit39 and confirms both mlx5 receive queues before bulk
+sends, retaining the registered slab and RDMA payload path. The small-payload
+RoCE fixture is `tests/test_tp_bulk_small`; model evidence and protocol review
+are still required. See `research/bulk-receive-ready-plan-3bfefc5.md` in the
+same candidate dossier.

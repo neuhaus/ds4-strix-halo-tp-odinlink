@@ -54000,6 +54000,9 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
             metal_graph_tp_prefill_ffn_wavefront_requested());
     }
 #if defined(DS4_ROCM_BUILD)
+    const char *bulk_recv_ready = getenv("DS4_TP_BULK_RECV_READY");
+    if (bulk_recv_ready && strcmp(bulk_recv_ready, "1") == 0)
+        config |= DS4_TP_CONFIG_BULK_RECV_READY;
     const char *score_batch =
         getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH");
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&

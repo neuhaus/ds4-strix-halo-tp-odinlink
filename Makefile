@@ -846,6 +846,12 @@ tests/test_tp_big_gate_overlap.o: tests/test_tp_big_gate_overlap.cu ds4_tp.h ds4
 tests/test_tp_big_gate_overlap: tests/test_tp_big_gate_overlap.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
 
+tests/test_tp_bulk_small.o: tests/test_tp_bulk_small.cu ds4_tp.h ds4.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_bulk_small: tests/test_tp_bulk_small.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
+
 test-tp-big-gate-overlap: tests/test_tp_big_gate_overlap
 	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
 		echo "error: set TP_ROLE TP_LEADER TP_PORT RDMA_DEVICE RDMA_GID_INDEX" >&2; exit 2; }

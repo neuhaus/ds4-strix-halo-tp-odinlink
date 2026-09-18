@@ -2268,6 +2268,20 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      void *ready_ud) {
     ds4_tp_rdma *r = &tp->rdma;
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    const bool recv_ready =
+        (tp->prefill_config & DS4_TP_CONFIG_BULK_RECV_READY) != 0u;
+    if (recv_ready && !r->is_mlx5) {
+        fprintf(stderr, "ds4-tp: bulk receive-ready requires mlx5\n");
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    if (recv_ready) {
+        static bool reported;
+        if (!reported) {
+            fprintf(stderr, "ds4-tp: bulk receive-ready active provider=mlx5 payload=rdma\n");
+            reported = true;
+        }
+    }
     if ((ready == NULL) != (waves == 0u) ||
         (ready && (wave_bytes == 0u || bytes % wave_bytes != 0u ||
                    bytes / wave_bytes != waves))) {
@@ -2383,6 +2397,25 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             return 0;
         }
         if (g_bg_trace) g_bg_postrecv_s += tp_now_sec() - pr0;
+        if (recv_ready) {
+            /* The outer shape barrier precedes post_recv. A fast rank can
+             * otherwise SEND before its peer posts a receive and pay RC RNR
+             * backoff even for a 16 KiB payload. This negotiated metadata
+             * rendezvous confirms both receive queues before either SEND.
+             * Payloads remain entirely in the existing registered slab. */
+            struct {
+                uint32_t magic, chunks;
+                uint64_t bytes, offset, round_bytes;
+            } mine = {DS4_TP_BATCH_MAGIC, chunks, bytes, off, round_bytes},
+              theirs = {0};
+            if (!tp_write_full(tp->data_fd, &mine, sizeof(mine)) ||
+                !tp_read_full(tp->data_fd, &theirs, sizeof(theirs)) ||
+                memcmp(&mine, &theirs, sizeof(mine))) {
+                fprintf(stderr, "ds4-tp: bulk receive-ready exchange failed\n");
+                ds4_tp_mark_failed(tp);
+                return 0;
+            }
+        }
         atomic_thread_fence(memory_order_release);
         struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
         struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
