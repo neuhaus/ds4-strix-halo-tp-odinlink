@@ -5,6 +5,148 @@
 // independently; singleton attention needs no query/indexer selection.
 static constexpr uint64_t native_row=4096u*4u, native_vocab=154880u*4u;
 
+static void warm_difference(const char *name,ds4_gpu_tensor *a,ds4_gpu_tensor *b,uint64_t count) {
+    auto av=read(a,count),bv=read(b,count);
+    double square=0,ref_square=0,max_abs=0; uint64_t different=0;
+    for(size_t i=0;i<av.size();++i) {
+        const double d=(double)bv[i]-av[i];
+        max_abs=std::max(max_abs,std::fabs(d)); square+=d*d; ref_square+=(double)av[i]*av[i];
+        different+=std::memcmp(&av[i],&bv[i],4)!=0;
+    }
+    std::printf("WARM_DRIFT tensor=%s count=%llu differing=%llu max_abs=%.9g rel_l2=%.9g\n",
+        name,(unsigned long long)count,(unsigned long long)different,max_abs,
+        std::sqrt(square/std::max(ref_square,1e-30)));
+}
+
+static void warm_compare_metadata(State &a,State &b) {
+    auto &x=a.s.mla[45], &y=b.s.mla[45];
+    REQUIRE(x.token_count==y.token_count && x.complete_pools==y.complete_pools &&
+        x.tail_count==y.tail_count && a.s.valid && b.s.valid);
+    for(auto item : {std::make_pair(x.index_pool_ids,y.index_pool_ids),
+                    std::make_pair(x.index_pool_valid,y.index_pool_valid)}) {
+        const uint64_t bytes=(item.first==x.index_pool_ids?16u:4u)*x.complete_pools;
+        std::vector<unsigned char> aa(bytes),bb(bytes);
+        if(bytes) REQUIRE(ds4_gpu_tensor_read(item.first,0,aa.data(),bytes) &&
+            ds4_gpu_tensor_read(item.second,0,bb.data(),bytes));
+        REQUIRE(aa==bb);
+    }
+}
+
+static void warm_case(ds4_glm5_next_exec_ctx &x,unsigned n,unsigned prefix,bool batch) {
+    State ref(*x.model,true), got(*x.model,true);
+    Workspace sw(1,true), ww(batch?n:1,true), hw(n,true), gw(1,true);
+    seed_mla(ref,45,prefix); seed_mla(got,45,prefix);
+    Tensor hc((uint64_t)n*hc_row), input((uint64_t)n*native_row), scalar_hidden(native_row);
+    Tensor h(native_row), gh(native_row), logits(native_vocab), gl(native_vocab);
+    std::vector<float> host((size_t)n*16384u); std::vector<uint32_t> tokens(n);
+    for(unsigned t=0;t<n;++t) {
+        tokens[t]=73+(t*37+prefix)%154000;
+        for(unsigned j=0;j<16384;++j)
+            host[(size_t)t*16384+j]=float(int((j*193+t*317+prefix*17)%997)-498)/501.3f;
+    }
+    REQUIRE(ds4_gpu_tensor_write(hc,0,host.data(),host.size()*4));
+    REQUIRE(ds4_glm5_next_draft_target_hidden(&x,hw,hc,input));
+    for(unsigned t=0;t<n;++t) {
+        auto *hc_view=ds4_gpu_tensor_view(hc,(uint64_t)t*hc_row,hc_row);
+        auto *row=ds4_gpu_tensor_view(input,(uint64_t)t*native_row,native_row);
+        REQUIRE(hc_view && row && ds4_glm5_next_draft_target_hidden(&x,sw,hc_view,scalar_hidden));
+        equal("warm-target-normalization",row,scalar_hidden,4096);
+        if(batch) REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&ref.s,sw,row,&tokens[t],1));
+        else REQUIRE(ds4_glm5_next_draft_step(&x,&ref.s.mla[45],sw,row,tokens[t],h,logits));
+        ds4_gpu_tensor_free(row); ds4_gpu_tensor_free(hc_view);
+    }
+    const unsigned gates=x.tp->calls; const uint64_t seq=*x.tp_sequence;
+    if(batch) REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&got.s,ww,input,tokens.data(),n));
+    else for(unsigned t=0;t<n;++t) {
+        auto *row=ds4_gpu_tensor_view(input,(uint64_t)t*native_row,native_row); REQUIRE(row);
+        REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&got.s,ww,row,&tokens[t],1));
+        ds4_gpu_tensor_free(row);
+    }
+    REQUIRE(x.tp->calls==gates && *x.tp_sequence==seq);
+    warm_compare_metadata(ref,got);
+    std::printf("WARM_CASE rank=%u M=%u prefix=%u mode=%s\n",x.tp_rank,n,prefix,
+        batch?"batch-diagnostic":"scalar-exact");
+    if(batch) {
+        warm_difference("kv",ref.s.mla[45].compact_kv,got.s.mla[45].compact_kv,(uint64_t)(prefix+n)*512);
+        warm_difference("pool",ref.s.mla[45].index_pool,got.s.mla[45].index_pool,ref.s.mla[45].complete_pools*128);
+        warm_difference("key-tail",ref.s.mla[45].index_tail,got.s.mla[45].index_tail,4*128);
+        warm_difference("gate-tail",ref.s.mla[45].pool_gate_tail,got.s.mla[45].pool_gate_tail,4*128);
+    } else equal_layer(ref,got,45);
+    REQUIRE(ds4_glm5_next_draft_step(&x,&ref.s.mla[45],sw,scalar_hidden,113,h,logits));
+    REQUIRE(ds4_glm5_next_draft_step(&x,&got.s.mla[45],gw,scalar_hidden,113,gh,gl));
+    if(batch) {
+        warm_difference("next-hidden",h,gh,4096); warm_difference("next-logits",logits,gl,154880);
+    } else {
+        equal("warm-next-hidden",h,gh,4096); equal("warm-next-logits",logits,gl,154880);
+        equal_layer(ref,got,45);
+    }
+    ++cases; std::fflush(stdout);
+}
+
+static void native_warm_checks(ds4_glm5_next_exec_ctx &x) {
+    for(unsigned prefix : {0u,1u,2u,3u,2047u,2048u,8191u,8192u}) warm_case(x,13,prefix,false);
+    for(unsigned n : {2u,4u,8u,17u,255u,256u}) for(unsigned prefix : {0u,3u,2047u,8192u})
+        warm_case(x,n,prefix,true);
+    // Pool batch publication must retain physical tails, including at aligned
+    // boundaries. Changing this selector does not change projection arithmetic.
+    setenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE","1",1);
+    warm_case(x,4,0,true); warm_case(x,256,8192,true);
+    unsetenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE");
+    State s(*x.model,true); Workspace sw(1,true), bw(256,true);
+    Tensor input(256*native_row); REQUIRE(ds4_gpu_tensor_fill_f32(input,0.0625f,256*4096));
+    std::vector<uint32_t> tokens(256,73);
+    auto *one=ds4_gpu_tensor_view(input,0,native_row); REQUIRE(one);
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&x,&s.s,bw,input,tokens.data(),255));
+    tokens[255]=154880;
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&x,&s.s,bw,input,tokens.data(),256) && !s.s.mla[45].token_count);
+    tokens[255]=73;
+    REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&s.s,sw,one,tokens.data(),1));
+    auto other=x; other.model_size--;
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&other,&s.s,sw,one,tokens.data(),1));
+    REQUIRE(ds4_glm5_next_mla_replay_reserve(&s.s.mla[45],4));
+    ds4_glm5_next_mla_state *view=nullptr;
+    REQUIRE(ds4_glm5_next_mla_verify_begin(&s.s.mla[45],4,&view));
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&x,&s.s,sw,one,tokens.data(),1));
+    REQUIRE(ds4_glm5_next_state_reset(&s.s)); seed_mla(s,45,context-255);
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&x,&s.s,bw,input,tokens.data(),256));
+    // Inject a backend range refusal after KV has been written. Only the
+    // copied test metadata changes; the original model bytes stay untouched.
+    auto broken_model=*x.model; broken_model.layer[45].mla.index_k=x.model_size-1;
+    auto broken_ctx=x; broken_ctx.model=&broken_model;
+    State broken(broken_model,true); Workspace broken_w(1,true);
+    REQUIRE(!ds4_glm5_next_draft_warm_rows(&broken_ctx,&broken.s,broken_w,one,tokens.data(),1) &&
+        !broken.s.valid && !broken.s.mla[45].valid);
+    ds4_gpu_tensor_free(one);
+    // Four warmups + nine alternating scalar/batch samples. All hidden and
+    // token preparation, reset and cache seeding are outside the timed region.
+    State scalar(*x.model,true), batched(*x.model,true);
+    Workspace scalar_w(1,true), batch_w(256,true);
+    std::vector<double> samples[2];
+    for(unsigned iteration=0;iteration<13;++iteration) for(unsigned arm=0;arm<2;++arm) {
+        const unsigned mode=(arm+iteration)%2;
+        State &state=mode?batched:scalar; Workspace &workspace=mode?batch_w:scalar_w;
+        REQUIRE(ds4_glm5_next_state_reset(&state.s)); seed_mla(state,45,8192);
+        REQUIRE(ds4_gpu_synchronize()); const auto begin=std::chrono::steady_clock::now();
+        if(mode) REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&state.s,workspace,input,tokens.data(),256));
+        else for(unsigned t=0;t<256;++t) {
+            auto *row=ds4_gpu_tensor_view(input,(uint64_t)t*native_row,native_row); REQUIRE(row);
+            REQUIRE(ds4_glm5_next_draft_warm_rows(&x,&state.s,workspace,row,&tokens[t],1));
+            ds4_gpu_tensor_free(row);
+        }
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+        if(iteration>=4) {
+            samples[mode].push_back(ms);
+            std::printf("WARM_SAMPLE rank=%u M=256 sample=%u mode=%u ms=%.6f\n",x.tp_rank,iteration-4,mode,ms);
+        }
+    }
+    for(unsigned mode=0;mode<2;++mode) {
+        std::sort(samples[mode].begin(),samples[mode].end());
+        std::printf("WARM_MEDIAN rank=%u M=256 mode=%u ms=%.6f model_prefill_tps=unmeasured\n",
+            x.tp_rank,mode,samples[mode][4]);
+    }
+    std::puts("PASS scalar warm equivalence and batch finite diagnostic; simulated_peer=echo quality_test=0 network_test=0");
+}
+
 static void native_first_row_reference(ds4_glm5_next_exec_ctx &x,
         ds4_gpu_tensor *previous,unsigned token,ds4_gpu_tensor *hidden,ds4_gpu_tensor *logits) {
     const auto &l=x.model->layer[45]; const auto &m=l.mla; const auto &f=l.ffn_weight;

@@ -4542,11 +4542,16 @@ static int native_draft_settings(void) {
     return !slots || strcmp(slots, "8") == 0;
 }
 
-ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create(uint32_t capacity) {
-    if (!native_draft_settings()) return NULL;
-    ds4_glm5_next_workspace *w = ds4_glm5_next_workspace_create_capacity_context(1u, capacity);
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create_rows(
+        uint32_t tokens, uint32_t capacity) {
+    if (!tokens || tokens > 256u || !native_draft_settings()) return NULL;
+    ds4_glm5_next_workspace *w = ds4_glm5_next_workspace_create_capacity_context(tokens, capacity);
     if (w) { w->draft_only = true; ds4_glm5_next_workspace_begin_decode(w); }
     return w;
+}
+
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create(uint32_t capacity) {
+    return ds4_glm5_next_draft_workspace_create_rows(1u, capacity);
 }
 
 static int draft_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
@@ -4565,15 +4570,142 @@ static int draft_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
 
 int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_workspace *w, const ds4_gpu_tensor *hc, ds4_gpu_tensor *hidden) {
-    return context_valid(ctx) && w && w->capacity_tokens == 1u &&
-        ds4_gpu_tensor_bytes(hc) == GLM5_HC_WIDTH * sizeof(float) &&
-        ds4_gpu_tensor_bytes(hidden) == GLM5_WIDTH * sizeof(float) &&
-        target_buffers_disjoint((ds4_gpu_tensor *)hc, hidden) &&
-        ds4_gpu_hc_weighted_sum_tensor(w->output_hidden, hc, w->hc_mean_weights,
+    const uint32_t n = w ? w->capacity_tokens : 0u;
+    if (!context_valid(ctx) || !n ||
+        ds4_gpu_tensor_bytes(hc) != (uint64_t)n * GLM5_HC_WIDTH * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hidden) != (uint64_t)n * GLM5_WIDTH * sizeof(float) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)hc, hidden)) return 0;
+    ds4_gpu_tensor *means = ds4_gpu_tensor_view(n == 1u ? w->hc_mean_weights : w->hc_flat,
+        0, (uint64_t)n * GLM5_HC * sizeof(float));
+    ds4_gpu_tensor *contracted = n == 1u ? w->output_hidden : w->collapsed;
+    int ok = means && (n == 1u || ds4_gpu_tensor_fill_f32(means,
+        1.0f / GLM5_HC, (uint64_t)n * GLM5_HC));
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(contracted, hc, means,
             GLM5_WIDTH, GLM5_HC) &&
-        ds4_gpu_rms_norm_weight_tensor(hidden, w->output_hidden,
+        (n == 1u ? ds4_gpu_rms_norm_weight_tensor(hidden, contracted,
             ctx->model_map, ctx->model_size, ctx->model->output_norm,
-            GLM5_WIDTH, ctx->model->rms_norm_eps);
+            GLM5_WIDTH, ctx->model->rms_norm_eps) :
+        ds4_gpu_rms_norm_weight_rows_tensor(hidden, contracted,
+            ctx->model_map, ctx->model_size, ctx->model->output_norm,
+            GLM5_WIDTH, n, ctx->model->rms_norm_eps));
+    ds4_gpu_tensor_free(means);
+    return ok;
+}
+
+static void draft_bind(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w) {
+    if (w->draft_owner) return;
+    w->draft_owner = owner;
+    w->draft_context = *ctx;
+    w->draft_runtime_features = ds4_tp_runtime_features(ctx->tp);
+    w->draft_prefill_config = ds4_tp_prefill_config(ctx->tp);
+}
+
+/* Only activation tiles are concatenated. M1 keeps the original scalar
+ * primitive calls; M>1 uses ordinary GGUF projection dispatch. */
+static int native_project_inputs(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *previous,
+        const uint32_t *tokens, uint32_t n) {
+    const uint64_t row = GLM5_WIDTH * sizeof(float);
+    ds4_gpu_tensor *concat = ds4_gpu_tensor_view(w->hc_flat, 0, n * 2u * row);
+    ds4_gpu_tensor *enorm = n == 1u ? ds4_gpu_tensor_view(w->hc_flat, 0, row) : NULL;
+    ds4_gpu_tensor *hnorm = n == 1u ? ds4_gpu_tensor_view(w->hc_flat, row, row) : NULL;
+    int ok = concat && (n != 1u || (enorm && hnorm));
+    if (ok && n == 1u) {
+        ok = ctx->model->token_embd_type == 8u ?
+            ds4_gpu_embed_token_q8_0_tensor(w->ffn_collapsed, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, tokens[0], GLM5_WIDTH) :
+            ds4_gpu_embed_token_hc_bf16_tensor(w->ffn_collapsed, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, tokens[0], GLM5_WIDTH, 1u);
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(enorm, w->ffn_collapsed,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_enorm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps) &&
+            ds4_gpu_rms_norm_weight_tensor(hnorm, previous,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_hnorm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps);
+    } else if (ok) {
+        /* Query selection is unused during warming: borrow its existing
+         * integer storage for the small shifted-token tile. */
+        ds4_gpu_tensor *ids = ds4_gpu_tensor_view(w->mla_selected_token, 0, n * 4u);
+        ok = ids && ds4_gpu_tensor_write(ids, 0, tokens, n * 4u);
+        if (ok) ok = ctx->model->token_embd_type == 8u ?
+            ds4_gpu_embed_tokens_q8_0_tensor(w->ffn_collapsed, ids, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, n, GLM5_WIDTH) :
+            ds4_gpu_embed_tokens_hc_bf16_tensor(w->ffn_collapsed, ids, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, n, GLM5_WIDTH, 1u);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(w->ffn_hidden, w->ffn_collapsed,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_enorm,
+                GLM5_WIDTH, n, ctx->model->rms_norm_eps) &&
+            ds4_gpu_rms_norm_weight_rows_tensor(w->down, previous,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_hnorm,
+                GLM5_WIDTH, n, ctx->model->rms_norm_eps);
+        for (uint32_t t = 0; ok && t < n; ++t)
+            ok = ds4_gpu_tensor_copy(concat, 2u * t * row, w->ffn_hidden, t * row, row) &&
+                 ds4_gpu_tensor_copy(concat, (2u * t + 1u) * row, w->down, t * row, row);
+        ds4_gpu_tensor_free(ids);
+    }
+    if (ok) ok = ds4_gpu_matmul_bf16_tensor(w->collapsed, ctx->model_map, ctx->model_size,
+        ctx->model->nextn_eh_proj, 2u * GLM5_WIDTH, GLM5_WIDTH, concat, n);
+    ds4_gpu_tensor_free(hnorm); ds4_gpu_tensor_free(enorm); ds4_gpu_tensor_free(concat);
+    return ok;
+}
+
+int ds4_glm5_next_draft_warm_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *previous, const uint32_t *tokens, uint32_t n) {
+    uint32_t slot = 0, pool = 0;
+    bool publish = false;
+    if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
+        !owner || !owner->draft_only || owner->draft_model != ctx->model ||
+        owner->pending_mla_verifications ||
+        !w || !w->draft_only || !tokens || !n || n > 256u || n != w->capacity_tokens ||
+        !draft_binding_matches(ctx, owner, w) || !native_draft_settings() ||
+        ds4_gpu_tensor_bytes(previous) != (uint64_t)n * GLM5_WIDTH * sizeof(float)) return 0;
+    ds4_glm5_next_mla_state *s = &owner->mla[DS4_GLM5_NEXT_TRUNK_COUNT];
+    if (w->sparse_pool_capacity < s->capacity_pools ||
+        !ds4_glm5_next_mla_append_plan(s, &slot, &pool, &publish) ||
+        n > s->capacity_tokens - s->token_count ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_big_out) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_big_in) ||
+        (ctx->tp_slab && !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < n; ++t) if (tokens[t] >= GLM5_VOCAB) return 0;
+    draft_bind(ctx, owner, w);
+    const uint32_t pos = s->token_count;
+    const ds4_glm5_next_layer_offsets *l = &ctx->model->layer[DS4_GLM5_NEXT_TRUNK_COUNT];
+    const ds4_glm5_next_mla_offsets *m = &l->mla;
+    int ok = native_project_inputs(ctx, w, previous, tokens, n);
+    if (ok) ok = n == 1u ? ds4_gpu_rms_norm_weight_tensor(w->ffn_hidden, w->collapsed,
+        ctx->model_map, ctx->model_size, l->attn_norm, GLM5_WIDTH, ctx->model->rms_norm_eps) :
+        ds4_gpu_rms_norm_weight_rows_tensor(w->ffn_hidden, w->collapsed,
+        ctx->model_map, ctx->model_size, l->attn_norm, GLM5_WIDTH, n, ctx->model->rms_norm_eps);
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(w->mla_kv_raw, ctx->model_map, ctx->model_size,
+            m->kv_a_mqa, GLM5_WIDTH, GLM5_KV_LORA, w->ffn_hidden, n) &&
+        ds4_gpu_glm_kv_lora_rms_norm_tensor(w->mla_kv_norm, w->mla_kv_raw,
+            ctx->model_map, ctx->model_size, m->kv_a_norm, n, GLM5_KV_LORA,
+            GLM5_KV_LORA, ctx->model->rms_norm_eps) &&
+        ds4_gpu_glm_store_compact_kv_tensor(s->compact_kv, NULL, w->mla_kv_norm,
+            w->mla_kv_raw, pos, n, s->capacity_tokens, GLM5_KV_LORA,
+            GLM5_KV_LORA, 0u, false) &&
+        ds4_gpu_matmul_bf16_tensor(w->mla_index_k_raw, ctx->model_map, ctx->model_size,
+            m->index_k, GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n) &&
+        ds4_gpu_glm_store_indexer_k_tensor(w->mla_index_k_norm, w->mla_index_k_raw,
+            ctx->model_map, ctx->model_size, m->index_k_norm, m->index_k_norm_b,
+            0u, n, n, GLM5_INDEX_DIM, 0u, 1u, 1.0e-6f, 1, 1, 0, 1, 0, 0, false) &&
+        ds4_gpu_matmul_bf16_tensor(w->mla_pool_gate_raw, ctx->model_map, ctx->model_size,
+            m->index_pool_gate, GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n) &&
+        mla_stage_index_rows(ctx, m, s, w, pos, n);
+    /* The aligned pooled helper can omit inactive tails. Preserve their
+     * physical scalar bytes too, so future accepted-prefix journals match. */
+    const uint64_t index_row = GLM5_INDEX_DIM * sizeof(float);
+    for (uint32_t t = n > 4u ? n - 4u : 0u; ok && t < n; ++t)
+        ok = ds4_gpu_tensor_copy(s->index_tail, ((pos + t) % 4u) * index_row,
+                w->mla_index_k_norm, t * index_row, index_row) &&
+             ds4_gpu_tensor_copy(s->pool_gate_tail, ((pos + t) % 4u) * index_row,
+                w->mla_pool_gate_raw, t * index_row, index_row);
+    if (ok) ok = ds4_gpu_synchronize();
+    for (uint32_t t = 0; ok && t < n; ++t) ok = ds4_glm5_next_mla_append_commit(s);
+    if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(owner); }
+    return ok;
 }
 
 int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
@@ -4611,30 +4743,8 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
      * Never allow a private draft to run across that ownership change. */
     for (unsigned trunk = 3; trunk < DS4_GLM5_NEXT_TRUNK_COUNT; ++trunk)
         if (local_q4k_half_residency(ctx, &ctx->model->layer[trunk]) != 1) return 0;
-    if (!w->draft_owner) {
-        w->draft_owner = s->owner;
-        w->draft_context = *ctx;
-        w->draft_runtime_features = ds4_tp_runtime_features(ctx->tp);
-        w->draft_prefill_config = ds4_tp_prefill_config(ctx->tp);
-    }
-    const uint64_t row = GLM5_WIDTH * sizeof(float);
-    ds4_gpu_tensor *concat = ds4_gpu_tensor_view(w->hc_flat, 0, 2u * row);
-    ds4_gpu_tensor *enorm = ds4_gpu_tensor_view(w->hc_flat, 0, row);
-    ds4_gpu_tensor *hnorm = ds4_gpu_tensor_view(w->hc_flat, row, row);
-    int ok = concat && enorm && hnorm;
-    if (ok) ok = ctx->model->token_embd_type == 8u ?
-        ds4_gpu_embed_token_q8_0_tensor(w->ffn_collapsed, ctx->model_map,
-            ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, token, GLM5_WIDTH) :
-        ds4_gpu_embed_token_hc_bf16_tensor(w->ffn_collapsed, ctx->model_map,
-            ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, token, GLM5_WIDTH, 1u);
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(enorm, w->ffn_collapsed,
-            ctx->model_map, ctx->model_size, ctx->model->nextn_enorm,
-            GLM5_WIDTH, ctx->model->rms_norm_eps) &&
-        ds4_gpu_rms_norm_weight_tensor(hnorm, previous,
-            ctx->model_map, ctx->model_size, ctx->model->nextn_hnorm,
-            GLM5_WIDTH, ctx->model->rms_norm_eps) &&
-        ds4_gpu_matmul_bf16_tensor(w->collapsed, ctx->model_map, ctx->model_size,
-            ctx->model->nextn_eh_proj, 2u * GLM5_WIDTH, GLM5_WIDTH, concat, 1u);
+    draft_bind(ctx, s->owner, w);
+    int ok = native_project_inputs(ctx, w, previous, &token, 1u);
     ds4_glm5_next_exec_ctx bulk = *ctx;
     bulk.force_bulk_gates = true;
     const uint32_t pos = s->token_count;
@@ -4652,7 +4762,6 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_matmul_bf16_tensor(logits, ctx->model_map, ctx->model_size,
             ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, hidden, 1u);
     if (ok) ok = ds4_gpu_synchronize() && ds4_glm5_next_mla_append_commit(s);
-    ds4_gpu_tensor_free(hnorm); ds4_gpu_tensor_free(enorm); ds4_gpu_tensor_free(concat);
     if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(s->owner); }
     return ok;
 }

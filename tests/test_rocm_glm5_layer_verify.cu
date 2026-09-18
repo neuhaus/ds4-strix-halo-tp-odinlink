@@ -65,7 +65,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *p,uint32_t,uint64_t,const void *out,void *i
 }
 
 static constexpr uint64_t hc_row = 16384u*4u;
-static constexpr unsigned context = 8216;
+static constexpr unsigned context = 8464;
 static uint64_t compared_values;
 static unsigned cases;
 
@@ -89,7 +89,7 @@ struct State {
 struct Workspace {
     ds4_glm5_next_workspace *p;
     explicit Workspace(unsigned m, bool draft=false) : p(draft ?
-        ds4_glm5_next_draft_workspace_create(context) :
+        ds4_glm5_next_draft_workspace_create_rows(m,context) :
         ds4_glm5_next_workspace_create_capacity_context(m,context)) {
         REQUIRE(p); ds4_glm5_next_workspace_begin_decode(p);
     }
@@ -465,7 +465,8 @@ static void target_profile(ds4_glm5_next_exec_ctx &x) {
 #include "glm5_native_draft_checks.hpp"
 
 int main(int argc,char **argv) {
-    const bool native=argc==3 && !std::strcmp(argv[1],"--native-draft");
+    const bool warm=argc==3 && !std::strcmp(argv[1],"--native-warm");
+    const bool native=warm || (argc==3 && !std::strcmp(argv[1],"--native-draft"));
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
     const bool resident_both=dense_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
@@ -532,6 +533,7 @@ int main(int argc,char **argv) {
         const unsigned end_rank=resident?resident_rank+1u:2u;
         if (native) {
             peer.rank=x.tp_rank=resident_rank;
+            if (warm) native_warm_checks(x);
             native_draft_checks(x);
         } else if (profile) {
             peer.rank=x.tp_rank=resident_rank;
@@ -570,7 +572,7 @@ int main(int argc,char **argv) {
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
         cases,(unsigned long long)compared_values,!native && (target||timing)?1:0,
-        timing||resident_both?1:0);
+        timing||resident_both||native?1:0);
     if (resident) ds4_gpu_q4k_kshard_release();
     ds4_gpu_cleanup();
     return 0;

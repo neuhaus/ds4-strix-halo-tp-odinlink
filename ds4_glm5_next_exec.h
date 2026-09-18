@@ -86,11 +86,26 @@ void ds4_glm5_next_workspace_begin_decode(
 /* Explicit native block45 workspace: one scalar activation set and one
  * bounded eight-expert packed window, invalidated before each reuse. */
 ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create(uint32_t context_capacity);
+/* Teacher warming uses one exact row tile (1..256); no expert window is
+ * allocated by warming. A one-row workspace can subsequently draft. */
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create_rows(
+        uint32_t tokens, uint32_t context_capacity);
 /* Target mHC -> contracted, post-output-norm hidden. Chained draft hidden is
- * already post-shared-head-norm and must not pass through this conversion. */
+ * already post-shared-head-norm and must not pass through this conversion.
+ * Input/output contain exactly workspace-capacity rows. */
 int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_workspace *workspace, const ds4_gpu_tensor *hc_hidden,
         ds4_gpu_tensor *normalized_hidden);
+/* Consume shifted teacher rows into live private KV/index state only. No
+ * attention query/output, FFN, vocabulary head, payload exchange or proposal
+ * selection. Exact-size normalized predecessor rows and host token IDs.
+ * Scalar warming matches a full teacher draft step bitwise; multirow GEMM
+ * may reorder draft arithmetic. A pending speculative journal is refused.
+ * Same owner/model/link binding and invalidation rules as draft_step. */
+int ds4_glm5_next_draft_warm_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *draft_state, ds4_glm5_next_workspace *workspace,
+        const ds4_gpu_tensor *normalized_predecessors,
+        const uint32_t *shifted_tokens, uint32_t tokens);
 /* A shifted token plus normalized predecessor hidden consumes one private
  * MLA row, returning normalized draft hidden and full logits. Caller owns
  * distinct F32 input/hidden/logit buffers and the draft-only state. Pass its
