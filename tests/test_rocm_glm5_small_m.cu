@@ -52,14 +52,18 @@ static void stream_probe(const Glm5TestGGUF &gguf) {
             REQUIRE(xs[role][t] && ys[role][t]);
         }
         auto launch=[&](unsigned arm) {
-            for (const auto &p : projections) {
-                const uint64_t offset=p.offset+(uint64_t)rank*p.k*p.n*2u;
-                if (arm==0u) {
+            if (arm==0u) {
+                // Ordinary serial tokens traverse the entire weight stream
+                // before returning to a projection for the next token.
+                for (unsigned t=0;t<m;++t) for (const auto &p : projections) {
+                    const uint64_t offset=p.offset+(uint64_t)rank*p.k*p.n*2u;
                     const unsigned role=p.k==8192u;
-                    for (unsigned t=0;t<m;++t)
                         if (!ds4_gpu_matmul_bf16_tensor(ys[role][t],gguf.map,
                             gguf.size,offset,p.k,p.n,xs[role][t],1u)) return 0;
-                } else if (!ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,
+                }
+            } else for (const auto &p : projections) {
+                const uint64_t offset=p.offset+(uint64_t)rank*p.k*p.n*2u;
+                if (!ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,
                            offset,p.k,p.n,x,m)) return 0;
             }
             return 1;
