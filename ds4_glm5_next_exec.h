@@ -12,6 +12,18 @@ extern "C" {
 struct ds4_tp;
 typedef struct ds4_glm5_next_workspace ds4_glm5_next_workspace;
 
+/* Research leaf for unchanged Q8_0 dense FFNs, M=2/4/8: paired K4096/N12288
+ * gate/up (out1 non-NULL), or single K12288/N4096 down (out1 NULL).
+ * Requires production Q8 tile mode 1 and exact shared-X prefetch=8 settings.
+ * Independent contiguous F32 tensors; no GPU allocation or weight expansion.
+ * Unsupported shapes/settings/backends return zero, with no retry. */
+int ds4_rocm_glm5_dense_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t tokens);
+
 /* Reserve the bounded sparse-attention Lane-B tile workspace before timed
  * prefill. A positive return means reserved, zero is a hard backend failure,
  * and -1 means the backend does not provide the specialization. */
@@ -215,7 +227,10 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
  * these APIs alone do not enable speculative session execution.
  * DS4_ROCM_GLM5_BF16_VERIFY_HEAD=1 opts into exact batched BF16 vocabulary
  * projection, reusing batch activation scratch. Other head types stay scalar;
- * the ordinary single-token output API is unchanged. */
+ * the ordinary single-token output API is unchanged.
+ * DS4_ROCM_GLM5_VERIFY_DENSE_Q8=1 batches the three dense FFNs' Q8 matrices
+ * after scalar mHC preparation. Requires the research leaf settings above;
+ * uses existing batch scratch and leaves ordinary/prefill selection intact. */
 int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
                                         ds4_glm5_next_state *state,
                                         uint32_t capacity);

@@ -344,6 +344,12 @@ tests/test_rocm_glm5_small_m.o: tests/test_rocm_glm5_small_m.cu tests/glm5_gguf_
 tests/test_rocm_glm5_small_m: tests/test_rocm_glm5_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_rocm_glm5_dense_q8_small_m.o: tests/test_rocm_glm5_dense_q8_small_m.cu tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_dense_q8_small_m: tests/test_rocm_glm5_dense_q8_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_small_m_kda.o: tests/test_rocm_glm5_small_m_kda.cu tests/glm5_gguf_test.hpp ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 

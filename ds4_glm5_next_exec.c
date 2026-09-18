@@ -49,6 +49,21 @@ static double glm5_exec_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_dense_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)offset0; (void)offset1; (void)in_dim; (void)out_dim;
+    (void)x; (void)tokens;
+    return 0;
+}
+
 static void glm5_phase_trace(const ds4_glm5_next_exec_ctx *ctx,
                              const char *phase, uint32_t layer,
                              uint32_t n_tokens) {
@@ -1204,9 +1219,9 @@ static const ds4_gpu_tensor *kda_attention_result_for_trace(
 }
 #endif
 
-static int dense_ffn_rows(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
-                          ds4_glm5_next_workspace *w, ds4_gpu_tensor *hc_out,
-                          uint32_t n_tokens, int finite_debug) {
+static int dense_ffn_prefix(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                            ds4_glm5_next_workspace *w,
+                            uint32_t n_tokens, int finite_debug) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     int ok = ds4_gpu_rms_norm_plain_rows_tensor(
         w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
@@ -1223,6 +1238,14 @@ static int dense_ffn_rows(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
             ctx->model->rms_norm_eps);
     if (finite_debug) route_failure_stats("dense_ffn_hidden", w->ffn_hidden,
                                           n_tokens * GLM5_WIDTH);
+    return ok;
+}
+
+static int dense_ffn_rows(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                          ds4_glm5_next_workspace *w, ds4_gpu_tensor *hc_out,
+                          uint32_t n_tokens, int finite_debug) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    int ok = dense_ffn_prefix(ctx, il, w, n_tokens, finite_debug);
     if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
         layer->ffn_weight.gate, layer->ffn_weight.up,
@@ -4285,6 +4308,37 @@ static int verify_kda_attention(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
         hc_in, w->hc_split, GLM5_WIDTH, GLM5_HC);
 }
 
+static int verify_dense_ffn(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                            ds4_glm5_next_workspace *batch_w,
+                            ds4_glm5_next_workspace *scalar_w,
+                            ds4_gpu_tensor *hc_out, uint32_t tokens) {
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    /* mHC's M1 reduction order is load-bearing. Batch only after scalar
+     * preparation; all destinations are existing owned activation scratch. */
+    for (uint32_t t = 0; t < tokens; ++t) {
+        if (!ds4_gpu_tensor_copy(scalar_w->after_attention, 0u,
+                batch_w->after_attention, t * hc_row, hc_row) ||
+            !dense_ffn_prefix(ctx, il, scalar_w, 1u, 0) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_hidden, t * hidden_row,
+                scalar_w->ffn_hidden, 0u, hidden_row) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_split, t * split_row,
+                scalar_w->ffn_split, 0u, split_row)) return 0;
+    }
+    return ds4_rocm_glm5_dense_q8_small_m(batch_w->gate, batch_w->up,
+            ctx->model_map, ctx->model_size, f->gate, f->up,
+            GLM5_WIDTH, GLM5_DENSE_MID, batch_w->ffn_hidden, tokens) &&
+        ds4_gpu_swiglu_tensor(batch_w->mid, batch_w->gate, batch_w->up,
+            tokens * GLM5_DENSE_MID, 10.0f, 1.0f) &&
+        ds4_rocm_glm5_dense_q8_small_m(batch_w->down, NULL,
+            ctx->model_map, ctx->model_size, f->down, 0u,
+            GLM5_DENSE_MID, GLM5_WIDTH, batch_w->mid, tokens) &&
+        ds4_gpu_hc_expand_split_tensor(hc_out, batch_w->down,
+            batch_w->after_attention, batch_w->ffn_split, GLM5_WIDTH, GLM5_HC);
+}
+
 static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
                                uint32_t il, ds4_glm5_next_state *state,
                                ds4_glm5_next_workspace *batch_w,
@@ -4303,6 +4357,13 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         return 0;
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const bool is_kda = layer->attention == DS4_GLM5_NEXT_ATTN_KDA;
+    const char *dense_option = getenv("DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
+    if (dense_option && strcmp(dense_option, "0") != 0 && strcmp(dense_option, "1") != 0) {
+        fprintf(stderr, "ds4: invalid GLM5 dense Q8 verification selector\n");
+        return 0;
+    }
+    const bool batch_dense = is_kda && layer->ffn == DS4_GLM5_NEXT_FFN_DENSE &&
+        dense_option && strcmp(dense_option, "1") == 0;
     const uint64_t frontier = is_kda ? state->kda.layer[il].token_count :
         state->mla[il].token_count;
     if (frontier > state->context_capacity ||
@@ -4323,7 +4384,15 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         if (ok) ok = ds4_gpu_synchronize();
         attention_sec += glm5_exec_now_sec() - phase_start;
     }
-    for (uint32_t t = 0u; ok && t < n_tokens; ++t) {
+    if (ok && batch_dense) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ok = verify_dense_ffn(&bulk, il, batch_w, scalar_w, hc_out, n_tokens);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            ffn_sec += glm5_exec_now_sec() - phase_start;
+        }
+    }
+    for (uint32_t t = 0u; ok && !batch_dense && t < n_tokens; ++t) {
         if (profile) phase_start = glm5_exec_now_sec();
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * row, row);
         ds4_gpu_tensor *in = is_kda ? NULL : ds4_gpu_tensor_view(hc_in, t * row, row);

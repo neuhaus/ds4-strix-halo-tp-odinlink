@@ -13,6 +13,7 @@ extern "C" {
 #include <cstring>
 #include <vector>
 #include <chrono>
+#include <string>
 
 #define REQUIRE(x) do { if (!(x)) { \
     std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::exit(1); \
@@ -373,9 +374,15 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     std::puts("TARGET_VERIFY injected mid-pass exchange failure invalidates whole state PASS");
 }
 
-static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false) {
+static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false,
+                         const char *switch_name="DS4_ROCM_GLM5_BF16_VERIFY_HEAD") {
+    const bool dense_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
+    const char *tag=heads_only?(dense_compare?"DENSE_Q8_BUDGET":"HEAD_BUDGET"):"TARGET_BUDGET";
+    const char *old_option=std::getenv(switch_name);
+    const bool had_option=old_option!=nullptr;
+    const std::string old_value=old_option?old_option:"";
     std::printf("%s begin rank=%u m=%u simulated_peer=echo\n",
-        heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m);
+        tag,x.tp_rank,m);
     std::fflush(stdout);
     constexpr uint64_t logit_row=154880u*4u;
     const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
@@ -397,7 +404,7 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
             serial_target_reserved(x,state,scalar,991+t,scratch,prefix_hidden,prefix_logits);
         REQUIRE(ds4_gpu_synchronize());
         if (heads_only)
-            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD",arm?"1":"0",1)==0);
+            REQUIRE(setenv(switch_name,arm?"1":"0",1)==0);
         const auto start=std::chrono::steady_clock::now();
         if (arm || heads_only) {
             REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,m,
@@ -413,8 +420,8 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
         if (sample>=4) {
             times[arm].push_back(ms);
             std::printf("%s_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
-                heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m,sample-4,
-                arm?"verify_commit":heads_only?"scalar_head_verify":"serial",ms);
+                tag,x.tp_rank,m,sample-4,
+                arm?"verify_commit":heads_only?(dense_compare?"scalar_dense_verify":"scalar_head_verify"):"serial",ms);
             std::fflush(stdout);
         }
     }
@@ -425,9 +432,9 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
     for (auto &v:times) std::sort(v.begin(),v.end());
     std::printf("%s rank=%u m=%u samples=9 control_median_ms=%.6f "
         "verify_commit_median_ms=%.6f simulated_peer=echo network_test=0 drafting_test=0\n",
-        heads_only?"HEAD_BUDGET":"TARGET_BUDGET",x.tp_rank,m,times[0][4],times[1][4]);
+        tag,x.tp_rank,m,times[0][4],times[1][4]);
     std::fflush(stdout);
-    if (heads_only) REQUIRE(setenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD","1",1)==0);
+    if (heads_only) REQUIRE((had_option?setenv(switch_name,old_value.c_str(),1):unsetenv(switch_name))==0);
 }
 
 static void target_profile(ds4_glm5_next_exec_ctx &x) {
@@ -453,7 +460,8 @@ static void target_profile(ds4_glm5_next_exec_ctx &x) {
 }
 
 int main(int argc,char **argv) {
-    const bool resident_both=argc==3 && !std::strcmp(argv[1],"--target-resident-both");
+    const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
+    const bool resident_both=dense_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
         !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile);
@@ -472,6 +480,13 @@ int main(int argc,char **argv) {
     setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1);
     Glm5TestGGUF g; REQUIRE(g.open_file(path));
     ds4_glm5_next_model_offsets model={}; REQUIRE(glm5_next_bind_real_offsets(g,model));
+    if (dense_compare) {
+        REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_DENSE_Q8") &&
+            !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_DENSE_Q8"),"1"));
+        REQUIRE(std::getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD") &&
+            !std::strcmp(std::getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD"),"1") && model.output_type==30u);
+        std::puts("TARGET_SETTINGS dense_q8=1 bf16_head=1 model_head_type=30");
+    }
     REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     if (!resident) REQUIRE(ds4_gpu_set_model_map(g.map,g.size));
     {
@@ -526,7 +541,8 @@ int main(int argc,char **argv) {
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
                 if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
-                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true);
+                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true,
+                    dense_compare?"DS4_ROCM_GLM5_VERIFY_DENSE_Q8":"DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
             }
         } else if (smoke) run_case(x,0,4,3,2);
         else {
