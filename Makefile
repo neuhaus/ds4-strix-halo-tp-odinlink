@@ -778,6 +778,10 @@ test-tp-native-cycle: tests/test_tp_native_cycle
 tests/test_tp_bulk_ready: tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o $(LDLIBS)
 
+.PHONY: test-tp-bulk-ready
+test-tp-bulk-ready: tests/test_tp_bulk_ready
+	./tests/test_tp_bulk_ready
+
 tests/test_glm5_native_session: tests/test_glm5_native_session.c ds4_glm5_native_session.inc tests/ds4_tp_hello_test.o ds4_tp.h ds4.h ds4_glm5_next_exec.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_glm5_native_session.c tests/ds4_tp_hello_test.o $(LDLIBS)
 
@@ -854,6 +858,13 @@ tests/test_tp_bulk_small.o: tests/test_tp_bulk_small.cu ds4_tp.h ds4.h
 
 tests/test_tp_bulk_small: tests/test_tp_bulk_small.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
+
+.PHONY: test-tp-bulk-small
+test-tp-bulk-small: tests/test_tp_bulk_small
+	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
+		echo "error: set TP_ROLE TP_LEADER TP_PORT RDMA_DEVICE RDMA_GID_INDEX" >&2; exit 2; }
+	./tests/test_tp_bulk_small "$(TP_ROLE)" "$(TP_LEADER)" "$(TP_PORT)" \
+		"$(RDMA_DEVICE)" "$(RDMA_GID_INDEX)" "$(if $(TP_BULK_RECV_READY),$(TP_BULK_RECV_READY),1)" $(TP_BULK_TEST_MODE)
 
 test-tp-big-gate-overlap: tests/test_tp_big_gate_overlap
 	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
@@ -1577,7 +1588,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_glm5_native_session \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_tp_bulk_ready tests/test_glm5_native_session \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
@@ -1588,6 +1599,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/te
 	./tests/test_gpu_args
 	./tests/test_tp_hello
 	./tests/test_tp_native_cycle
+	./tests/test_tp_bulk_ready
 	./tests/test_glm5_native_session
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)

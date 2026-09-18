@@ -455,6 +455,8 @@ static void native_refresh_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned pr
 }
 
 static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
+    const uint64_t old_config = x.tp->prefill_config;
+    x.tp->prefill_config |= UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
     State target(*x.model), serial(*x.model), draft(*x.model,true), teacher(*x.model,true);
     Workspace scalar(1), batch(m), dw(1,true), tw(1,true);
     Tensor hc(hc_row), ref_hc(hc_row), scalar_logits(native_vocab), ref_logits(native_vocab);
@@ -512,6 +514,7 @@ static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
             x.tp_rank,m,cycle,accepted,(unsigned)target.s.kda.layer[0].token_count);
         std::fflush(stdout); ++cases;
     }
+    x.tp->prefill_config = old_config;
 }
 
 static void native_refresh_checks(ds4_glm5_next_exec_ctx &x) {

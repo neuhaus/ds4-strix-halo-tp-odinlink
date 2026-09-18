@@ -27,6 +27,7 @@ struct ds4_tp {
     bool capable = true, failed = false;
     unsigned calls = 0, fail_call = 0, bulk_calls = 0, aux_calls = 0;
     uint64_t prefill_config = 0;
+    uint64_t latency_seq = 0;
 };
 extern "C" {
 void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
@@ -51,6 +52,13 @@ int ds4_tp_gate_exchange(ds4_tp *p,uint32_t,uint32_t,uint64_t) {
 int ds4_tp_gate_exchange_from_registered(ds4_tp *p,uint32_t,uint32_t,uint64_t,const void *out) {
     if (++p->calls==p->fail_call) return 0;
     std::memcpy(p->slab+16384,out,16384); return 1;
+}
+int ds4_tp_native_gate_exchange_next(ds4_tp *p,uint32_t layer,uint32_t gate,const void *out) {
+    const uint64_t seq = ++p->latency_seq;
+    const unsigned ordinal = (unsigned)((seq - 1u) % 87u);
+    REQUIRE((ordinal < 3u ? ordinal * 2u : ordinal + 3u) == layer * 2u + gate);
+    return out ? ds4_tp_gate_exchange_from_registered(p,layer,gate,seq,out) :
+                 ds4_tp_gate_exchange(p,layer,gate,seq);
 }
 int ds4_tp_aux_gate_exchange(ds4_tp *p,uint32_t) {
     ++p->aux_calls;

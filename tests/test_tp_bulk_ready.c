@@ -84,9 +84,23 @@ static void faults(unsigned first, unsigned last) {
         ++cases;
     }
 }
+static void separate_sockets(void) {
+    int control[2], data[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, control) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, data) == 0);
+    ds4_tp *tp = ds4_tp_test_bulk_ready_create(control[0], data[0]); CHECK(tp);
+    CHECK(!ds4_tp_test_bulk_ready(tp, 1, 16384, 0, 16384, 100));
+    CHECK(ds4_tp_failed(tp));
+    unsigned char record[32];
+    CHECK(recv(data[1], record, sizeof(record), MSG_DONTWAIT) == sizeof(record));
+    CHECK(recv(data[1], record, 1, MSG_DONTWAIT) == 0);
+    CHECK(recv(control[1], record, 1, MSG_DONTWAIT) == 0);
+    ds4_tp_test_control_destroy(tp); close(data[1]); close(control[1]);
+    ++cases;
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--silent")) faults(0, 1);
-    else { pairs(); faults(0, 7); }
+    else { pairs(); faults(0, 7); separate_sockets(); }
     printf("PASS bulk ready socket cases=%u\n", cases);
     return 0;
 }

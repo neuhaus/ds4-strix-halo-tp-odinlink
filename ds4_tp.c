@@ -507,6 +507,8 @@ static int tp_bulk_ready_fail(ds4_tp *tp) {
         attr.qp_state = IBV_QPS_ERR;
         if (tp->rdma.api.modify_qp(tp->rdma.qp, &attr, IBV_QP_STATE) != 0)
             fprintf(stderr, "ds4-tp: bulk ready could not park failed QP: %s\n", strerror(errno));
+        else
+            fprintf(stderr, "ds4-tp: bulk receive-ready failed QP parked in ERR\n");
     }
 #endif
     if (tp->data_fd >= 0) shutdown(tp->data_fd, SHUT_RDWR);
@@ -547,10 +549,11 @@ static int tp_bulk_ready_exchange(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
 int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
                             uint64_t offset, uint64_t round_bytes,
                             unsigned timeout_ms) {
-    tp->data_fd = tp->control_fd;
+    const int saved_fd = tp->data_fd;
+    if (tp->data_fd < 0) tp->data_fd = tp->control_fd;
     const int ok = tp_bulk_ready_exchange(tp, chunks, bytes, offset, round_bytes,
                                          tp_now_sec() + timeout_ms / 1000.0);
-    tp->data_fd = -1;
+    tp->data_fd = saved_fd;
     return ok;
 }
 #endif
@@ -3058,6 +3061,25 @@ int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
     return 0;
 }
 
+int ds4_tp_native_gate_exchange_next(ds4_tp *tp, uint32_t layer,
+                                      uint32_t gate, const void *payload) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp && !ds4_tp_failed(tp) && tp->rdma_active &&
+        ds4_tp_glm5_native_rows(tp->prefill_config) &&
+        tp->rdma.last_gate_seq != UINT64_MAX &&
+        (!payload || ds4_tp_big_gate_is_direct(tp, payload, payload, tp->vec_bytes))) {
+        /* Bulk exchanges drain the decode receive window and leave this
+         * counter at the last consumed ordinary gate. Never rewind it. */
+        return tp_rdma_gate_exchange(tp, layer, gate,
+                                      tp->rdma.last_gate_seq + 1u, payload);
+    }
+#else
+    (void)tp; (void)layer; (void)gate; (void)payload;
+#endif
+    return 0;
+}
+
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
     DS4_TP_TEST_COUNT_EXCHANGE();
 #ifdef DS4_TP_HAVE_VERBS
@@ -3820,8 +3842,16 @@ ds4_tp *ds4_tp_test_control_create(int fd, int rank) {
     if (tp) { tp->control_fd = fd; tp->data_fd = -1; tp->rank = rank; atomic_init(&tp->failed, false); }
     return tp;
 }
+ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd) {
+    ds4_tp *tp = ds4_tp_test_control_create(control_fd, 0);
+    if (tp) tp->data_fd = data_fd;
+    return tp;
+}
 void ds4_tp_test_control_destroy(ds4_tp *tp) {
-    if (tp) { close(tp->control_fd); free(tp); }
+    if (tp) {
+        if (tp->data_fd >= 0 && tp->data_fd != tp->control_fd) close(tp->data_fd);
+        close(tp->control_fd); free(tp);
+    }
 }
 #endif
 

@@ -1436,7 +1436,10 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
             return 0;
         }
         const uint64_t sequence = ++*ctx->tp_sequence;
-        const int exchanged = direct_send ?
+        const bool native_session = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(ctx->tp)) != 0u;
+        const int exchanged = native_session ?
+            ds4_tp_native_gate_exchange_next(ctx->tp, layer, gate,
+                direct_send ? ctx->tp_big_out_host : NULL) : direct_send ?
             ds4_tp_gate_exchange_from_registered(
                 ctx->tp, layer, gate, sequence, ctx->tp_big_out_host) :
             ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence);

@@ -22,14 +22,19 @@ static uint32_t word(uint32_t seq, uint32_t rank, uint32_t index) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
-        std::fprintf(stderr, "usage: %s leader|worker HOST PORT DEVICE GID READY(0|1)\n", argv[0]);
+    if (argc != 7 && argc != 8) {
+        std::fprintf(stderr, "usage: %s leader|worker HOST PORT DEVICE GID READY(0|1) [legacy|native-tail|ready-mismatch]\n", argv[0]);
         return 2;
     }
     const bool leader = !std::strcmp(argv[1], "leader");
     CHECK(leader || !std::strcmp(argv[1], "worker"));
     CHECK(!std::strcmp(argv[6], "0") || !std::strcmp(argv[6], "1"));
     const bool ready = !std::strcmp(argv[6], "1");
+    const bool mismatch = argc == 8 && !std::strcmp(argv[7], "ready-mismatch");
+    const bool transition = argc == 8 && !mismatch;
+    CHECK(!mismatch || ready);
+    const bool legacy = transition && !std::strcmp(argv[7], "legacy");
+    CHECK(!transition || legacy || !std::strcmp(argv[7], "native-tail"));
     const int port = std::atoi(argv[3]), gid = std::atoi(argv[5]);
     CHECK(port > 0 && port < 65536 && gid >= 0);
     CHECK(setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0);
@@ -50,6 +55,15 @@ int main(int argc, char **argv) {
     id.n_layer = 64u; id.n_embd = 4096u; id.n_vocab = 1u;
     id.quant_bits = 4u; id.ctx_size = 1024u;
     id.prefill_config = ready ? DS4_TP_CONFIG_BULK_RECV_READY : 0u;
+    if (transition) {
+        id.n_layer = 45;
+        id.gate_slot_step = 1;
+        id.gates_per_token = 87;
+        for (unsigned slot = 0; slot < 90; ++slot)
+            if (slot >= 6 || slot % 2 == 0)
+                id.gate_slot_mask[slot / 64] |= UINT64_C(1) << (slot % 64);
+        id.prefill_config |= UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+    }
     char err[512] = {};
     ds4_tp *tp = nullptr;
     if (!ds4_tp_create(&tp, &opt, &id, err, sizeof(err))) {
@@ -64,6 +78,45 @@ int main(int argc, char **argv) {
     auto *recv = (uint32_t *)((char *)slab + ds4_tp_slab_big_in_offset(tp));
     const uint32_t rank = leader ? 0u : 1u;
     uint32_t seq = 0;
+    if (mismatch) {
+        // Both ranks arm32 live receive WRs. Last-chunk size disagreement
+        // must poison/park the QP and close both sockets without any SEND.
+        const uint64_t bytes = UINT64_C(4194304) - rank * 16384u;
+        CHECK(!ds4_tp_big_gate_exchange(tp, 0, 1, send, recv, bytes));
+        CHECK(ds4_tp_failed(tp));
+        CHECK(!ds4_tp_big_gate_exchange(tp, 0, 2, send, recv, bytes));
+        ds4_tp_free(tp);
+        CHECK(hipHostFree(slab) == hipSuccess);
+        std::printf("PASS bulk ready mismatch rank=%u armed_recvs=32 reentry_refused=1 teardown=1\n", rank);
+        return 0;
+    }
+    if (transition) {
+        /* Reproduce native draft/bulk -> ordinary tail -> bulk -> ordinary.
+         * Bulk headers deliberately advance independently of the latency ring. */
+        for (unsigned cycle = 0; cycle < 3; ++cycle) {
+            for (unsigned draft_gate = 0; draft_gate < 14; ++draft_gate) {
+                ++seq;
+                for (unsigned i = 0; i < 4096; ++i) send[i] = word(seq, rank, i);
+                CHECK(ds4_tp_big_gate_exchange(tp, 45, seq, send, recv, 16384));
+                for (unsigned i = 0; i < 4096; ++i) CHECK(recv[i] == word(seq, rank ^ 1u, i));
+            }
+            for (unsigned slot = 0; slot < 90; ++slot) {
+                if (slot < 6 && slot % 2) continue; // leading FFNs are replicated
+                ++seq;
+                for (unsigned i = 0; i < 4096; ++i) send[i] = word(seq, rank, i);
+                CHECK(legacy ? ds4_tp_gate_exchange_from_registered(tp, slot / 2, slot % 2, seq, send) :
+                    ds4_tp_native_gate_exchange_next(tp, slot / 2, slot % 2, send));
+                const auto *received = (const uint32_t *)((const char *)slab +
+                    ds4_tp_slab_in_offset(tp, slot / 2, slot % 2));
+                for (unsigned i = 0; i < 4096; ++i) CHECK(received[i] == word(seq, rank ^ 1u, i));
+            }
+        }
+        CHECK(!ds4_tp_failed(tp));
+        ds4_tp_free(tp);
+        CHECK(hipHostFree(slab) == hipSuccess);
+        std::printf("PASS bulk native-tail rank=%u ready=%u cycles=3 changed_payload=1\n", rank, ready);
+        return 0;
+    }
     for (uint32_t rows : {1u, 2u, 4u, 8u, 256u, 257u, 512u, 513u}) {
         const uint32_t values = rows * 4096u;
         const unsigned repeats = rows <= 8u ? 32u : 2u;

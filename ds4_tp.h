@@ -516,6 +516,11 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
 int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
                                          uint32_t gate, uint64_t seq,
                                          const void *payload);
+/* Native GLM5 sessions interleave draft/bulk and ordinary token traffic.
+ * Advance the latency channel's own ordinal, independently of bulk headers.
+ * RDMA-only, negotiated native sessions only; NULL payload uses the gate slab. */
+int ds4_tp_native_gate_exchange_next(ds4_tp *tp, uint32_t layer,
+                                      uint32_t gate, const void *payload);
 /* Exchange the dependent KDA output-row half paired with the preceding
  * logical attention gate.  It does not consume or advance a gate sequence. */
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
@@ -629,6 +634,7 @@ int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
 #ifdef DS4_TP_TEST_HOOKS
 /* Socket-only control fixture: no RDMA payload capability is manufactured. */
 ds4_tp *ds4_tp_test_control_create(int fd, int rank);
+ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd);
 void ds4_tp_test_control_destroy(ds4_tp *tp);
 int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
                             uint64_t offset, uint64_t round_bytes,
