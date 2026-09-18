@@ -25,6 +25,7 @@ struct ds4_tp {
     unsigned char *slab = nullptr;
     bool capable = true, failed = false;
     unsigned calls = 0, fail_call = 0, bulk_calls = 0, aux_calls = 0;
+    uint64_t prefill_config = 0;
 };
 extern "C" {
 void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
@@ -33,7 +34,7 @@ bool ds4_tp_is_rdma(const ds4_tp *p) { return p->capable; }
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *p) { return p->capable; }
 bool ds4_tp_big_gate_is_direct(const ds4_tp *p,const void *,const void *,uint64_t) { return p->capable; }
 uint32_t ds4_tp_runtime_features(const ds4_tp *p) { return p->features; }
-uint64_t ds4_tp_prefill_config(const ds4_tp *) { return 0; }
+uint64_t ds4_tp_prefill_config(const ds4_tp *p) { return p->prefill_config; }
 uint64_t ds4_tp_vec_bytes(const ds4_tp *) { return 16384; }
 uint64_t ds4_tp_aux_payload_bytes(const ds4_tp *) { return 8192; }
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *,uint32_t,uint32_t) { return 0; }
@@ -295,6 +296,35 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
     REQUIRE(!ds4_glm5_next_target_verify_finish(&other,&candidate.s,accepted));
     other=x; other.tp_rank=1-x.tp_rank;
     REQUIRE(!ds4_glm5_next_target_verify_finish(&other,&candidate.s,accepted));
+    // Mutate one binding field at a time on a real completed transaction.
+    // Every refusal must preserve all live state, journals and transport calls.
+    const auto finish_calls=x.tp->calls;
+    const auto binding=candidate.s.verification;
+    auto refused=[&](const ds4_glm5_next_exec_ctx &changed) {
+        REQUIRE(!ds4_glm5_next_target_verify_finish(&changed,&candidate.s,accepted));
+        REQUIRE(candidate.s.valid && x.tp->calls==finish_calls &&
+            !std::memcmp(&binding,&candidate.s.verification,sizeof(binding)) &&
+            candidate.s.kda.pending_verifications==34 &&
+            candidate.s.pending_mla_verifications==11);
+        equal_target(base,candidate);
+    };
+    other=x; other.model_map=(const unsigned char *)x.model_map+1; refused(other);
+    other=x; --other.model_size; refused(other);
+    ds4_tp other_peer=*x.tp; other=x; other.tp=&other_peer; refused(other);
+    auto *slab_view=ds4_gpu_tensor_view(x.tp_slab,0,ds4_gpu_tensor_bytes(x.tp_slab));
+    auto *out_view=ds4_gpu_tensor_view(x.tp_big_out,0,ds4_gpu_tensor_bytes(x.tp_big_out));
+    auto *in_view=ds4_gpu_tensor_view(x.tp_big_in,0,ds4_gpu_tensor_bytes(x.tp_big_in));
+    REQUIRE(slab_view && out_view && in_view);
+    other=x; other.tp_slab=slab_view; refused(other);
+    other=x; other.tp_big_out=out_view; refused(other);
+    other=x; other.tp_big_in=in_view; refused(other);
+    other=x; other.tp_big_out_host=(unsigned char *)x.tp_big_out_host+4; refused(other);
+    other=x; other.tp_big_in_host=(unsigned char *)x.tp_big_in_host+4; refused(other);
+    ds4_gpu_tensor_free(slab_view); ds4_gpu_tensor_free(out_view); ds4_gpu_tensor_free(in_view);
+    ++*x.tp_sequence; refused(x); --*x.tp_sequence;
+    const auto features=x.tp->features;
+    x.tp->features^=DS4_TP_FEATURE_GLM5_SMALL_GATE; refused(x); x.tp->features=features;
+    ++x.tp->prefill_config; refused(x); --x.tp->prefill_config;
     candidate.s.kda.layer[44].pending_tokens=1;
     REQUIRE(!ds4_glm5_next_target_verify_finish(&x,&candidate.s,accepted));
     candidate.s.kda.layer[44].pending_tokens=m;
@@ -389,10 +419,33 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
         x.tp_rank,m,times[0][4],times[1][4]); std::fflush(stdout);
 }
 
+static void target_profile(ds4_glm5_next_exec_ctx &x) {
+    State state(*x.model);
+    Workspace scalar(1), batch(8);
+    Tensor scratch(hc_row), hidden(hc_row), logits(154880u*4u);
+    Tensor batch_scratch(8*hc_row), batch_hidden(8*hc_row), batch_logits(8u*154880u*4u);
+    const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
+    REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&state.s,8));
+    for (unsigned il=3;il<45;il+=4) seed_mla(state,il,0);
+    for (unsigned pass=0;pass<3;++pass) {
+        REQUIRE(ds4_glm5_next_state_reset(&state.s));
+        for (unsigned t=0;t<3;++t)
+            serial_target_reserved(x,state,scalar,991+t,scratch,hidden,logits);
+        REQUIRE(ds4_gpu_synchronize());
+        if (pass==2) REQUIRE(setenv("DS4_GLM5_VERIFY_PROFILE","1",1)==0);
+        REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,8,
+            batch_scratch,batch_hidden,batch_logits));
+        REQUIRE(ds4_glm5_next_target_verify_finish(&x,&state.s,8));
+        REQUIRE(unsetenv("DS4_GLM5_VERIFY_PROFILE")==0);
+    }
+    std::printf("VERIFY_PROFILE_DONE rank=%u simulated_peer=echo network_test=0 quality_test=0\n",x.tp_rank);
+}
+
 int main(int argc,char **argv) {
     const bool resident_both=argc==3 && !std::strcmp(argv[1],"--target-resident-both");
+    const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
-        !std::strcmp(argv[1],"--target-resident-timing") || resident_both);
+        !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile);
     REQUIRE(!resident || !std::strcmp(argv[2],"0") || !std::strcmp(argv[2],"1"));
     const unsigned resident_rank=resident && !std::strcmp(argv[2],"1")?1u:0u;
     const bool timing=(argc==2 && !std::strcmp(argv[1],"--target-timing")) ||
@@ -445,7 +498,10 @@ int main(int argc,char **argv) {
         x.tp_sequence=&sequence;
         const unsigned first_rank=resident?resident_rank:0u;
         const unsigned end_rank=resident?resident_rank+1u:2u;
-        if (timing) {
+        if (profile) {
+            peer.rank=x.tp_rank=resident_rank;
+            target_profile(x);
+        } else if (timing) {
             for (unsigned rank=first_rank;rank<end_rank;++rank) {
                 peer.rank=x.tp_rank=rank;
                 for (unsigned m : {2u,4u,8u}) target_timing(x,m);

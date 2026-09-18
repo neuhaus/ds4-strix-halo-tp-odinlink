@@ -111,3 +111,12 @@ Run targeted CPU/protocol checks and
 `scripts/check-research-root-contract.sh` before committing. Keep candidate
 kernels default-off until their applicable gates pass. Keep advisor reviews in
 the promotion dossier; a repair or experiment commit is not a promotion.
+
+## Active uncensored-model verifier track
+
+`research/glm53-uncensored-six-kda-20260917` extends current main with
+default-off exact BF16 reuse and accepted-prefix target verification for the
+unchanged uncensored Q4 GGUF. Its dossier is
+`$DS4_RESEARCH_ROOT/candidates/glm53-uncensored-20260915/`. Local echo-peer
+checks do not establish real TP throughput or promotion. Session publication
+requires coordinator agreement on both ranks' verification and commit outcomes.

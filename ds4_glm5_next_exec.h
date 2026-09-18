@@ -189,7 +189,9 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
  * (M=2/4/8), plus distinct scalar/decode and M-row workspaces. The wrapper
  * allocates no GPU storage; scalar FFNs retain their ordinary residency policy.
  * Preload the production compressed slices before an allocation-free timed
- * pass. Buffers must not alias each other or workspace/TP storage.
+ * pass. Caller buffers must be allocated independently of workspace/state
+ * storage. The API rejects overlapping supplied tensor ranges and TP ranges;
+ * it does not inspect every workspace/state allocation or parent allocation.
  * Input IDs are validated before any work; successful verification computes
  * all 45 layers and every output head, synchronizes, and leaves live state
  * pending at its original common frontier. The model, settings and transport
@@ -201,6 +203,14 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
  * a completed pass. Finish validates all journals before committing any;
  * backend failure invalidates the whole sequence. Reset/invalidation discards
  * an incomplete pass. Neither operation rewinds transport sequence counters.
+ * A preflight refusal leaves the pass pending: restore its binding to finish
+ * (including finish(0)), or reset the whole context. No context-preserving
+ * abort is supported after a lost binding or an incomplete pass.
+ * These are rank-local transactions. Before publishing history/logits/tokens
+ * or resuming inference, the coordinator must establish that BOTH ranks
+ * verified successfully and then finished successfully with its chosen count.
+ * Any rank failure, disagreement or lost acknowledgement invalidates BOTH
+ * sequence states; a local success alone never permits publication.
  * Session history, EOS, drafting and coordinator acceptance are caller work;
  * these APIs alone do not enable speculative session execution. */
 int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,

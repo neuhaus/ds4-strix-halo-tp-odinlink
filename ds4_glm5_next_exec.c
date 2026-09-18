@@ -4313,10 +4313,18 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
                     !ds4_glm5_next_mla_verify_ready(&state->mla[il], n_tokens)))) return 0;
     ds4_glm5_next_exec_ctx bulk = *ctx;
     bulk.force_bulk_gates = true;
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    double phase_start = profile ? glm5_exec_now_sec() : 0.0;
+    double attention_sec = 0.0, ffn_sec = 0.0;
     ds4_glm5_next_mla_state *mla = NULL;
     int ok = is_kda ? verify_kda_attention(&bulk, il, state, batch_w, hc_in, n_tokens) :
         ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
+    if (profile) {
+        if (ok) ok = ds4_gpu_synchronize();
+        attention_sec += glm5_exec_now_sec() - phase_start;
+    }
     for (uint32_t t = 0u; ok && t < n_tokens; ++t) {
+        if (profile) phase_start = glm5_exec_now_sec();
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * row, row);
         ds4_gpu_tensor *in = is_kda ? NULL : ds4_gpu_tensor_view(hc_in, t * row, row);
         ok = out != NULL;
@@ -4335,14 +4343,27 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
                     slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
                     bulk.tp_big_out, true, true);
         }
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            attention_sec += glm5_exec_now_sec() - phase_start;
+            phase_start = glm5_exec_now_sec();
+        }
         if (ok) ok = layer->ffn == DS4_GLM5_NEXT_FFN_DENSE ?
             dense_ffn_rows(&bulk, il, scalar_w, out, 1u, 0) :
             routed_ffn_one(&bulk, il, (uint32_t)frontier + t, scalar_w, out);
         if (ok && !is_kda) ok = ds4_glm5_next_mla_append_commit(mla);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            ffn_sec += glm5_exec_now_sec() - phase_start;
+        }
         ds4_gpu_tensor_free(in);
         ds4_gpu_tensor_free(out);
     }
     if (ok) ok = ds4_gpu_synchronize();
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u layer=%u kind=%s m=%u attention_ms=%.6f ffn_ms=%.6f ok=%d\n",
+        ctx->tp_rank, il, is_kda ? "kda" : "mla", n_tokens,
+        attention_sec * 1000.0, ffn_sec * 1000.0, ok);
     if (!ok) ds4_glm5_next_state_invalidate(state);
     return ok;
 }
@@ -4466,18 +4487,23 @@ int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
         .frontier=state->kda.layer[0].token_count, .tokens=tokens,
     };
     memcpy(v->input_tokens, input_tokens, tokens * sizeof(*input_tokens));
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const double begin_sec = profile ? glm5_exec_now_sec() : 0.0;
     int ok = 1;
     for (uint32_t t = 0; ok && t < tokens; ++t) {
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_scratch, t * row, row);
         ok = out && ds4_glm5_next_embed_token(ctx, v->input_tokens[t], out);
         ds4_gpu_tensor_free(out);
     }
+    if (profile && ok) ok = ds4_gpu_synchronize();
+    const double embed_sec = profile ? glm5_exec_now_sec() : 0.0;
     ds4_gpu_tensor *in = hc_scratch, *out = hc_out;
     for (uint32_t il = 0; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
         ok = layer_verify_run(ctx, il, state, batch_w, scalar_w, in, out, tokens);
         if (ok) v->next_layer = il + 1u;
         ds4_gpu_tensor *swap = in; in = out; out = swap;
     }
+    const double trunk_sec = profile ? glm5_exec_now_sec() : 0.0;
     /* The 45-layer trunk is odd: final hidden rows are always in hc_out. */
     for (uint32_t t = 0; ok && t < tokens; ++t) {
         ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_out, t * row, row);
@@ -4487,6 +4513,11 @@ int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_tensor_free(hidden);
     }
     if (ok) ok = ds4_gpu_synchronize();
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u target m=%u embed_ms=%.6f trunk_ms=%.6f head_ms=%.6f ok=%d\n",
+        ctx->tp_rank, tokens, (embed_sec - begin_sec) * 1000.0,
+        (trunk_sec - embed_sec) * 1000.0,
+        (glm5_exec_now_sec() - trunk_sec) * 1000.0, ok);
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
@@ -4500,6 +4531,8 @@ int ds4_glm5_next_target_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
                                        ds4_glm5_next_state *state,
                                        uint32_t accepted) {
     if (!target_binding_matches(ctx, state)) return 0;
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const double begin_sec = profile ? glm5_exec_now_sec() : 0.0;
     const ds4_glm5_next_verification *v = &state->verification;
     if (!v->complete || v->next_layer != DS4_GLM5_NEXT_TRUNK_COUNT ||
         accepted > v->tokens || state->kda.pending_verifications != 34u ||
@@ -4525,6 +4558,9 @@ int ds4_glm5_next_target_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
         return 0;
     }
     memset(&state->verification, 0, sizeof(state->verification));
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u finish accepted=%u commit_ms=%.6f ok=1\n",
+        ctx->tp_rank, accepted, (glm5_exec_now_sec() - begin_sec) * 1000.0);
     return 1;
 }
 
