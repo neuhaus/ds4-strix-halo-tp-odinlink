@@ -128,7 +128,9 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
         ok = next >= 0; predictions[t] = (uint32_t)next;
     }
     uint32_t accepted = ok ? 1u : 0u;
-    while (ok && accepted < rows && tokens[accepted - 1u] != (uint32_t)c->eos &&
+    /* EOS remains unconsumed for the caller: interactive generation stops,
+     * whereas the fixed-length benchmark selects its next non-EOS root. */
+    while (ok && accepted < rows && tokens[accepted] != (uint32_t)c->eos &&
         tokens[accepted] == predictions[accepted - 1u]) ++accepted;
     if (!ds4_tp_native_agree(e->tp.ctx, c, 8u, accepted, predictions, ok, err, errlen)) goto failed;
     ok = ds4_glm5_next_draft_target_hidden(x, batch, hc[1], normalized) &&

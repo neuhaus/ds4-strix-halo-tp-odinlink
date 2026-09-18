@@ -311,7 +311,12 @@ static void cycle_cases(void) {
     int fd[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     fixture *a = create(fd[0], 0, 8, 3), *b = create(fd[1], 1, 8, 3);
     prepare(a, 8, 8, F_NONE, 9, 12); prepare(b, 8, 8, F_NONE, 9, 12);
-    run_pair(a, b, 4); destroy(a); destroy(b);
+    /* CLI stops on EOS, while fixed-length benchmarks choose the best non-EOS
+     * root. Leave that decision at the caller's next ordinary frontier. */
+    run_pair(a, b, 3);
+    CHECK(glm5_native_argmax(a->s.logits) == 12 && glm5_native_argmax(b->s.logits) == 12);
+    CHECK(a->accepted[3] == -1 && b->accepted[3] == -1);
+    destroy(a); destroy(b);
 }
 static void teacher_cases(void) {
     ds4_session disabled = {0};
