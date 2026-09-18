@@ -530,13 +530,14 @@ __global__ static void matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kern
 /* Small target-verification batches reuse unchanged BF16 weights across
  * independent token accumulators. Keep the M1 lane/K traversal and reduction;
  * activation panels bound LDS at 32 KiB even for eight tokens. */
-template <uint32_t Tokens>
+template <uint32_t Tokens, uint32_t PanelK = 1024u>
 __global__ static void matmul_bf16_f32_small_m_exact_kernel(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim) {
     static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u,
                   "supported small verification batches");
-    constexpr uint32_t PanelK = 1024u;
+    static_assert(PanelK == 1024u || PanelK == 128u,
+                  "wide projection or KDA low-rank expansion");
     constexpr uint32_t Rows = 8u;
     __shared__ float panel[Tokens][PanelK];
     const uint32_t tid = threadIdx.x;

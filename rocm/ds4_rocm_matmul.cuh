@@ -2708,7 +2708,9 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
     const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 8u) &&
-        ((in_dim == 4096u && out_dim == 4096u) ||
+        ((in_dim == 4096u &&
+          (out_dim == 4096u || out_dim == 128u || out_dim == 32u)) ||
+         (in_dim == 128u && out_dim == 4096u) ||
          (in_dim == 8192u && out_dim == 2048u));
     if (small_m_shape) {
         const char *small_m = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT");
@@ -2720,13 +2722,22 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             if (getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") ||
                 (split && strcmp(split, "0") != 0) ||
                 (legacy && strcmp(legacy, "0") != 0)) return 0;
-#define DS4_SMALL_M_EXACT(T) \
-            matmul_bf16_f32_small_m_exact_kernel<T><<<out_dim / 8u, 256u>>>( \
+            // The skinny and low-rank prefill tiles preserve the generic
+            // 256-lane batch order, not the one-wave M1 order. Include these
+            // KDA gate shapes here so verification also preserves recurrence.
+#define DS4_SMALL_M_EXACT(T, K) \
+            matmul_bf16_f32_small_m_exact_kernel<T, K><<<out_dim / 8u, 256u>>>( \
                 (float *)out->ptr, (const uint16_t *)wptr, \
                 (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim)
-            if (n_tok == 2u) DS4_SMALL_M_EXACT(2u);
-            else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u);
-            else DS4_SMALL_M_EXACT(8u);
+            if (in_dim == 128u) {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 128u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u);
+                else DS4_SMALL_M_EXACT(8u, 128u);
+            } else {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u);
+                else DS4_SMALL_M_EXACT(8u, 1024u);
+            }
 #undef DS4_SMALL_M_EXACT
             return cuda_ok(cudaGetLastError(), "BF16 small-M exact launch");
         }
