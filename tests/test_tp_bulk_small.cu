@@ -10,6 +10,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -23,7 +24,7 @@ static uint32_t word(uint32_t seq, uint32_t rank, uint32_t index) {
 
 int main(int argc, char **argv) {
     if (argc != 7 && argc != 8) {
-        std::fprintf(stderr, "usage: %s leader|worker HOST PORT DEVICE GID READY(0|1) [legacy|native-tail|ready-mismatch]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s leader|worker HOST PORT DEVICE GID READY(0|1) [legacy|native-tail|ready-mismatch|handoff|handoff-route-fail|handoff-compute-fail|handoff-stall]\n", argv[0]);
         return 2;
     }
     const bool leader = !std::strcmp(argv[1], "leader");
@@ -31,7 +32,14 @@ int main(int argc, char **argv) {
     CHECK(!std::strcmp(argv[6], "0") || !std::strcmp(argv[6], "1"));
     const bool ready = !std::strcmp(argv[6], "1");
     const bool mismatch = argc == 8 && !std::strcmp(argv[7], "ready-mismatch");
-    const bool transition = argc == 8 && !mismatch;
+    const bool handoff = argc == 8 && !std::strncmp(argv[7], "handoff", 7);
+    const bool route_fail = handoff && !std::strcmp(argv[7], "handoff-route-fail");
+    const bool compute_fail = handoff && !std::strcmp(argv[7], "handoff-compute-fail");
+    const bool stall = handoff && !std::strcmp(argv[7], "handoff-stall");
+    CHECK(!handoff || ready);
+    CHECK(!handoff || route_fail || compute_fail || stall || !std::strcmp(argv[7], "handoff"));
+    if (handoff) CHECK(setenv("DS4_TP_TIMEOUT_SEC", "1", 1) == 0);
+    const bool transition = argc == 8 && !mismatch && !handoff;
     CHECK(!mismatch || ready);
     const bool legacy = transition && !std::strcmp(argv[7], "legacy");
     CHECK(!transition || legacy || !std::strcmp(argv[7], "native-tail"));
@@ -55,6 +63,7 @@ int main(int argc, char **argv) {
     id.n_layer = 64u; id.n_embd = 4096u; id.n_vocab = 1u;
     id.quant_bits = 4u; id.ctx_size = 1024u;
     id.prefill_config = ready ? DS4_TP_CONFIG_BULK_RECV_READY : 0u;
+    if (handoff) id.prefill_config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
     if (transition) {
         id.n_layer = 45;
         id.gate_slot_step = 1;
@@ -78,6 +87,51 @@ int main(int argc, char **argv) {
     auto *recv = (uint32_t *)((char *)slab + ds4_tp_slab_big_in_offset(tp));
     const uint32_t rank = leader ? 0u : 1u;
     uint32_t seq = 0;
+    if (handoff) {
+        for (uint32_t rows : {2u,4u,8u}) {
+            for (unsigned cycle=0;cycle<4;++cycle) {
+                for (unsigned phase=0;phase<2;++phase) {
+                    const bool fault=(phase==0 && route_fail) || (phase==1 && compute_fail);
+                    const int ok=ds4_tp_verify_layer_agree(tp,seq,4,8192+cycle*8,rows,
+                        phase,UINT64_C(0xfeed0000)+cycle,fault?leader:1,err,sizeof(err));
+                    if (fault) {
+                        CHECK(!ok && ds4_tp_failed(tp));
+                        CHECK(!ds4_tp_big_gate_exchange(tp,4,seq+1,send,recv,rows*16384u));
+                        ds4_tp_free(tp); CHECK(hipHostFree(slab)==hipSuccess);
+                        std::printf("PASS handoff rejected rank=%u phase=%u no_payload=1\n",rank,phase);
+                        return 0;
+                    }
+                    CHECK(ok);
+                }
+                if (stall) {
+                    // Keep the peer alive with both sockets open after phase1.
+                    // A 1s production deadline must release rank0 before teardown.
+                    if (!leader) std::this_thread::sleep_for(std::chrono::seconds(3));
+                    else {
+                        const double start=now_ms();
+                        CHECK(!ds4_tp_big_gate_exchange(tp,4,seq+1,send,recv,rows*16384u));
+                        const double elapsed=now_ms()-start;
+                        CHECK(ds4_tp_failed(tp) && elapsed>=750 && elapsed<2500);
+                        CHECK(!ds4_tp_big_gate_exchange(tp,4,seq+2,send,recv,rows*16384u));
+                        std::printf("HANDOFF_STALL rank=0 elapsed_ms=%.3f bounded=1\n",elapsed);
+                    }
+                    ds4_tp_free(tp); CHECK(hipHostFree(slab)==hipSuccess);
+                    std::printf("PASS handoff post-compute stall rank=%u\n",rank); return 0;
+                }
+                ++seq;
+                for (uint32_t i=0;i<rows*4096;++i) send[i]=word(seq,rank,i);
+                std::memset(recv,0,rows*16384u);
+                std::atomic_thread_fence(std::memory_order_release);
+                CHECK(ds4_tp_big_gate_exchange(tp,4,seq,send,recv,rows*16384u));
+                std::atomic_thread_fence(std::memory_order_acquire);
+                for (uint32_t i=0;i<rows*4096;++i) CHECK(recv[i]==word(seq,rank^1u,i));
+            }
+        }
+        CHECK(!ds4_tp_failed(tp));
+        ds4_tp_free(tp); CHECK(hipHostFree(slab)==hipSuccess);
+        std::printf("PASS handoff RoCE rank=%u exchanges=%u rows=2/4/8 changed_payload=1\n",rank,seq);
+        return 0;
+    }
     if (mismatch) {
         // Both ranks arm32 live receive WRs. Last-chunk size disagreement
         // must poison/park the QP and close both sockets without any SEND.

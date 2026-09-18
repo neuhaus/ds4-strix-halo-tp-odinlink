@@ -160,3 +160,14 @@ evaluation and TP exchanges remain per token. Unsupported shared-pair modes
 or nonresident layouts refuse. MLA and ordinary decode are unchanged by the
 selector. See `research/shared-q8-integration-plan-d02a636.md` for the bounded
 hypothesis and required real-weight, network and promotion checks.
+
+`DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF=1` separately batches route readbacks,
+agreements and FFN payload exchanges across M2/4/8 in resident KDA routed
+verification. It retains scalar router/expert arithmetic and existing scratch,
+requires shared-Q8 batching and negotiated bit40, and stays default-off.
+Layer agreements carry failure status with bounded I/O; negotiated bulk header
+waits also have deadlines and terminate both channels on failure. The optional
+`DS4_GLM5_NATIVE_PHASE_PROFILE=1` reports completed native-cycle boundaries
+without extra GPU fences. See `research/handoff-plan-927ae0e.md` in the same
+dossier. Echo-peer component fixtures and protocol tests do not establish
+whole-model speed, real RoCE correctness or promotion.

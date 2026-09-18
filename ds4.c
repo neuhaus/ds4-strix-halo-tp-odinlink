@@ -51689,6 +51689,16 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         fprintf(stderr, "ds4: native GLM5 draft width must be 0/2/4/8 and match the TP hello\n");
         return 0;
     }
+    const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+    const bool use_handoff = handoff && strcmp(handoff, "1") == 0;
+    const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    if ((handoff && strcmp(handoff, "0") && strcmp(handoff, "1")) ||
+        use_handoff != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
+        (use_handoff && (!native_rows || !shared || strcmp(shared, "1")))) {
+        fprintf(stderr, "ds4: native FFN handoff requires matching hello, native draft and shared-Q8 batch\n");
+        return 0;
+    }
     uint32_t workspace_capacity = 1u;
     const char *batch_env = getenv("DS4_GLM5_NEXT_PREFILL_BATCH");
     const char *reuse_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
@@ -54018,6 +54028,9 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
         const uint32_t rows = ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"));
         const uint64_t code = rows == 2u ? 1u : rows == 4u ? 2u : rows == 8u ? 3u : 0u;
         config |= code << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+        const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+        if (handoff && strcmp(handoff, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
     }
 #endif
     return config;

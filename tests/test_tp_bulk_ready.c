@@ -98,9 +98,26 @@ static void separate_sockets(void) {
     ds4_tp_test_control_destroy(tp); close(data[1]); close(control[1]);
     ++cases;
 }
+static void handoff_gate_silent(void) {
+    int control[2], data[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, control) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, data) == 0);
+    ds4_tp *tp=ds4_tp_test_handoff_gate_create(control[0],data[0]); CHECK(tp);
+    unsigned char out[8]={0}, in[8]={0};
+    const double start=now();
+    CHECK(!ds4_tp_big_gate_exchange(tp,4,1,out,in,sizeof(out)));
+    const double elapsed=now()-start;
+    CHECK(ds4_tp_failed(tp) && elapsed>=0.75 && elapsed<2.0);
+    CHECK(!ds4_tp_big_gate_exchange(tp,4,2,out,in,sizeof(out)));
+    CHECK(recv(control[1],in,1,MSG_DONTWAIT)==0);
+    ds4_tp_test_control_destroy(tp); close(control[1]); close(data[1]);
+    ++cases;
+    printf("PASS post-agreement bulk header deadline elapsed=%.3f seconds\n",elapsed);
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--silent")) faults(0, 1);
-    else { pairs(); faults(0, 7); separate_sockets(); }
+    else if (argc == 2 && !strcmp(argv[1], "--handoff-silent")) handoff_gate_silent();
+    else { pairs(); faults(0, 7); separate_sockets(); handoff_gate_silent(); }
     printf("PASS bulk ready socket cases=%u\n", cases);
     return 0;
 }

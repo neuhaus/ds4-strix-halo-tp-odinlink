@@ -56,6 +56,8 @@ enum {
     DS4_TP_CONFIG_GLM5_NATIVE_SHIFT = 37,
     /* Explicit receive-ready rendezvous for the mlx5 bulk RC channel. */
     DS4_TP_CONFIG_BULK_RECV_READY = UINT64_C(1) << 39,
+    /* Exact native KDA routed verification with one FFN handoff per layer. */
+    DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF = UINT64_C(1) << 40,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
@@ -596,6 +598,7 @@ typedef enum {
     DS4_TP_FRAME_LOGITS_TOP2 = 18,
     DS4_TP_FRAME_GLM5_NATIVE = 19,
     DS4_TP_FRAME_GLM5_NATIVE_AGREE = 20,
+    DS4_TP_FRAME_GLM5_VERIFY_LAYER = 21,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -631,10 +634,19 @@ int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
                          uint32_t phase, uint32_t accepted,
                          const uint32_t tokens[8], int local_ok,
                          char *err, size_t errlen);
+/* Native verifier only. Phase0 agrees on an ordered route-table hash; phase1
+ * agrees that local expert computation completed before a bulk FFN exchange.
+ * The monotonic transport sequence binds this to the enclosing transaction.
+ * Always send local failure; one deadline covers send and receive. */
+int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
+                            uint32_t frontier, uint32_t rows, uint32_t phase,
+                            uint64_t route_hash, int local_ok,
+                            char *err, size_t errlen);
 #ifdef DS4_TP_TEST_HOOKS
 /* Socket-only control fixture: no RDMA payload capability is manufactured. */
 ds4_tp *ds4_tp_test_control_create(int fd, int rank);
 ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd);
+ds4_tp *ds4_tp_test_handoff_gate_create(int control_fd, int data_fd);
 void ds4_tp_test_control_destroy(ds4_tp *tp);
 int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
                             uint64_t offset, uint64_t round_bytes,

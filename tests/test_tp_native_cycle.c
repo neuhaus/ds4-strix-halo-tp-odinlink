@@ -17,14 +17,19 @@ typedef struct {
     ds4_tp *tp;
     ds4_tp_native_cycle cycle;
     uint32_t phase, accepted, tokens[8];
+    uint32_t layer_mode, layer;
+    uint64_t route_hash;
     int ok, result;
     char error[128];
 } arm;
 
 static void *agree(void *arg) {
     arm *a = arg;
-    a->result = ds4_tp_native_agree(a->tp, &a->cycle, a->phase, a->accepted,
-                                  a->tokens, a->ok, a->error, sizeof(a->error));
+    a->result = a->layer_mode ? ds4_tp_verify_layer_agree(a->tp,
+        a->cycle.cycle, a->layer, a->cycle.prefix, a->cycle.rows, a->phase,
+        a->route_hash, a->ok, a->error, sizeof(a->error)) :
+        ds4_tp_native_agree(a->tp, &a->cycle, a->phase, a->accepted,
+                           a->tokens, a->ok, a->error, sizeof(a->error));
     return NULL;
 }
 
@@ -72,6 +77,35 @@ static void agreement_cases(void) {
         case 12: b.cycle.rows = 3; break;
         case 13: b.phase = 10; break;
         case 14: b.accepted = 9; break;
+        }
+        pair(&a, &b, 0);
+    }
+}
+
+static void layer_cases(void) {
+    for (uint32_t rows = 2u; rows <= 8u; rows *= 2u)
+        for (uint32_t phase = 0u; phase < 2u; ++phase) {
+            arm a = {.cycle=base, .phase=phase, .ok=1,
+                     .layer_mode=1, .layer=4, .route_hash=UINT64_C(0xfedcba9876543210)};
+            a.cycle.rows = rows;
+            arm b = a; pair(&a, &b, 1);
+        }
+    for (unsigned fault = 0; fault < 12u; ++fault) {
+        arm a = {.cycle=base, .ok=1, .layer_mode=1, .layer=4, .route_hash=12345};
+        arm b = a;
+        switch (fault) {
+        case 0: ++b.cycle.cycle; break;
+        case 1: ++b.cycle.prefix; break;
+        case 2: b.cycle.rows=4; break;
+        case 3: ++b.layer; break;
+        case 4: b.phase=1; break;
+        case 5: ++b.route_hash; break;
+        case 6: b.ok=0; break;
+        case 7: a.ok=0; break;
+        case 8: b.layer=45; break;
+        case 9: b.cycle.rows=3; break;
+        case 10: b.phase=2; break;
+        case 11: b.layer_mode=0; break;
         }
         pair(&a, &b, 0);
     }
@@ -154,12 +188,13 @@ static void config_cases(void) {
 /* Run both 30-second production deadlines together: silent reader and writer
  * backpressure. No shortened test-only timeout can hide an unbounded send. */
 static void stalled_cases(void) {
-    int sockets[2][2]; arm a[2] = {{.cycle = base, .ok = 1}, {.cycle = base, .ok = 1}};
-    pthread_t threads[2]; struct timespec start, end;
+    int sockets[4][2]; arm a[4] = {0};
+    pthread_t threads[4]; struct timespec start, end;
     CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
+        a[i] = (arm){.cycle=base, .ok=1, .layer_mode=i/2u, .layer=4};
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets[i]) == 0);
-        if (i) {
+        if (i & 1u) {
             char data[4096] = {0}; ssize_t sent;
             do { sent = send(sockets[i][0], data, sizeof(data), MSG_DONTWAIT); } while (sent > 0);
             CHECK(sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
@@ -167,7 +202,7 @@ static void stalled_cases(void) {
         a[i].tp = ds4_tp_test_control_create(sockets[i][0], 0); CHECK(a[i].tp);
         CHECK(pthread_create(&threads[i], NULL, agree, &a[i]) == 0);
     }
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         CHECK(pthread_join(threads[i], NULL) == 0);
         CHECK(!a[i].result && ds4_tp_failed(a[i].tp));
         ds4_tp_test_control_destroy(a[i].tp); close(sockets[i][1]); ++cases;
@@ -180,7 +215,7 @@ static void stalled_cases(void) {
 
 int main(void) {
     ds4_tp_test_reset_exchange_calls();
-    config_cases(); command_cases(); agreement_cases(); malformed_cases(); stalled_cases();
+    config_cases(); command_cases(); agreement_cases(); layer_cases(); malformed_cases(); stalled_cases();
     CHECK(ds4_tp_test_get_exchange_calls() == 0);
     printf("PASS native control cases=%u tensor_exchange_calls=0 (socket control only)\n", cases);
     return 0;

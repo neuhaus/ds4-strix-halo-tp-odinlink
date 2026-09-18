@@ -1,6 +1,13 @@
 /* Native session orchestration. Included after ds4_session is defined; the
  * socket/arithmetic fixture includes these same functions with controlled
  * backend operations to test publication and failure ordering. */
+#include <time.h>
+static double glm5_native_wall_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int ds4_session_glm5_native_teach(ds4_session *s,
         ds4_glm5_next_workspace *target_ws, const ds4_gpu_tensor *hc,
         const int *tokens, uint32_t rows) {
@@ -72,6 +79,11 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
     ds4_engine *e = s->engine;
     ds4_glm5_next_exec_ctx *x = &s->glm5_next_exec;
     const uint32_t rows = c->rows;
+    const char *profile_env = getenv("DS4_GLM5_NATIVE_PHASE_PROFILE");
+    const bool profile = profile_env && strcmp(profile_env, "1") == 0;
+    const double cycle_start = profile ? glm5_native_wall_sec() : 0.0;
+    double draft_sec = 0.0, agree_sec = 0.0, verify_sec = 0.0;
+    double select_sec = 0.0, commit_sec = 0.0, phase_start = 0.0;
     uint32_t tokens[8] = {0}, predictions[8] = {0};
     const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t vocab_row = (uint64_t)DS4_N_VOCAB * sizeof(float);
@@ -106,10 +118,13 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
     if (ok) ok = ds4_glm5_next_mla_verify_begin(&s->glm5_native_state.mla[45], rows - 1u, &view) &&
         ds4_gpu_tensor_copy(s->glm5_native_chain, 0, s->glm5_native_previous, 0, row) &&
         ds4_gpu_synchronize();
+    if (profile) phase_start = glm5_native_wall_sec();
     if (!ds4_tp_native_agree(e->tp.ctx, c, 0u, 0u, tokens, ok, err, errlen)) goto failed;
+    if (profile) agree_sec += glm5_native_wall_sec() - phase_start;
     s->glm5_native_cycle = c->cycle;
     ds4_glm5_next_workspace_begin_decode(s->glm5_next_ws);
     for (uint32_t t = 0; t < rows - 1u; ++t) {
+        if (profile) phase_start = glm5_native_wall_sec();
         if (ok) ok = ds4_glm5_next_draft_step(x, view, s->glm5_native_ws,
             s->glm5_native_chain, tokens[t], s->glm5_native_hidden, s->glm5_next_logits) &&
             ds4_gpu_tensor_read(s->glm5_next_logits, 0, s->sample_probs, vocab_row);
@@ -118,11 +133,21 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
         tokens[t + 1u] = proposed >= 0 ? (uint32_t)proposed : UINT32_MAX;
         if (ok && t + 1u < rows - 1u) ok = ds4_gpu_tensor_copy(s->glm5_native_chain,
             0, s->glm5_native_hidden, 0, row);
+        if (profile) {
+            const double now = glm5_native_wall_sec();
+            draft_sec += now - phase_start; phase_start = now;
+        }
         if (!ds4_tp_native_agree(e->tp.ctx, c, t + 1u, 0u, tokens, ok, err, errlen)) goto failed;
+        if (profile) agree_sec += glm5_native_wall_sec() - phase_start;
     }
+    if (profile) phase_start = glm5_native_wall_sec();
     ok = ds4_glm5_next_target_verify(x, &s->glm5_next_state, batch, s->glm5_next_ws,
-        tokens, rows, hc[0], hc[1], logits) &&
-        ds4_gpu_tensor_read(logits, 0, s->glm5_native_host_logits, rows * vocab_row);
+        tokens, rows, hc[0], hc[1], logits);
+    if (profile) {
+        const double now = glm5_native_wall_sec();
+        verify_sec = now - phase_start; phase_start = now;
+    }
+    ok = ok && ds4_gpu_tensor_read(logits, 0, s->glm5_native_host_logits, rows * vocab_row);
     for (uint32_t t = 0; ok && t < rows; ++t) {
         const int next = glm5_native_argmax(s->glm5_native_host_logits + (uint64_t)t * DS4_N_VOCAB);
         ok = next >= 0; predictions[t] = (uint32_t)next;
@@ -132,7 +157,15 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
      * whereas the fixed-length benchmark selects its next non-EOS root. */
     while (ok && accepted < rows && tokens[accepted] != (uint32_t)c->eos &&
         tokens[accepted] == predictions[accepted - 1u]) ++accepted;
+    if (profile) {
+        const double now = glm5_native_wall_sec();
+        select_sec = now - phase_start; phase_start = now;
+    }
     if (!ds4_tp_native_agree(e->tp.ctx, c, 8u, accepted, predictions, ok, err, errlen)) goto failed;
+    if (profile) {
+        const double now = glm5_native_wall_sec();
+        agree_sec += now - phase_start; phase_start = now;
+    }
     ok = ds4_glm5_next_draft_target_hidden(x, batch, hc[1], normalized) &&
         ds4_glm5_next_draft_refresh(x, &s->glm5_native_state, s->glm5_native_ws,
             normalized, tokens, c->prefix, rows, accepted, s->glm5_native_previous) &&
@@ -140,7 +173,12 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
         ds4_gpu_tensor_copy(s->glm5_next_cur, 0, hc[1], (accepted - 1u) * row * 4u, row * 4u) &&
         ds4_gpu_tensor_copy(s->glm5_next_logits, 0, logits, (accepted - 1u) * vocab_row, vocab_row) &&
         ds4_gpu_synchronize();
+    if (profile) {
+        const double now = glm5_native_wall_sec();
+        commit_sec = now - phase_start; phase_start = now;
+    }
     if (!ds4_tp_native_agree(e->tp.ctx, c, 9u, accepted, predictions, ok, err, errlen)) goto failed;
+    if (profile) agree_sec += glm5_native_wall_sec() - phase_start;
     /* Publication has no allocation or device work and follows both ranks'
      * successful target commit AND native teacher refresh. */
     memcpy(s->logits, s->glm5_native_host_logits + (uint64_t)(accepted - 1u) * DS4_N_VOCAB, vocab_row);
@@ -151,6 +189,11 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
     s->checkpoint_valid = true;
     ds4_gpu_tensor_free(normalized); ds4_gpu_tensor_free(logits);
     ds4_gpu_tensor_free(hc[0]); ds4_gpu_tensor_free(hc[1]);
+    if (profile) fprintf(stderr, "NATIVE_PHASE rank=%u cycle=%llu prefix=%u rows=%u accepted=%u draft_ms=%.6f verify_ms=%.6f select_ms=%.6f commit_ms=%.6f agree_ms=%.6f total_ms=%.6f\n",
+        x->tp_rank, (unsigned long long)c->cycle, c->prefix, rows, accepted,
+        draft_sec * 1000.0, verify_sec * 1000.0, select_sec * 1000.0,
+        commit_sec * 1000.0, agree_sec * 1000.0,
+        (glm5_native_wall_sec() - cycle_start) * 1000.0);
     return (int)accepted;
 failed:
     ds4_gpu_synchronize();

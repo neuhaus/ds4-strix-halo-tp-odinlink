@@ -254,6 +254,11 @@ int main(void) {
         prefill | DS4_TP_CONFIG_BULK_RECV_READY, 1, NULL);
     ok &= check_prefill("hello mismatched-bulk-receive-ready",
         prefill | DS4_TP_CONFIG_BULK_RECV_READY, prefill, 0, NULL);
+    ok &= check_prefill("hello equal-verify-ffn-handoff",
+        prefill | DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF,
+        prefill | DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF, 1, NULL);
+    ok &= check_prefill("hello mismatched-verify-ffn-handoff",
+        prefill | DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF, prefill, 0, NULL);
     if ((DS4_TP_CONFIG_BULK_RECV_READY &
          ((UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) |
           DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA |

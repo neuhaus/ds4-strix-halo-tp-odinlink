@@ -26,6 +26,10 @@ struct ds4_tp {
     unsigned char *slab = nullptr;
     bool capable = true, failed = false;
     unsigned calls = 0, fail_call = 0, bulk_calls = 0, aux_calls = 0;
+    unsigned layer_agrees[2] = {}, handoff_bulk_calls = 0, handoff_pending = 0;
+    int fail_agree_phase = -1;
+    uint64_t handoff_sequence = 0, handoff_hash = 0;
+    uint32_t handoff_layer = 0, handoff_frontier = 0, handoff_rows = 0;
     uint64_t prefill_config = 0;
     uint64_t latency_seq = 0;
 };
@@ -43,8 +47,27 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *,uint32_t,uint32_t) { return 0; }
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *,uint32_t,uint32_t) { return 16384; }
 uint64_t ds4_tp_slab_aux_out_payload_offset(const ds4_tp *,uint32_t) { return 32768; }
 uint64_t ds4_tp_slab_aux_in_payload_offset(const ds4_tp *,uint32_t) { return 40960; }
-void ds4_tp_mark_failed(ds4_tp *p) { p->failed=true; }
+void ds4_tp_mark_failed(ds4_tp *p) { p->failed=true; p->handoff_pending=0; }
 int ds4_tp_hash_check(ds4_tp *,uint64_t,uint64_t,char *,size_t) { return 1; }
+int ds4_tp_verify_layer_agree(ds4_tp *p,uint64_t sequence,uint32_t layer,
+        uint32_t frontier,uint32_t rows,uint32_t phase,uint64_t hash,
+        int local_ok,char *,size_t) {
+    REQUIRE(layer>=3 && layer<45 && layer%4!=3 && phase<2 &&
+        (rows==2 || rows==4 || rows==8) && frontier<=UINT32_MAX-rows &&
+        (p->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+    ++p->layer_agrees[phase];
+    if (!local_ok || p->failed || p->fail_agree_phase==(int)phase) {
+        ds4_tp_mark_failed(p); return 0;
+    }
+    REQUIRE(p->handoff_pending==phase);
+    if (!phase) {
+        p->handoff_sequence=sequence; p->handoff_hash=hash;
+        p->handoff_layer=layer; p->handoff_frontier=frontier; p->handoff_rows=rows;
+    } else REQUIRE(p->handoff_sequence==sequence && p->handoff_hash==hash &&
+        p->handoff_layer==layer && p->handoff_frontier==frontier && p->handoff_rows==rows);
+    ++p->handoff_pending;
+    return 1;
+}
 int ds4_tp_gate_exchange(ds4_tp *p,uint32_t,uint32_t,uint64_t) {
     if (++p->calls==p->fail_call) return 0;
     std::memcpy(p->slab+16384,p->slab,16384); return 1;
@@ -65,7 +88,12 @@ int ds4_tp_aux_gate_exchange(ds4_tp *p,uint32_t) {
     if (++p->calls==p->fail_call) return 0;
     std::memcpy(p->slab+40960,p->slab+32768,8192); return 1;
 }
-int ds4_tp_big_gate_exchange(ds4_tp *p,uint32_t,uint64_t,const void *out,void *in,uint64_t bytes) {
+int ds4_tp_big_gate_exchange(ds4_tp *p,uint32_t layer,uint64_t sequence,const void *out,void *in,uint64_t bytes) {
+    if (p->handoff_pending) {
+        REQUIRE(p->handoff_pending==2 && layer==p->handoff_layer &&
+            sequence==p->handoff_sequence+1 && bytes==p->handoff_rows*16384u);
+        p->handoff_pending=0; ++p->handoff_bulk_calls;
+    }
     ++p->bulk_calls;
     if (++p->calls==p->fail_call) return 0;
     std::memcpy(in,out,bytes); return 1;
@@ -291,7 +319,14 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
     REQUIRE(!ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,alias,logits));
     ds4_gpu_tensor_free(alias);
     const auto aux_before=x.tp->aux_calls;
+    const auto agree_before=x.tp->layer_agrees[0];
+    const auto compute_before=x.tp->layer_agrees[1];
+    const auto handoff_before=x.tp->handoff_bulk_calls;
     REQUIRE(ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    const unsigned handoffs=(x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF)?31u:0u;
+    REQUIRE(x.tp->layer_agrees[0]==agree_before+handoffs &&
+        x.tp->layer_agrees[1]==compute_before+handoffs &&
+        x.tp->handoff_bulk_calls==handoff_before+handoffs && !x.tp->handoff_pending);
     REQUIRE(candidate.s.verification.complete && candidate.s.verification.next_layer==45 &&
         candidate.s.kda.pending_verifications==34 && candidate.s.pending_mla_verifications==11 &&
         x.tp->aux_calls==aux_before);
@@ -405,11 +440,51 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     }
 }
 
+static void target_handoff_failure(ds4_glm5_next_exec_ctx &x) {
+    State state(*x.model);
+    Workspace scalar(1), batch(2);
+    Tensor scratch(2*hc_row), hidden(2*hc_row), logits(2u*154880*4u);
+    const uint32_t tokens[2]={300,1234};
+    REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&state.s,2));
+    auto fails=[&]() {
+        REQUIRE(!ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,2,scratch,hidden,logits));
+        REQUIRE(!state.s.valid && !state.s.verification.tokens &&
+            !state.s.kda.pending_verifications && !state.s.pending_mla_verifications &&
+            !ds4_glm5_next_target_verify_finish(&x,&state.s,1));
+        ds4_tp_mark_failed(x.tp); x.tp->failed=false;
+        REQUIRE(ds4_glm5_next_state_reset(&state.s));
+    };
+    REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF","invalid",1)==0); fails();
+    REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF","1",1)==0);
+    x.tp->prefill_config &= ~DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF; fails();
+    x.tp->prefill_config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+    REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8","0",1)==0); fails();
+    REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8","1",1)==0);
+    for (int phase=0;phase<2;++phase) {
+        const auto before=x.tp->layer_agrees[phase];
+        const auto bulk_before=x.tp->handoff_bulk_calls;
+        x.tp->fail_agree_phase=phase; fails(); x.tp->fail_agree_phase=-1;
+        REQUIRE(x.tp->layer_agrees[phase]==before+1 && x.tp->handoff_bulk_calls==bulk_before);
+    }
+    const char *overlap=std::getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
+    const bool had_overlap=overlap!=nullptr;
+    const std::string overlap_value=overlap?overlap:"";
+    const auto before=x.tp->layer_agrees[0];
+    const auto compute_before=x.tp->layer_agrees[1];
+    REQUIRE(setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP","invalid",1)==0); fails();
+    REQUIRE(x.tp->layer_agrees[0]==before+1 && x.tp->layer_agrees[1]==compute_before);
+    REQUIRE((had_overlap?setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP",overlap_value.c_str(),1):
+        unsetenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP"))==0);
+    std::puts("TARGET_HANDOFF invalid selector/hello/shared, local failure and both agreement failures refuse PASS");
+}
+
 static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false,
                          const char *switch_name="DS4_ROCM_GLM5_BF16_VERIFY_HEAD") {
     const bool dense_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
     const bool shared_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
-    const char *tag=heads_only?(shared_compare?"SHARED_Q8_BUDGET":
+    const bool handoff_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+    const uint64_t original_config=x.tp->prefill_config;
+    const char *tag=heads_only?(handoff_compare?"HANDOFF_BUDGET":shared_compare?"SHARED_Q8_BUDGET":
         dense_compare?"DENSE_Q8_BUDGET":"HEAD_BUDGET"):"TARGET_BUDGET";
     const char *old_option=std::getenv(switch_name);
     const bool had_option=old_option!=nullptr;
@@ -438,6 +513,9 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
         REQUIRE(ds4_gpu_synchronize());
         if (heads_only)
             REQUIRE(setenv(switch_name,arm?"1":"0",1)==0);
+        if (handoff_compare) x.tp->prefill_config =
+            (original_config & ~DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) |
+            (arm?DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF:0u);
         const auto start=std::chrono::steady_clock::now();
         if (arm || heads_only) {
             REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,m,
@@ -454,7 +532,7 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
             times[arm].push_back(ms);
             std::printf("%s_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
                 tag,x.tp_rank,m,sample-4,
-                arm?"verify_commit":heads_only?(shared_compare?"scalar_shared_verify":
+                arm?"verify_commit":heads_only?(handoff_compare?"scalar_handoff_verify":shared_compare?"scalar_shared_verify":
                     dense_compare?"scalar_dense_verify":"scalar_head_verify"):"serial",ms);
             std::fflush(stdout);
         }
@@ -469,6 +547,7 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
         tag,x.tp_rank,m,times[0][4],times[1][4]);
     std::fflush(stdout);
     if (heads_only) REQUIRE((had_option?setenv(switch_name,old_value.c_str(),1):unsetenv(switch_name))==0);
+    x.tp->prefill_config=original_config;
 }
 
 static void target_profile(ds4_glm5_next_exec_ctx &x) {
@@ -501,7 +580,8 @@ int main(int argc,char **argv) {
     const bool native=refresh || warm || (argc==3 && !std::strcmp(argv[1],"--native-draft"));
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
     const bool shared_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-shared-both");
-    const bool resident_both=dense_compare || shared_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
+    const bool handoff_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-handoff-both");
+    const bool resident_both=dense_compare || shared_compare || handoff_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
         !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile || native);
@@ -527,16 +607,19 @@ int main(int argc,char **argv) {
             !std::strcmp(std::getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD"),"1") && model.output_type==30u);
         std::puts("TARGET_SETTINGS dense_q8=1 bf16_head=1 model_head_type=30");
     }
-    if (shared_compare) {
+    if (shared_compare || handoff_compare) {
         REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8") &&
             !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8"),"1"));
         std::puts("TARGET_SETTINGS shared_q8=1 scalar_prefix=1 weights=original");
     }
+    if (handoff_compare) REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF") &&
+        !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF"),"1"));
     REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     if (!resident) REQUIRE(ds4_gpu_set_model_map(g.map,g.size));
     {
         Tensor slab(65536,true), out(8*4096*4,true), in(8*4096*4,true);
         ds4_tp peer; peer.slab=(unsigned char *)ds4_gpu_tensor_contents(slab);
+        if (handoff_compare) peer.prefill_config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
         if (resident) {
             Glm5NextKShardPlan plan;
             REQUIRE(glm5_next_build_kshard_plan(g,model,plan,native));
@@ -590,8 +673,10 @@ int main(int argc,char **argv) {
                     for (unsigned accepted : {0u,m/2u,m})
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
-                if (resident_both && !shared_compare) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
+                if (handoff_compare) target_handoff_failure(x);
+                if (resident_both && !shared_compare && !handoff_compare) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
                 if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true,
+                    handoff_compare?"DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF":
                     shared_compare?"DS4_ROCM_GLM5_VERIFY_SHARED_Q8":
                     dense_compare?"DS4_ROCM_GLM5_VERIFY_DENSE_Q8":"DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
             }
@@ -608,6 +693,8 @@ int main(int argc,char **argv) {
             }
         }
         if (!target && !timing) refusal_and_failure(x);
+        if (handoff_compare) std::printf("HANDOFF_COUNTS rank=%u routes=%u compute=%u bulk=%u simulated_peer=echo\n",
+            peer.rank,peer.layer_agrees[0],peer.layer_agrees[1],peer.handoff_bulk_calls);
     }
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",

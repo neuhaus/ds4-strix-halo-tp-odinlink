@@ -4436,6 +4436,114 @@ static int verify_shared_ffn_prepare(const ds4_glm5_next_exec_ctx *ctx,
             batch_w->shared_mid, tokens);
 }
 
+/* All attention/prefix/shared rows have already been prepared. Retain the M1
+ * router and packed expert dispatch: only their route and output handoffs are
+ * batched. No prefill GEMM, alternate activation codec or route reordering. */
+static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                             ds4_glm5_next_workspace *batch,
+                             ds4_glm5_next_workspace *scalar,
+                             ds4_gpu_tensor *hc_out, uint32_t frontier,
+                             uint32_t rows, int ok) {
+    const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint64_t route_row = GLM5_EXPERTS_USED * sizeof(uint32_t);
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const uint64_t q4_gate_row = (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t q4_down_row = (GLM5_ROUTED_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t q4_down_half = (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    const uint64_t sequence = *ctx->tp_sequence;
+    int32_t ids[8u * GLM5_EXPERTS_USED] = {0};
+    float weights[8u * GLM5_EXPERTS_USED] = {0};
+    uint64_t hash = UINT64_C(1469598103934665603);
+    char error[128] = {0};
+    ok = ok && shared_route_overlap_mode(ctx, scalar, 1) >= 0;
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ok = ds4_gpu_tensor_copy(scalar->ffn_hidden, 0, batch->ffn_hidden,
+                t * hidden_row, hidden_row) &&
+            ds4_gpu_matmul_f32_tensor(scalar->router_logits, ctx->model_map,
+                ctx->model_size, f->gate_inp, GLM5_WIDTH, GLM5_EXPERTS,
+                scalar->ffn_hidden, 1u) &&
+            ds4_gpu_glm_router_select_tensor(scalar->router_selected,
+                scalar->router_weights, scalar->router_probs, ctx->model_map,
+                ctx->model_size, f->exp_probs_b, scalar->router_logits,
+                GLM5_EXPERTS, GLM5_EXPERTS_USED, 2.5f) &&
+            ds4_gpu_tensor_copy(batch->router_selected, t * route_row,
+                scalar->router_selected, 0, route_row) &&
+            ds4_gpu_tensor_copy(batch->router_weights, t * route_row,
+                scalar->router_weights, 0, route_row);
+    }
+    if (ok) ok = ds4_gpu_tensor_read(batch->router_selected, 0, ids, rows * route_row) &&
+        ds4_gpu_tensor_read(batch->router_weights, 0, weights, rows * route_row);
+    for (uint32_t t = 0; ok && t < rows; ++t)
+        for (uint32_t i = 0; ok && i < GLM5_EXPERTS_USED; ++i) {
+            const uint32_t index = t * GLM5_EXPERTS_USED + i;
+            ok = ids[index] >= 0 && ids[index] < GLM5_EXPERTS &&
+                isfinite(weights[index]) && weights[index] >= 0.0f;
+            for (uint32_t j = 0; ok && j < i; ++j)
+                ok = ids[index] != ids[t * GLM5_EXPERTS_USED + j];
+        }
+    if (ok) {
+        hash = fnv64_continue(hash, ids, rows * route_row);
+        hash = fnv64_continue(hash, weights, rows * route_row);
+    }
+    if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 0u,
+            hash, ok, error, sizeof(error))) goto failed;
+
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
+            t * hidden_row, hidden_row);
+        ok = local && ds4_gpu_tensor_copy(scalar->ffn_hidden, 0,
+                batch->ffn_hidden, t * hidden_row, hidden_row) &&
+            ds4_gpu_tensor_copy(scalar->router_selected, 0,
+                batch->router_selected, t * route_row, route_row) &&
+            ds4_gpu_tensor_copy(scalar->router_weights, 0,
+                batch->router_weights, t * route_row, route_row) &&
+            ds4_gpu_tensor_copy(scalar->shared_out, 0,
+                batch->shared_out, t * hidden_row, hidden_row) &&
+            ds4_gpu_routed_moe_one_packed_q4k_tensor(scalar->routed_out,
+                scalar->routed_gate, scalar->routed_up, scalar->routed_mid,
+                scalar->routed_experts, ctx->model_map, ctx->model_size,
+                f->gate_exps, f->up_exps, f->down_exps, GLM5_EXPERTS,
+                q4_gate_row, q4_down_row, ctx->tp_rank * GLM5_RANK_MID, GLM5_RANK_MID,
+                ctx->tp_rank * q4_down_half, q4_down_half, scalar->router_selected,
+                scalar->router_weights, GLM5_EXPERTS_USED, 10.0f,
+                scalar->ffn_hidden, NULL, il) &&
+            ds4_gpu_add_tensor(local, scalar->routed_out,
+                scalar->shared_out, GLM5_WIDTH) && ds4_gpu_synchronize();
+        ds4_gpu_tensor_free(local);
+    }
+    /* Failure is always exchanged before either side posts the bulk payload. */
+    if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 1u,
+            hash, ok, error, sizeof(error))) goto failed;
+    if (!tp_exchange_rows(ctx, il, DS4_TP_GATE_FFN, rows)) goto failed;
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
+            t * hidden_row, hidden_row);
+        ds4_gpu_tensor *remote = ds4_gpu_tensor_view(ctx->tp_big_in,
+            t * hidden_row, hidden_row);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * hc_row, hc_row);
+        ok = local && remote && out &&
+            ds4_gpu_tensor_copy(scalar->after_attention, 0,
+                batch->after_attention, t * hc_row, hc_row) &&
+            ds4_gpu_tensor_copy(scalar->ffn_split, 0,
+                batch->ffn_split, t * split_row, split_row) &&
+            ds4_gpu_add_tensor(scalar->down, local, remote, GLM5_WIDTH) &&
+            ds4_gpu_hc_expand_split_tensor(out, scalar->down,
+                scalar->after_attention, scalar->ffn_split, GLM5_WIDTH, GLM5_HC);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(remote); ds4_gpu_tensor_free(local);
+    }
+    if (ok) ok = ds4_gpu_synchronize();
+    if (!ok) goto failed;
+    return 1;
+failed:
+    ds4_gpu_synchronize();
+    ds4_tp_mark_failed(ctx->tp);
+    fprintf(stderr, "ds4: native FFN handoff failed rank=%u layer=%u: %s\n",
+        ctx->tp_rank, il, error[0] ? error : "local operation or payload exchange");
+    return 0;
+}
+
 static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
                                uint32_t il, ds4_glm5_next_state *state,
                                ds4_glm5_next_workspace *batch_w,
@@ -4468,6 +4576,14 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     }
     const bool batch_shared = is_kda && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
         shared_option && strcmp(shared_option, "1") == 0;
+    const char *handoff_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+    if (handoff_option && strcmp(handoff_option, "0") && strcmp(handoff_option, "1"))
+        return 0;
+    const bool handoff_requested = handoff_option && strcmp(handoff_option, "1") == 0;
+    if (handoff_requested != ((ds4_tp_prefill_config(ctx->tp) &
+            DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
+        (handoff_requested && (!shared_option || strcmp(shared_option, "1")))) return 0;
+    const bool batch_handoff = handoff_requested && batch_shared;
     if (batch_shared) {
         const char *pair = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
         if (!layer->is_trunk || scalar_w->draft_only ||
@@ -4521,7 +4637,20 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
             }
         }
     }
-    for (uint32_t t = 0u; ok && !batch_dense && t < n_tokens; ++t) {
+    if (batch_handoff) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ok = verify_ffn_handoff(&bulk, il, batch_w, scalar_w, hc_out,
+            (uint32_t)frontier, n_tokens, ok);
+        if (profile) ffn_sec += glm5_exec_now_sec() - phase_start;
+        if (ok) {
+            static int reported[2];
+            if (!reported[ctx->tp_rank]) {
+                fprintf(stderr, "ds4: native KDA FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0\n", ctx->tp_rank);
+                reported[ctx->tp_rank] = 1;
+            }
+        }
+    }
+    for (uint32_t t = 0u; ok && !batch_dense && !batch_handoff && t < n_tokens; ++t) {
         if (profile) phase_start = glm5_exec_now_sec();
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * row, row);
         ds4_gpu_tensor *in = is_kda ? NULL : ds4_gpu_tensor_view(hc_in, t * row, row);
