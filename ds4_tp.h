@@ -52,7 +52,7 @@ enum {
     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
     /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
     DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
-    /* 0=disabled, 1/2/3 encode native GLM5 target widths 2/4/8. */
+    /* 0=disabled, 1/2/3 encode native GLM5 target widths 2/4/8; see bit41 for 6. */
     DS4_TP_CONFIG_GLM5_NATIVE_SHIFT = 37,
     /* Explicit receive-ready rendezvous for the mlx5 bulk RC channel. */
     DS4_TP_CONFIG_BULK_RECV_READY = UINT64_C(1) << 39,

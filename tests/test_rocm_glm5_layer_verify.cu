@@ -114,6 +114,23 @@ struct Tensor {
     ~Tensor() { ds4_gpu_tensor_free(p); }
     operator ds4_gpu_tensor *() const { return p; }
 };
+struct GuardedTensor {
+    Tensor storage;
+    ds4_gpu_tensor *p;
+    uint64_t bytes;
+    explicit GuardedTensor(uint64_t n) : storage(n+128u),
+        p(ds4_gpu_tensor_view(storage,64u,n)), bytes(n) {
+        REQUIRE(p && ds4_gpu_tensor_fill_f32(storage,12345.0f,(n+128u)/4u));
+    }
+    ~GuardedTensor() { ds4_gpu_tensor_free(p); }
+    operator ds4_gpu_tensor *() const { return p; }
+    void check() const {
+        float guards[32];
+        REQUIRE(ds4_gpu_tensor_read(storage,0,guards,64u) &&
+            ds4_gpu_tensor_read(storage,bytes+64u,guards+16,64u));
+        for (float v:guards) REQUIRE(v==12345.0f);
+    }
+};
 struct State {
     ds4_glm5_next_state s = {};
     explicit State(const ds4_glm5_next_model_offsets &m, bool draft=false) {
@@ -243,6 +260,8 @@ static void refusal_and_failure(ds4_glm5_next_exec_ctx &x) {
     Tensor input(4*hc_row), output(4*hc_row);
     REQUIRE(ds4_gpu_tensor_fill_f32(input,0.125f,4*16384));
     REQUIRE(!ds4_glm5_next_layer_verify_reserve(&x,0,&state.s,3));
+    REQUIRE(!ds4_glm5_next_layer_verify_reserve(&x,0,&state.s,5));
+    REQUIRE(!ds4_glm5_next_layer_verify_reserve(&x,0,&state.s,7));
     REQUIRE(ds4_glm5_next_layer_verify_reserve(&x,0,&state.s,4));
     x.tp->capable=false;
     const unsigned before=x.tp->calls;
@@ -296,7 +315,7 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
     const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
     State base(*x.model), reference(*x.model), candidate(*x.model);
     Workspace scalar(1), batch(m);
-    Tensor scratch(m*hc_row), got(m*hc_row), logits(m*logit_row);
+    GuardedTensor scratch(m*hc_row), got(m*hc_row), logits(m*logit_row);
     Tensor serial(m*hc_row), serial_logits(m*logit_row);
     Tensor next_a(hc_row), next_b(hc_row), logit_a(logit_row), logit_b(logit_row);
     // Match even physically inactive tail entries without changing model data.
@@ -331,7 +350,20 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
     const auto agree_before=x.tp->layer_agrees[0];
     const auto compute_before=x.tp->layer_agrees[1];
     const auto handoff_before=x.tp->handoff_bulk_calls;
+    auto guard_tp_tail=[&](bool poison) {
+        for (ds4_gpu_tensor *buffer : {x.tp_big_out,x.tp_big_in}) {
+            const uint64_t start=(uint64_t)m*4096u*4u;
+            const uint64_t bytes=ds4_gpu_tensor_bytes(buffer)-start;
+            if (!bytes) continue;
+            auto *tail=ds4_gpu_tensor_view(buffer,start,bytes); REQUIRE(tail);
+            if (poison) REQUIRE(ds4_gpu_tensor_fill_f32(tail,12345.0f,bytes/4u));
+            else for (float v:read(tail,bytes/4u)) REQUIRE(v==12345.0f);
+            ds4_gpu_tensor_free(tail);
+        }
+    };
+    guard_tp_tail(true);
     REQUIRE(ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    scratch.check(); got.check(); logits.check(); guard_tp_tail(false);
     const unsigned handoffs=(x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF)?31u:0u;
     REQUIRE(x.tp->layer_agrees[0]==agree_before+handoffs &&
         x.tp->layer_agrees[1]==compute_before+handoffs &&
@@ -695,7 +727,10 @@ int main(int argc,char **argv) {
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
                 if (handoff_compare) {
-                    for (unsigned m : glm5_test_verifier_widths()) target_case(x,m,8192u+(m==4),m/2,true);
+                    for (unsigned m : glm5_test_verifier_widths()) {
+                        target_case(x,m,8192u+(m==4),m/2,true);
+                        if (m==6u) target_case(x,m,8195u,5u,true);
+                    }
                     target_handoff_failure(x);
                 }
                 if (resident_both && !shared_compare && !handoff_compare) for (unsigned m : glm5_test_verifier_widths()) target_timing(x,m);

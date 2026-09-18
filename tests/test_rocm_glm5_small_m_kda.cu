@@ -111,7 +111,7 @@ static uint64_t compare(const std::vector<float> &ref,
 static void time_kda(const Glm5TestGGUF &g,
                      const ds4_glm5_kda_weight_offsets &weights) {
     // Local warm-weight stage budget, not a target-verifier throughput test.
-    for (unsigned rank=0;rank<2;++rank) for (unsigned m : {2u,4u,8u}) {
+    for (unsigned rank=0;rank<2;++rank) for (unsigned m : glm5_test_verifier_widths()) {
         HeadState state(rank);
         REQUIRE(ds4_glm5_kda_replay_reserve(&state.slot.layer[0],m,rank));
         ds4_glm5_kda_workspace scalar = {}, batch = {};
@@ -200,7 +200,7 @@ static void replay_cases(const Glm5TestGGUF &g) {
         values+=a.size();
     };
     for (unsigned il : {0u,44u}) for (unsigned rank=0;rank<2;++rank)
-    for (unsigned m : {2u,4u,8u}) for (unsigned prefix : {0u,3u,7u})
+    for (unsigned m : glm5_test_verifier_widths()) for (unsigned prefix : {0u,3u,7u})
     for (unsigned accepted=0;accepted<=m;++accepted) {
         const auto weights=bind(g,il);
         HeadState control(rank), candidate(rank);
@@ -354,7 +354,7 @@ int main(int argc, char **argv) {
     uint64_t candidate_different=0, candidate_values=0;
     for (unsigned il : {0u,1u,44u}) {
         const auto weights=bind(g,il);
-        for (unsigned rank=0;rank<2;++rank) for (unsigned m : {2u,4u,8u})
+        for (unsigned rank=0;rank<2;++rank) for (unsigned m : glm5_test_verifier_widths())
         for (unsigned prefix : {0u,3u,7u}) {
             std::vector<float> host((prefix+m+1u)*4096u);
             for (size_t i=0;i<host.size();++i)

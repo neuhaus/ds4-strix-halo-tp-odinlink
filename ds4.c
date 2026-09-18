@@ -51687,7 +51687,7 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     const uint32_t native_rows = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(e->tp.ctx));
     if (native_rows == UINT32_MAX ||
         native_rows != ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"))) {
-        fprintf(stderr, "ds4: native GLM5 draft width must be 0/2/4/8 and match the TP hello\n");
+        fprintf(stderr, "ds4: native GLM5 draft width must be 0/2/4/6/8 and match the TP hello\n");
         return 0;
     }
     const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
@@ -51814,6 +51814,11 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             !s->glm5_native_host_logits) return 0;
         s->glm5_native_rows = native_rows;
         fprintf(stderr, "ds4: native GLM5 draft enabled (research, max target rows=%u)\n", native_rows);
+        fprintf(stderr, "ds4: native GLM5 config proposals=%u hello=0x%016llx verifier_workspaces=%u/%u/%u\n",
+            native_rows-1u, (unsigned long long)ds4_tp_prefill_config(e->tp.ctx),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[0]),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[1]),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[2]));
     }
     s->glm5_next_ready = true;
     fprintf(stderr, "ds4: GLM5 ordinary executor enabled (experimental, TP/RDMA)\n");

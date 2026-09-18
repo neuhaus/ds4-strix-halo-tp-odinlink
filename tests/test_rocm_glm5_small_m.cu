@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
                     layer,role,rank,m,arm,(unsigned long long)mismatches,max_abs);
                 if (arm==2u) { REQUIRE(mismatches==0u); exact_values+=ref.size(); }
             }
-            if (!baseline && layer==0u && !output && rank==0u && m==2u) {
+            if (!baseline && layer==0u && !output && rank==0u && m==glm5_test_verifier_widths().front()) {
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","invalid",1)==0);
                 REQUIRE(!launch(2u));
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1)==0);
@@ -194,8 +194,9 @@ int main(int argc, char **argv) {
                 REQUIRE(std::memcmp(ref.data(),got.data(),ref.size()*4u)==0);
                 std::puts("PASS small-M guards and unchanged M1 under opt-in");
             }
-            if (!baseline && layer==0u && !output && rank==0u && m==8u) {
-                for (unsigned tail : {3u,7u}) {
+            if (!baseline && layer==0u && !output && rank==0u && m==glm5_test_verifier_widths().back()) {
+                for (unsigned tail : {3u,5u,7u}) {
+                    if (tail>m) continue;
                     std::vector<float> control((size_t)tail*n), candidate(control.size());
                     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","0",1)==0);
                     REQUIRE(ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,offset,k,n,x,tail) && ds4_gpu_synchronize());
@@ -205,7 +206,7 @@ int main(int argc, char **argv) {
                     REQUIRE(ds4_gpu_tensor_read(y,0u,candidate.data(),candidate.size()*4u));
                     REQUIRE(std::memcmp(control.data(),candidate.data(),control.size()*4u)==0);
                 }
-                std::puts("PASS unsupported M3/M7 keep incumbent dispatch");
+                std::puts("PASS fitting unsupported M3/M5/M7 keep incumbent dispatch");
             }
             if (layer==0u && (head || output || std::strcmp(role,"q")==0)) {
                 hipEvent_t begin,end;

@@ -31,6 +31,8 @@ int main(int argc, char **argv) {
     CHECK(leader || !std::strcmp(argv[1], "worker"));
     CHECK(!std::strcmp(argv[6], "0") || !std::strcmp(argv[6], "1"));
     const bool ready = !std::strcmp(argv[6], "1");
+    const uint32_t only_rows=ds4_tp_glm5_native_rows_parse(std::getenv("DS4_TEST_NATIVE_ROWS"));
+    CHECK(only_rows!=UINT32_MAX);
     const bool mismatch = argc == 8 && !std::strcmp(argv[7], "ready-mismatch");
     const bool handoff = argc == 8 && !std::strncmp(argv[7], "handoff", 7);
     const bool route_fail = handoff && !std::strcmp(argv[7], "handoff-route-fail");
@@ -64,6 +66,7 @@ int main(int argc, char **argv) {
     id.quant_bits = 4u; id.ctx_size = 1024u;
     id.prefill_config = ready ? DS4_TP_CONFIG_BULK_RECV_READY : 0u;
     if (handoff) id.prefill_config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+    if (only_rows) id.prefill_config |= ds4_tp_glm5_native_config(only_rows);
     if (transition) {
         id.n_layer = 45;
         id.gate_slot_step = 1;
@@ -71,7 +74,7 @@ int main(int argc, char **argv) {
         for (unsigned slot = 0; slot < 90; ++slot)
             if (slot >= 6 || slot % 2 == 0)
                 id.gate_slot_mask[slot / 64] |= UINT64_C(1) << (slot % 64);
-        id.prefill_config |= UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+        if (!only_rows) id.prefill_config |= ds4_tp_glm5_native_config(8u);
     }
     char err[512] = {};
     ds4_tp *tp = nullptr;
@@ -88,7 +91,8 @@ int main(int argc, char **argv) {
     const uint32_t rank = leader ? 0u : 1u;
     uint32_t seq = 0;
     if (handoff) {
-        for (uint32_t rows : {2u,4u,8u}) {
+        for (uint32_t rows : {2u,4u,6u,8u}) {
+            if (only_rows && rows!=only_rows) continue;
             for (unsigned cycle=0;cycle<4;++cycle) {
                 for (unsigned phase=0;phase<2;++phase) {
                     const bool fault=(phase==0 && route_fail) || (phase==1 && compute_fail);
@@ -129,7 +133,7 @@ int main(int argc, char **argv) {
         }
         CHECK(!ds4_tp_failed(tp));
         ds4_tp_free(tp); CHECK(hipHostFree(slab)==hipSuccess);
-        std::printf("PASS handoff RoCE rank=%u exchanges=%u rows=2/4/8 changed_payload=1\n",rank,seq);
+        std::printf("PASS handoff RoCE rank=%u exchanges=%u selected_rows=%u changed_payload=1\n",rank,seq,only_rows);
         return 0;
     }
     if (mismatch) {
@@ -171,7 +175,8 @@ int main(int argc, char **argv) {
         std::printf("PASS bulk native-tail rank=%u ready=%u cycles=3 changed_payload=1\n", rank, ready);
         return 0;
     }
-    for (uint32_t rows : {1u, 2u, 4u, 8u, 256u, 257u, 512u, 513u}) {
+    for (uint32_t rows : {1u, 2u, 4u, 6u, 8u, 256u, 257u, 512u, 513u}) {
+        if (only_rows && rows!=only_rows) continue;
         const uint32_t values = rows * 4096u;
         const unsigned repeats = rows <= 8u ? 32u : 2u;
         std::vector<double> samples;

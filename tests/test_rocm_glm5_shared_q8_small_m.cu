@@ -109,6 +109,8 @@ int main() {
             };
             bad_pair(gate.view,up.view,gate_offset,4096,1024,4352,0,1);
             bad_pair(gate.view,up.view,gate_offset,4096,1024,4352,0,3);
+            bad_pair(gate.view,up.view,gate_offset,4096,1024,4352,0,5);
+            bad_pair(gate.view,up.view,gate_offset,4096,1024,4352,0,7);
             bad_pair(gate.view,up.view,gate_offset,2048,1024,4352,0,m);
             bad_pair(gate.view,up.view,gate_offset,4096,1023,4352,0,m);
             bad_pair(gate.view,up.view,gate_offset,4096,1024,2176,0,m);

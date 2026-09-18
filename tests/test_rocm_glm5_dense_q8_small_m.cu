@@ -102,6 +102,8 @@ int main() {
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,m));
             REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1)==0);
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,1));
+            for (unsigned bad : {3u,5u,7u})
+                REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,bad));
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,gate.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,m));
             auto *short_out=ds4_gpu_tensor_view(gate.view,0,gate.count*4-4); REQUIRE(short_out);
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(short_out,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,m));

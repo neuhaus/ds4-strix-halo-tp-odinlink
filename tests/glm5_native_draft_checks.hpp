@@ -456,7 +456,10 @@ static void native_refresh_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned pr
 
 static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
     const uint64_t old_config = x.tp->prefill_config;
-    x.tp->prefill_config |= UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+    x.tp->prefill_config &= ~(DS4_TP_CONFIG_GLM5_NATIVE_SIX |
+        (UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT));
+    x.tp->prefill_config |= ds4_tp_glm5_native_config(m);
+    REQUIRE(ds4_tp_glm5_native_rows(x.tp->prefill_config)==m);
     State target(*x.model), serial(*x.model), draft(*x.model,true), teacher(*x.model,true);
     Workspace scalar(1), batch(m), dw(1,true), tw(1,true);
     Tensor hc(hc_row), ref_hc(hc_row), scalar_logits(native_vocab), ref_logits(native_vocab);
@@ -518,7 +521,7 @@ static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
 }
 
 static void native_refresh_checks(ds4_glm5_next_exec_ctx &x) {
-    for(unsigned m : glm5_test_verifier_widths()) for(unsigned prefix : {0u,3u,8191u,8192u})
+    for(unsigned m : glm5_test_verifier_widths()) for(unsigned prefix : {0u,1u,2u,3u,8191u,8192u})
         for(unsigned k=1;k<=m;++k) native_refresh_case(x,m,prefix,k);
     // An incomplete journal is refused before rollback. A late GPU range
     // refusal after rollback/KV writes poisons the private owner.

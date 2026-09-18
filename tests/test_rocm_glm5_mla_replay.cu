@@ -234,7 +234,7 @@ int main() {
         Fixture f(g,ape);
         for (unsigned prefix : {0u,1u,2u,3u,2044u,2045u,2046u,2047u,
                                 2048u,2049u,8192u,8193u,8194u,8195u})
-            for (unsigned m : {2u,4u,8u}) for (unsigned accepted=0;accepted<=m;++accepted) {
+            for (unsigned m : glm5_test_verifier_widths()) for (unsigned accepted=0;accepted<=m;++accepted) {
                 run_case(f,prefix,m,accepted,false); ++cases;
                 if (!(prefix%4) && !(m%4)) {
                     run_case(f,prefix,m,accepted,true); ++cases;

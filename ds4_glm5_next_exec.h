@@ -12,7 +12,7 @@ extern "C" {
 struct ds4_tp;
 typedef struct ds4_glm5_next_workspace ds4_glm5_next_workspace;
 
-/* Research leaf for unchanged Q8_0 dense FFNs, M=2/4/8: paired K4096/N12288
+/* Research leaf for unchanged Q8_0 dense FFNs, M=2/4/6/8: paired K4096/N12288
  * gate/up (out1 non-NULL), or single K12288/N4096 down (out1 NULL).
  * Requires production Q8 tile mode 1 and exact shared-X prefetch=8 settings.
  * Independent contiguous F32 tensors; no GPU allocation or weight expansion.
@@ -24,7 +24,7 @@ int ds4_rocm_glm5_dense_q8_small_m(
         uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t tokens);
 
-/* Production-unused shared-expert Q8_0 leaf, M=2/4/8, same settings as above.
+/* Production-unused shared-expert Q8_0 leaf, M=2/4/6/8, same settings as above.
  * Pair: rank-local gate/up K4096/N1024, row_bytes=4352, k_first=0.
  * Single: down K1024/N4096, full row_bytes=2176, k_first=0 or1024;
  * offset0 names the unsliced tensor, offset1 must be zero. Original strides
@@ -143,7 +143,7 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
 /* Retire a completed M-1 native proposal journal and rebuild K accepted
  * input rows from actual normalized target hidden, using scalar teacher
  * arithmetic. Before the cycle target consumed N inputs, private draft N-1.
- * target_hidden contains exactly M rows (M=2/4/8), input_tokens the verified
+ * target_hidden contains exactly M rows (M=2/4/6/8), input_tokens the verified
  * [root, proposals...], and K includes root (1..M). previous_hidden initially
  * holds target h[N-1]. Warm [previous, target_hidden[0..K-2]] with inputs[0..K-1],
  * then replace previous_hidden with target_hidden[K-1]. The correction/bonus
@@ -275,7 +275,7 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
 /* Research full-target transaction. Reserve every trunk journal first;
  * partial reservation failure retains bounded storage owned/freed by state.
  * Caller owns exact M-row hidden scratch, hidden output and vocabulary logits
- * (M=2/4/8), plus distinct scalar/decode and M-row workspaces. The wrapper
+ * (M=2/4/6/8), plus distinct scalar/decode and M-row workspaces. The wrapper
  * allocates no GPU storage; scalar FFNs retain their ordinary residency policy.
  * Preload the production compressed slices before an allocation-free timed
  * pass. Caller buffers must be allocated independently of workspace/state

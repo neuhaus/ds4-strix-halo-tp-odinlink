@@ -559,6 +559,28 @@ static int test_native_journal_lengths(void) {
     return 1;
 }
 
+static int test_width_six_reservation(void) {
+    ds4_glm5_next_model_offsets model; make_valid(&model);
+    for (unsigned capacity=4;capacity<=6;capacity+=2) {
+        ds4_glm5_next_state state={0}; FILE *quiet=tmpfile();
+        CHECK(quiet && ds4_glm5_next_state_init(&state,&model,16u,quiet), "six-row owner");
+        ds4_glm5_kda_layer_state *k=&state.kda.layer[0];
+        ds4_glm5_next_mla_state *m=&state.mla[3];
+        for (unsigned invalid=5;invalid<=7;invalid+=2) {
+            CHECK(!ds4_glm5_kda_replay_reserve(k,invalid,0), "KDA excludes odd target widths");
+            CHECK(!ds4_glm5_next_mla_replay_reserve(m,invalid), "MLA excludes odd target widths");
+        }
+        CHECK(ds4_glm5_kda_replay_reserve(k,capacity,0) &&
+            ds4_glm5_next_mla_replay_reserve(m,capacity), "reserve exact target width");
+        CHECK(ds4_glm5_kda_verify_ready(k,6,0)==(capacity==6) &&
+            ds4_glm5_next_mla_verify_ready(m,6)==(capacity==6), "six rows require six-row journal");
+        CHECK(!ds4_glm5_kda_verify_ready(k,8,0) &&
+            !ds4_glm5_next_mla_verify_ready(m,8), "six-row journal cannot serve eight");
+        ds4_glm5_next_state_free(&state); fclose(quiet);
+    }
+    return 1;
+}
+
 #ifdef DS4_GLM5_TARGET_COMMIT_TEST
 /* Exercise the production all-layer finish with deterministic host backend
  * failures. This is lifecycle/atomicity evidence, not numerical GPU evidence. */
@@ -580,10 +602,9 @@ int ds4_rocm_glm5_kda_replay_commit(ds4_glm5_kda_layer_state *s,
     return ++replay_calls != fail_replay_call;
 }
 
-static int stage_target(ds4_glm5_next_exec_ctx *ctx, ds4_glm5_next_state *s) {
-    const uint32_t n = 4;
+static int stage_target(ds4_glm5_next_exec_ctx *ctx, ds4_glm5_next_state *s, uint32_t n) {
     ds4_glm5_kda_workspace w = {.capacity_tokens=n};
-    ds4_gpu_tensor input = {.bytes=4u*4096u*4u};
+    ds4_gpu_tensor input = {.bytes=n*4096u*4u};
     for (unsigned il = 0; il < 45; ++il) {
         const int reserved = il % 4u != 3u ?
             ds4_glm5_kda_replay_reserve(&s->kda.layer[il], n, ctx->tp_rank) :
@@ -619,7 +640,7 @@ static int stage_target(ds4_glm5_next_exec_ctx *ctx, ds4_glm5_next_state *s) {
     return 1;
 }
 
-static int test_target_commit(void) {
+static int test_target_commit(unsigned width) {
     reset_fakes();
     setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT", "1", 1);
     ds4_glm5_next_model_offsets model;
@@ -628,21 +649,21 @@ static int test_target_commit(void) {
     FILE *quiet = fopen("/dev/null", "w");
     CHECK(quiet && ds4_glm5_next_state_init(&state, &model, 8, quiet), "target state init");
     ds4_tp peer = {0};
-    ds4_gpu_tensor out = {.bytes=65536}, in = {.bytes=65536};
+    ds4_gpu_tensor out = {.bytes=width*16384u}, in = {.bytes=width*16384u};
     uint64_t sequence = 81;
     ds4_glm5_next_exec_ctx ctx = {
         .model=&model, .model_map=&model, .model_size=1, .tp=&peer,
         .tp_big_out=&out, .tp_big_in=&in, .tp_big_out_host=&out,
         .tp_big_in_host=&in, .tp_sequence=&sequence,
     };
-    for (unsigned accepted = 0; accepted <= 4; ++accepted) {
-        CHECK(stage_target(&ctx, &state), "complete pending target");
+    for (unsigned accepted = 0; accepted <= width; ++accepted) {
+        CHECK(stage_target(&ctx, &state, width), "complete pending target");
         const int copies = copy_calls, commits = replay_calls;
         state.kda.layer[44].pending_tokens = 2;
         CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted) &&
               state.valid && copy_calls == copies && replay_calls == commits,
               "last-layer mismatch prevents every commit");
-        state.kda.layer[44].pending_tokens = 4;
+        state.kda.layer[44].pending_tokens = width;
         state.mla[43].token_count = 1; state.mla[43].tail_count = 1;
         CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted) &&
               copy_calls == copies && replay_calls == commits, "late MLA mismatch prevents commit");
@@ -656,7 +677,7 @@ static int test_target_commit(void) {
         ctx.model_size++;
         CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "changed source refused");
         ctx.model_size--;
-        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, 5), "accepted bound");
+        CHECK(!ds4_glm5_next_target_verify_finish(&ctx, &state, width+1), "accepted bound");
         CHECK(ds4_glm5_next_target_verify_finish(&ctx, &state, accepted), "uniform accepted prefix");
         CHECK(!state.verification.tokens && !state.kda.pending_verifications &&
               !state.pending_mla_verifications && sequence == 81, "retire without rewinding transport");
@@ -667,7 +688,7 @@ static int test_target_commit(void) {
         CHECK(ds4_glm5_next_state_reset(&state), "reset accepted target");
     }
     for (unsigned mode = 0; mode < 3; ++mode) {
-        CHECK(stage_target(&ctx, &state), "stage failing target");
+        CHECK(stage_target(&ctx, &state, width), "stage failing target");
         if (mode == 0) fail_replay_call = replay_calls + 4; /* after MLA layer 3 */
         if (mode == 1) fail_copy_call = copy_calls + 1; /* after KDA layers 0..2 */
         if (mode == 2) fail_sync = 1; /* every launch succeeded */
@@ -679,7 +700,7 @@ static int test_target_commit(void) {
         fail_replay_call = fail_copy_call = fail_sync = 0;
         CHECK(ds4_glm5_next_state_reset(&state), "reset invalid target");
     }
-    CHECK(stage_target(&ctx, &state) && ds4_glm5_next_state_reset(&state) &&
+    CHECK(stage_target(&ctx, &state, width) && ds4_glm5_next_state_reset(&state) &&
           !state.verification.tokens && !ds4_glm5_next_target_verify_finish(&ctx, &state, 0),
           "reset cancels pending full target");
     ds4_glm5_next_state_free(&state);
@@ -698,8 +719,10 @@ int main(void) {
     ok &= test_mla_replay(false);
     ok &= test_mla_replay(true);
     ok &= test_native_journal_lengths();
+    ok &= test_width_six_reservation();
 #ifdef DS4_GLM5_TARGET_COMMIT_TEST
-    ok &= test_target_commit();
+    ok &= test_target_commit(4);
+    ok &= test_target_commit(6);
 #endif
     if (ok) fprintf(stderr, "PASS GLM5-next atomic resident state lifecycle\n");
     return ok ? 0 : 1;
