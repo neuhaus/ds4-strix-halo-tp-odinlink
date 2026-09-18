@@ -83,6 +83,29 @@ void ds4_glm5_next_workspace_begin_prefill(
 void ds4_glm5_next_workspace_begin_decode(
         ds4_glm5_next_workspace *workspace);
 
+/* Explicit native block45 workspace: one scalar activation set and one
+ * bounded eight-expert packed window, invalidated before each reuse. */
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create(uint32_t context_capacity);
+/* Target mHC -> contracted, post-output-norm hidden. Chained draft hidden is
+ * already post-shared-head-norm and must not pass through this conversion. */
+int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *workspace, const ds4_gpu_tensor *hc_hidden,
+        ds4_gpu_tensor *normalized_hidden);
+/* A shifted token plus normalized predecessor hidden consumes one private
+ * MLA row, returning normalized draft hidden and full logits. Caller owns
+ * distinct F32 input/hidden/logit buffers and the draft-only state. Pass its
+ * live mla[45] for teacher warming or a journal view for a speculative chain.
+ * Registered bulk exchanges only; all trunk experts must remain resident.
+ * One workspace binds to one owner/model/link on its first step, including
+ * across state resets. Model offsets and weights remain immutable; destroy
+ * the workspace before freeing that state or releasing model residency.
+ * On any execution failure the entire private owner is invalidated. This
+ * interface does not publish session history or select an accepted prefix. */
+int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_mla_state *draft_state, ds4_glm5_next_workspace *workspace,
+        const ds4_gpu_tensor *previous_normalized_hidden, uint32_t shifted_token,
+        ds4_gpu_tensor *normalized_hidden, ds4_gpu_tensor *logits);
+
 #ifdef DS4_TP_TEST_HOOKS
 uint64_t ds4_glm5_next_mla_stage_capture_bytes(uint32_t n_tokens);
 int ds4_glm5_next_mla_stage_capture_dump(

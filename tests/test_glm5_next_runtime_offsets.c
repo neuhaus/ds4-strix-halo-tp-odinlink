@@ -21,6 +21,9 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
     model->output_norm = next++;
     model->output = next++;
     model->nextn_eh_proj = next++;
+    model->nextn_enorm = next++;
+    model->nextn_hnorm = next++;
+    model->nextn_shared_head_norm = next++;
     model->layer_count = DS4_GLM5_NEXT_LAYER_COUNT;
     model->trunk_count = DS4_GLM5_NEXT_TRUNK_COUNT;
     model->nextn_count = 1u;
@@ -245,6 +248,18 @@ static int test_contract(void) {
     model.nextn_eh_proj = 0u;
     CHECK(!ds4_glm5_next_model_offsets_validate(&model),
           "missing nextn projection rejected");
+    make_valid(&model);
+    model.nextn_enorm = 0u;
+    CHECK(!ds4_glm5_next_model_offsets_validate(&model),
+          "missing native embedding norm rejected");
+    make_valid(&model);
+    model.nextn_hnorm = 0u;
+    CHECK(!ds4_glm5_next_model_offsets_validate(&model),
+          "missing native hidden norm rejected");
+    make_valid(&model);
+    model.nextn_shared_head_norm = 0u;
+    CHECK(!ds4_glm5_next_model_offsets_validate(&model),
+          "missing native shared-head norm rejected");
     make_valid(&model);
     model.layer[2].ffn = DS4_GLM5_NEXT_FFN_ROUTED;
     CHECK(!ds4_glm5_next_model_offsets_validate(&model),

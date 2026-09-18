@@ -4495,6 +4495,7 @@ typedef struct {
     ds4_tensor *output;
     ds4_tensor *nextn_eh_proj;
     ds4_glm5_next_layer_weights layer[DS4_MAX_LAYER];
+    ds4_tensor *nextn_enorm, *nextn_hnorm, *nextn_shared_head_norm;
     ds4_glm5_layer_kind schedule[DS4_MAX_LAYER];
     uint32_t layer_count;
     uint32_t trunk_count;
@@ -4532,12 +4533,19 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
     }
     w->nextn_eh_proj = required_tensorf(
         m, "blk.%u.nextn.eh_proj.weight", trunk_count);
+    w->nextn_enorm = required_tensorf(m, "blk.%u.nextn.enorm.weight", trunk_count);
+    w->nextn_hnorm = required_tensorf(m, "blk.%u.nextn.hnorm.weight", trunk_count);
+    w->nextn_shared_head_norm = required_tensorf(
+        m, "blk.%u.nextn.shared_head_norm.weight", trunk_count);
     w->trunk_count = trunk_count;
     w->nextn_count = nextn_count;
     w->offsets.token_embd = w->token_embd->abs_offset;
     w->offsets.output_norm = w->output_norm->abs_offset;
     w->offsets.output = w->output->abs_offset;
     w->offsets.nextn_eh_proj = w->nextn_eh_proj->abs_offset;
+    w->offsets.nextn_enorm = w->nextn_enorm->abs_offset;
+    w->offsets.nextn_hnorm = w->nextn_hnorm->abs_offset;
+    w->offsets.nextn_shared_head_norm = w->nextn_shared_head_norm->abs_offset;
     w->offsets.token_embd_type = w->token_embd->type;
     w->offsets.output_type = w->output->type;
     w->offsets.layer_count = layer_count;
@@ -6335,6 +6343,9 @@ static void config_validate_glm5_next_model(const ds4_model *m,
                                2, 4096, 154880, 0);
     tensor_expect_layout(bound.nextn_eh_proj,
                          DS4_TENSOR_BF16, 2, 8192, 4096, 0);
+    tensor_expect_layout(bound.nextn_enorm, DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(bound.nextn_hnorm, DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(bound.nextn_shared_head_norm, DS4_TENSOR_F32, 1, 4096, 0, 0);
     for (uint32_t il = 0; il < layers; ++il) {
         tensor_expect_layout(required_tensorf(m, "blk.%u.attn_norm.weight", il),
                              DS4_TENSOR_F32, 1, 4096, 0, 0);

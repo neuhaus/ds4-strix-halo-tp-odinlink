@@ -78,6 +78,8 @@ typedef struct {
     uint64_t output_norm;
     uint64_t output;
     uint64_t nextn_eh_proj;
+    /* Native block45 norms; the draft has plain residuals, without mHC. */
+    uint64_t nextn_enorm, nextn_hnorm, nextn_shared_head_norm;
     /* Exact GGUF types for ordinary-inference root matrices. Production
      * bindings populate these; zero preserves the original BF16 contract for
      * synthetic offset fixtures created before the fields existed. */
@@ -147,6 +149,9 @@ typedef struct ds4_glm5_next_state {
     uint64_t bytes;
     uint32_t pending_mla_verifications;
     ds4_glm5_next_verification verification;
+    /* A private native draft owns only mla[45], with no trunk/KDA storage. */
+    bool draft_only;
+    const ds4_glm5_next_model_offsets *draft_model;
     bool valid;
 } ds4_glm5_next_state;
 
@@ -193,6 +198,9 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
                              uint32_t context_capacity,
                              FILE *accounting);
 int ds4_glm5_next_state_reset(ds4_glm5_next_state *state);
+int ds4_glm5_next_draft_state_init(ds4_glm5_next_state *state,
+                                   const ds4_glm5_next_model_offsets *model,
+                                   uint32_t context_capacity, FILE *accounting);
 void ds4_glm5_next_state_invalidate(ds4_glm5_next_state *state);
 void ds4_glm5_next_state_free(ds4_glm5_next_state *state);
 /* Plan/commit one compact MLA row without mutating state before the GPU work

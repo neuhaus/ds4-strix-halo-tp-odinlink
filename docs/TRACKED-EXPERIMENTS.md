@@ -120,3 +120,11 @@ unchanged uncensored Q4 GGUF. Its dossier is
 `$DS4_RESEARCH_ROOT/candidates/glm53-uncensored-20260915/`. Local echo-peer
 checks do not establish real TP throughput or promotion. Session publication
 requires coordinator agreement on both ranks' verification and commit outcomes.
+
+The explicit native block45 draft step uses its own compact MLA state and a
+bounded eight-expert window of original Q4_K bytes. Its workspace remains bound
+to one state, immutable model and TP link. Native residual/norm semantics adapt
+donors `fa09e19` and `519cf21` from the retained September 14 successor; they do
+not merge that track. The adaptation, primary-source references and test scope
+are recorded in the same dossier under `research/native-draft-step-plan-20260918.md`.
+This step alone does not enable session drafting or establish acceptance/speed.

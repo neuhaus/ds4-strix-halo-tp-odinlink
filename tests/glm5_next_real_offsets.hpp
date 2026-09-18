@@ -59,7 +59,11 @@ static bool glm5_next_bind_real_offsets(
         !g.tensor("output.weight", {4096u, 154880u}, 30u, model.output) ||
         !glm5_next_layer_tensor(g, 45u, "nextn.eh_proj.weight",
                                {8192u, 4096u}, 30u,
-                               model.nextn_eh_proj)) return false;
+                               model.nextn_eh_proj) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.enorm.weight", {4096u}, 0u, model.nextn_enorm) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.hnorm.weight", {4096u}, 0u, model.nextn_hnorm) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.shared_head_norm.weight", {4096u}, 0u,
+                               model.nextn_shared_head_norm)) return false;
     model.token_embd_type = g.tensors.at("token_embd.weight").type;
     model.output_type = g.tensors.at("output.weight").type;
 

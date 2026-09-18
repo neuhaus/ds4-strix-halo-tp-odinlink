@@ -17,6 +17,7 @@ static int alloc_calls;
 static int free_calls;
 static int fill_calls;
 static int fail_alloc_call;
+static int fail_fill_call;
 static int copy_calls, fail_copy_call;
 static FILE *accounting_stream;
 static int accounting_seen_before_alloc;
@@ -44,7 +45,7 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
     (void)value;
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     ++fill_calls;
-    return 1;
+    return fill_calls != fail_fill_call;
 }
 
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
@@ -77,6 +78,7 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
 static void reset_fakes(void) {
     alloc_calls = free_calls = fill_calls = 0;
     fail_alloc_call = 0;
+    fail_fill_call = 0;
     copy_calls = fail_copy_call = 0;
     accounting_stream = NULL;
     accounting_seen_before_alloc = 0;
@@ -95,6 +97,9 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
     model->output_norm = next++;
     model->output = next++;
     model->nextn_eh_proj = next++;
+    model->nextn_enorm = next++;
+    model->nextn_hnorm = next++;
+    model->nextn_shared_head_norm = next++;
     model->layer_count = DS4_GLM5_NEXT_LAYER_COUNT;
     model->trunk_count = DS4_GLM5_NEXT_TRUNK_COUNT;
     model->nextn_count = 1u;
@@ -302,15 +307,95 @@ static int test_partial_failure(void) {
     return 1;
 }
 
-static int test_mla_replay(void) {
+static int test_draft_lifecycle(void) {
+    ds4_glm5_next_model_offsets model;
+    make_valid(&model);
+    FILE *stream = tmpfile();
+    CHECK(stream, "open native state accounting");
+    for (unsigned capacity = 8u; capacity <= 8192u; capacity *= 2u) {
+        reset_fakes();
+        ds4_glm5_next_state state = {0};
+        CHECK(ds4_glm5_next_draft_state_init(&state, &model, capacity, stream),
+              "initialize native private state through 8K");
+        ds4_glm5_next_mla_state *s = &state.mla[45];
+        const uint64_t pools = capacity / 4u;
+        CHECK(state.valid && state.draft_only && state.layer_count == 46u &&
+              state.mla_count == 1u && !state.kda.layer && !state.kda.valid &&
+              state.bytes == (uint64_t)capacity * (512u * 4u + 4u) +
+                  pools * (128u * 4u + 20u) + 8u * 128u * 4u &&
+              alloc_calls == 7 && fill_calls == 3,
+              "one original compact MLA cache, no trunk or KDA allocation");
+        for (unsigned il = 0; il < 45u; ++il)
+            CHECK(!state.mla[il].compact_kv && !state.mla[il].replay &&
+                  !state.mla[il].index_pool && !state.mla[il].index_tail &&
+                  !state.mla[il].valid, "trunk slots remain empty");
+        CHECK(!ds4_glm5_next_draft_state_init(&state, &model, capacity, stream) &&
+              !ds4_glm5_next_state_init(&state, &model, capacity, stream),
+              "live native owner cannot be reinitialized or used as a target");
+        ds4_glm5_next_mla_state clone = *s;
+        CHECK(!ds4_glm5_next_mla_append_commit(&clone) &&
+              !ds4_glm5_next_mla_replay_reserve(&clone, 4u),
+              "copied live native owner cannot append or reserve");
+        ++s->capacity_tokens;
+        CHECK(!ds4_glm5_next_mla_append_commit(s), "wrong context refused");
+        --s->capacity_tokens;
+        s->owner = NULL;
+        CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
+              "native reset refuses a wrong owner");
+        s->owner = &state;
+        CHECK(ds4_glm5_next_state_reset(&state), "native ownership restored");
+        state.mla[3].index_tail = s->index_tail;
+        CHECK(!ds4_glm5_next_state_reset(&state), "native reset refuses trunk storage");
+        state.mla[3].index_tail = NULL;
+        CHECK(ds4_glm5_next_state_reset(&state), "native reset after refused trunk alias");
+        for (unsigned i = 0; i < capacity; ++i)
+            CHECK(ds4_glm5_next_mla_append_commit(s), "advance private MLA to capacity");
+        CHECK(!ds4_glm5_next_mla_append_commit(s), "native context bound");
+        ds4_glm5_next_state_invalidate(&state);
+        CHECK(!state.valid && !s->valid && !ds4_glm5_next_mla_append_commit(s),
+              "native invalidation prevents further writes");
+        CHECK(ds4_glm5_next_state_reset(&state) && state.valid && s->valid &&
+              !s->token_count && !s->tail_count && !s->complete_pools &&
+              alloc_calls == 7, "native reset recovers without allocation");
+        ds4_glm5_next_state_free(&state);
+        CHECK(free_calls == alloc_calls && !state.draft_only &&
+              !ds4_glm5_next_state_reset(&state), "native owner fully freed");
+    }
+    for (int allocation = 1; allocation <= 7; ++allocation) {
+        reset_fakes();
+        ds4_glm5_next_state state = {0};
+        fail_alloc_call = allocation;
+        CHECK(!ds4_glm5_next_draft_state_init(&state, &model, 9u, stream) &&
+              alloc_calls == 7 && free_calls == 6 && !state.draft_only && !state.bytes,
+              "every native allocation failure cleans up the entire owner");
+    }
+    for (int fill = 1; fill <= 3; ++fill) {
+        reset_fakes();
+        ds4_glm5_next_state state = {0};
+        fail_fill_call = fill;
+        CHECK(!ds4_glm5_next_draft_state_init(&state, &model, 9u, stream) &&
+              alloc_calls == 7 && free_calls == 7 && !state.valid && !state.bytes,
+              "every native initialization failure frees all storage");
+    }
+    reset_fakes();
+    ds4_glm5_next_state state = {0};
+    CHECK(!ds4_glm5_next_draft_state_init(&state, &model, 0u, stream) &&
+          !alloc_calls, "zero native context refused before allocation");
+    fclose(stream);
+    return 1;
+}
+
+static int test_mla_replay(bool draft) {
     reset_fakes();
     ds4_glm5_next_model_offsets model;
     make_valid(&model);
     ds4_glm5_next_state state = {0};
     FILE *stream = tmpfile();
-    CHECK(stream && ds4_glm5_next_state_init(&state, &model, 16u, stream),
+    CHECK(stream && (draft ?
+          ds4_glm5_next_draft_state_init(&state, &model, 16u, stream) :
+          ds4_glm5_next_state_init(&state, &model, 16u, stream)),
           "initialize replay owner");
-    ds4_glm5_next_mla_state *s = &state.mla[3], *view = NULL;
+    ds4_glm5_next_mla_state *s = &state.mla[draft ? 45 : 3], *view = NULL;
     CHECK(!ds4_glm5_next_mla_replay_bytes(s) &&
           !ds4_glm5_next_mla_replay_reserve(s, 3u), "explicit legal capacity");
     ds4_glm5_next_mla_state alias = *s;
@@ -376,6 +461,24 @@ static int test_mla_replay(void) {
           ds4_glm5_next_mla_replay_bytes(s) == 8192u,
           "reset retires view while retaining reservation");
     CHECK(alloc_calls == reserved_allocs, "begin/record/commit/reset allocate nothing");
+
+    for (unsigned accepted = 0; accepted <= 4u; ++accepted) {
+        CHECK(ds4_glm5_next_state_reset(&state), "reset accepted-prefix fixture");
+        for (unsigned i = 0; i < 3u; ++i)
+            CHECK(ds4_glm5_next_mla_append_commit(s), "seed pool boundary frontier");
+        CHECK(ds4_glm5_next_mla_verify_begin(s, 4u, &view), "begin prefix fixture");
+        for (unsigned i = 0; i < 4u; ++i) {
+            CHECK(ds4_glm5_next_mla_verify_record(view, 3u + i, s->index_tail, 0u,
+                      s->pool_gate_tail, 0u, 1u) &&
+                  ds4_glm5_next_mla_append_commit(view), "record sequential draft rows");
+        }
+        CHECK(s->token_count == 3u && ds4_glm5_next_mla_verify_finish(s, accepted) &&
+              s->token_count == 3u + accepted &&
+              s->complete_pools == (3u + accepted) / 4u &&
+              s->tail_count == (3u + accepted) % 4u &&
+              !state.pending_mla_verifications && ds4_glm5_next_mla_append_commit(s),
+              "zero, partial and full acceptance leave a usable live continuation");
+    }
 
     /* Copy submission failures at begin, both record copies and both commit
      * copies must poison the whole state. The byte-level GPU test is separate. */
@@ -548,7 +651,9 @@ int main(void) {
     int ok = test_bytes();
     ok &= test_lifecycle();
     ok &= test_partial_failure();
-    ok &= test_mla_replay();
+    ok &= test_draft_lifecycle();
+    ok &= test_mla_replay(false);
+    ok &= test_mla_replay(true);
 #ifdef DS4_GLM5_TARGET_COMMIT_TEST
     ok &= test_target_commit();
 #endif

@@ -166,6 +166,7 @@ int ds4_glm5_next_model_offsets_validate(
         model->trunk_count != DS4_GLM5_NEXT_TRUNK_COUNT ||
         model->nextn_count != 1u || !model->token_embd ||
         !model->output_norm || !model->output || !model->nextn_eh_proj ||
+        !model->nextn_enorm || !model->nextn_hnorm || !model->nextn_shared_head_norm ||
         !(model->rms_norm_eps > 0.0f) || model->rms_norm_eps > 1.0f ||
         !(model->hc_eps > 0.0f) || model->hc_eps > 1.0f) {
         return 0;
