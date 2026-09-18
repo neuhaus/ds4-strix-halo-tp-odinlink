@@ -344,7 +344,7 @@ static void native_draft_checks(ds4_glm5_next_exec_ctx &x) {
         x.tp->fail_call=0; x.tp->failed=false;
     }
     REQUIRE(ds4_glm5_next_state_reset(&s.s));
-    for(unsigned m : {2u,4u,8u}) for(unsigned accepted=0;accepted<=m;++accepted)
+    for(unsigned m : glm5_test_verifier_widths()) for(unsigned accepted=0;accepted<=m;++accepted)
         native_draft_case(x,m,3,accepted);
     for(unsigned prefix : {0u,2047u,2048u,8192u,8193u}) for(unsigned accepted=0;accepted<=4;++accepted)
         native_draft_case(x,4,prefix,accepted);
@@ -518,7 +518,7 @@ static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
 }
 
 static void native_refresh_checks(ds4_glm5_next_exec_ctx &x) {
-    for(unsigned m : {2u,4u,8u}) for(unsigned prefix : {0u,3u,8191u,8192u})
+    for(unsigned m : glm5_test_verifier_widths()) for(unsigned prefix : {0u,3u,8191u,8192u})
         for(unsigned k=1;k<=m;++k) native_refresh_case(x,m,prefix,k);
     // An incomplete journal is refused before rollback. A late GPU range
     // refusal after rollback/KV writes poisons the private owner.
@@ -537,6 +537,6 @@ static void native_refresh_checks(ds4_glm5_next_exec_ctx &x) {
     model.layer[45].mla.index_k=x.model_size-1; // backend failure injection, original model bytes unchanged
     REQUIRE(!ds4_glm5_next_draft_refresh(&broken,&state.s,w,target,tokens,1,4,2,previous) &&
         !state.s.valid && !state.s.mla[45].valid && !state.s.pending_mla_verifications);
-    for(unsigned m : {2u,4u,8u}) native_refresh_target_cycles(x,m);
+    for(unsigned m : glm5_test_verifier_widths()) native_refresh_target_cycles(x,m);
     std::puts("PASS native target-hidden refresh and greedy cycles; simulated_peer=echo network_test=0 quality_test=0");
 }

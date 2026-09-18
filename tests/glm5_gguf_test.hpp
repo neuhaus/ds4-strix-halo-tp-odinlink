@@ -2,6 +2,7 @@
 #define DS4_TESTS_GLM5_GGUF_TEST_HPP
 
 #include <cstdint>
+#include <cstdio>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,17 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// Optional narrow diagnostic selection; never round a requested width.
+static inline std::vector<unsigned> glm5_test_verifier_widths() {
+    const char *value = std::getenv("DS4_TEST_NATIVE_ROWS");
+    if (!value) return {2u, 4u, 6u, 8u};
+    if (value[0] && !value[1] &&
+        (value[0]=='2' || value[0]=='4' || value[0]=='6' || value[0]=='8'))
+        return {(unsigned)(value[0]-'0')};
+    std::fprintf(stderr, "invalid DS4_TEST_NATIVE_ROWS (expected 2/4/6/8)\n");
+    std::exit(1);
+}
 
 static inline bool glm5_test_router_seed(uint32_t &seed) {
     const char *value = std::getenv("DS4_GLM5_ROUTER_JITTER_SEED");

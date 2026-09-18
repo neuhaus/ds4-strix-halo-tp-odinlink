@@ -124,7 +124,7 @@ int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
 int ds4_glm5_kda_workspace_bytes(uint32_t capacity_tokens, uint64_t *bytes);
 void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace);
 /* Research-only accepted-prefix transaction for one TP half of an owned,
- * full 64-head layer state. Reserve explicitly (capacity 2/4/8; rank 0/1).
+ * full 64-head layer state. Reserve explicitly (capacity 2/4/6/8; rank 0/1).
  * Verify leaves live histories/recurrent bytes and token_count unchanged,
  * blocking ordinary begin/finish/commit until verify_finish. The count in
  * finish is consumed input rows, not predicted draft tokens: zero discards.

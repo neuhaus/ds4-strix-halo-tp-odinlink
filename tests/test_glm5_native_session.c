@@ -200,8 +200,10 @@ static fixture *create(int fd, unsigned rank, unsigned rows, unsigned prefix) {
     s->checkpoint.v = calloc(prefix ? prefix : 1u, sizeof(int)); CHECK(s->checkpoint.v);
     s->glm5_next_ws = ds4_glm5_next_draft_workspace_create_rows(1, s->ctx_size);
     s->glm5_native_ws = ds4_glm5_next_draft_workspace_create_rows(1, s->ctx_size);
-    for (unsigned i = 0; i < 3; ++i)
-        s->glm5_native_verify_ws[i] = ds4_glm5_next_draft_workspace_create_rows(2u << i, s->ctx_size);
+    for (unsigned i = 0; i < 3; ++i) {
+        const unsigned n = ds4_tp_glm5_native_workspace_rows(rows, i);
+        if (n) s->glm5_native_verify_ws[i] = ds4_glm5_next_draft_workspace_create_rows(n, s->ctx_size);
+    }
     s->glm5_native_previous = ds4_gpu_tensor_alloc(row_bytes);
     s->glm5_native_chain = ds4_gpu_tensor_alloc(row_bytes);
     s->glm5_native_hidden = ds4_gpu_tensor_alloc(row_bytes);
@@ -272,7 +274,7 @@ static void run_pair(fixture *a, fixture *b, unsigned expected) {
 }
 static void cycle_cases(void) {
     const unsigned prefixes[] = {1, 3, 8191, 8192};
-    for (unsigned p = 0; p < 4; ++p) for (unsigned rows = 2; rows <= 8; rows *= 2)
+    for (unsigned p = 0; p < 4; ++p) for (unsigned rows = 2; rows <= 8; rows += 2)
         for (unsigned k = 1; k <= rows; ++k) {
             int fd[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
             fixture *a = create(fd[0], 0, rows, prefixes[p]), *b = create(fd[1], 1, rows, prefixes[p]);
@@ -318,6 +320,39 @@ static void cycle_cases(void) {
     CHECK(a->accepted[3] == -1 && b->accepted[3] == -1);
     destroy(a); destroy(b);
 }
+static void width_six_cases(void) {
+    /* Mismatched workspace, rank configuration, command width and buffers
+     * must be rejected on both ranks before even the first proposal. */
+    for (unsigned fault=0; fault<6; ++fault) for (unsigned rank=0; rank<2; ++rank) {
+        int fd[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fd)==0);
+        fixture *a=create(fd[0],0,6,8192), *b=create(fd[1],1,6,8192);
+        prepare(a,6,6,F_NONE,9,-1); prepare(b,6,6,F_NONE,9,-1);
+        fixture *bad=rank?b:a;
+        switch (fault) {
+        case 0: bad->s.glm5_native_verify_ws[2]->rows=8; break;
+        case 1: bad->s.glm5_native_verify_ws[2]->rows=4; break;
+        case 2: bad->s.glm5_native_rows=8; break;
+        case 3: bad->command.rows=8; break;
+        case 4: bad->command.rows=4; break;
+        case 5: --bad->s.glm5_native_logits->bytes; break;
+        }
+        run_pair(a,b,0); CHECK(!a->step && !b->step); destroy(a); destroy(b);
+    }
+    for (unsigned limit=2; limit<=6; ++limit) {
+        int fd[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fd)==0);
+        fixture *a=create(fd[0],0,6,12288-limit), *b=create(fd[1],1,6,12288-limit);
+        const unsigned rows=ds4_tp_glm5_native_cycle_rows(6,limit);
+        prepare(a,rows,rows,F_NONE,9,-1); prepare(b,rows,rows,F_NONE,9,-1);
+        run_pair(a,b,rows); destroy(a); destroy(b);
+    }
+    for (unsigned fault=F_VIEW; fault<=F_SYNC; ++fault) for (unsigned rank=0; rank<2; ++rank) {
+        int fd[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fd)==0);
+        fixture *a=create(fd[0],0,6,8192), *b=create(fd[1],1,6,8192);
+        prepare(a,6,3,rank==0?fault:F_NONE,9,-1);
+        prepare(b,6,3,rank==1?fault:F_NONE,9,-1);
+        run_pair(a,b,0); destroy(a); destroy(b);
+    }
+}
 static void teacher_cases(void) {
     ds4_session disabled = {0};
     CHECK(ds4_session_glm5_native_teach(&disabled, NULL, NULL, NULL, 0)); ++cases;
@@ -355,7 +390,7 @@ static void teacher_cases(void) {
     ds4_gpu_tensor_free(hc); destroy(f); ++cases;
 }
 int main(void) {
-    teacher_cases(); cycle_cases();
+    teacher_cases(); cycle_cases(); width_six_cases();
     printf("PASS native session cases=%u production_orchestration=1 arithmetic_doubles=1 real_socket_agreement=1\n", cases);
     return 0;
 }

@@ -91,14 +91,16 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
         s->glm5_native_previous_valid && c->session_id == s->tp_session_id &&
         c->cycle && c->cycle == s->glm5_native_cycle + 1u &&
         c->prefix == (uint32_t)s->checkpoint.len && c->prefix &&
-        (rows == 2u || rows == 4u || rows == 8u) && rows <= s->glm5_native_rows &&
+        ds4_tp_glm5_native_width_valid(rows) && rows <= s->glm5_native_rows &&
         c->prefix <= (uint32_t)s->ctx_size && rows <= (uint32_t)s->ctx_size - c->prefix &&
         c->root >= 0 && (uint32_t)c->root < DS4_N_VOCAB && c->eos >= -1 &&
         (c->eos < 0 || (uint32_t)c->eos < DS4_N_VOCAB) && c->root != c->eos &&
         s->glm5_native_state.mla[45].token_count + 1u == c->prefix &&
         s->glm5_next_state.valid && s->glm5_native_state.valid && !ds4_tp_failed(e->tp.ctx);
-    const uint32_t wi = rows == 8u ? 2u : rows == 4u ? 1u : 0u;
+    const uint32_t wi = rows >= 6u ? 2u : rows == 4u ? 1u : 0u;
     ds4_glm5_next_workspace *batch = ok ? s->glm5_native_verify_ws[wi] : NULL;
+    ok = ok && ds4_tp_glm5_native_workspace_rows(s->glm5_native_rows, wi) == rows &&
+        ds4_glm5_next_workspace_capacity(batch) == rows;
     ds4_gpu_tensor *hc[2] = {NULL, NULL}, *logits = NULL, *normalized = NULL;
     if (ok) {
         hc[0] = ds4_gpu_tensor_view(s->glm5_native_hc[0], 0, rows * row * 4u);

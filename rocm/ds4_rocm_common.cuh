@@ -534,7 +534,7 @@ template <uint32_t Tokens, uint32_t PanelK = 1024u>
 __global__ static void matmul_bf16_f32_small_m_exact_kernel(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim) {
-    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u,
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u || Tokens == 8u,
                   "supported small verification batches");
     static_assert(PanelK == 1024u || PanelK == 128u,
                   "wide projection or KDA low-rank expansion");

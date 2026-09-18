@@ -391,6 +391,11 @@ static int tp_hello_validate_runtime_features(uint32_t local, uint32_t peer,
 
 static int tp_hello_validate_prefill_config(uint64_t local, uint64_t peer,
                                             char *err, size_t errlen) {
+    if (ds4_tp_glm5_native_rows(local) == UINT32_MAX ||
+        ds4_tp_glm5_native_rows(peer) == UINT32_MAX) {
+        tp_set_err(err, errlen, "tp hello: invalid native width encoding");
+        return 0;
+    }
     if (local == peer) return 1;
     tp_set_err(err, errlen,
                "tp hello: prefill config mismatch (local=0x%016llx peer=0x%016llx)",
@@ -3591,7 +3596,7 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
 
 static int tp_native_cycle_valid(const ds4_tp_native_cycle *c) {
     return c && c->session_id && c->cycle && c->prefix &&
-        (c->rows == 2u || c->rows == 4u || c->rows == 8u) &&
+        ds4_tp_glm5_native_width_valid(c->rows) &&
         c->prefix <= UINT32_MAX - c->rows && c->root >= 0 && c->eos >= -1;
 }
 
@@ -3860,7 +3865,7 @@ int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
         uint32_t layer, frontier, rows, phase, failed, reserved;
     } mine = {0}, theirs = {0};
     if (!tp || layer >= 45u || phase > 1u ||
-        (rows != 2u && rows != 4u && rows != 8u) ||
+        !ds4_tp_glm5_native_width_valid(rows) ||
         frontier > UINT32_MAX - rows) return tp_native_fail(tp, err, errlen);
     mine.sequence = sequence; mine.route_hash = route_hash;
     mine.layer = layer; mine.frontier = frontier; mine.rows = rows;

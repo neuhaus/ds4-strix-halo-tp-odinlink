@@ -4330,7 +4330,7 @@ int ds4_glm5_next_layer_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
     if (!verify_layer_valid(ctx, il, state) || state->verification.tokens ||
         state->kda.pending_verifications ||
         state->pending_mla_verifications ||
-        (capacity != 2u && capacity != 4u && capacity != 8u)) return 0;
+        !ds4_tp_glm5_native_width_valid(capacity)) return 0;
     if (ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA)
         return verify_kda_layout(ctx, il) &&
             ds4_glm5_kda_replay_reserve(&state->kda.layer[il], capacity, ctx->tp_rank);
@@ -4554,7 +4554,7 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     if (!verify_layer_valid(ctx, il, state) || !batch_w || !scalar_w ||
         batch_w == scalar_w || !scalar_w->decode_phase ||
         batch_w->capacity_tokens != n_tokens || scalar_w->capacity_tokens != 1u ||
-        (n_tokens != 2u && n_tokens != 4u && n_tokens != 8u) ||
+        !ds4_tp_glm5_native_width_valid(n_tokens) ||
         !hc_in || !hc_out || hc_in == hc_out || ctx->trace_prefix ||
         ds4_gpu_tensor_bytes(hc_in) != n_tokens * row ||
         ds4_gpu_tensor_bytes(hc_out) != n_tokens * row ||
@@ -4721,7 +4721,7 @@ static int target_verify_ready(const ds4_glm5_next_exec_ctx *ctx,
     if (!verify_layer_valid(ctx, 0u, state) || state->verification.tokens ||
         state->kda.pending_verifications || state->pending_mla_verifications ||
         state->kda.kda_count != 34u || state->mla_count != DS4_GLM5_NEXT_MLA_COUNT ||
-        (tokens != 2u && tokens != 4u && tokens != 8u) || ctx->trace_prefix ||
+        !ds4_tp_glm5_native_width_valid(tokens) || ctx->trace_prefix ||
         !tp_context_valid_bytes(ctx, (uint64_t)tokens * GLM5_WIDTH * sizeof(float)))
         return 0;
     const uint64_t frontier = state->kda.layer[0].token_count;
@@ -5033,7 +5033,7 @@ int ds4_glm5_next_draft_refresh(const ds4_glm5_next_exec_ctx *ctx,
         !owner || !owner->valid || !owner->draft_only || owner->draft_model != ctx->model ||
         !w || !w->draft_only || !w->decode_phase || w->capacity_tokens != 1u ||
         !draft_binding_matches(ctx, owner, w) || !native_draft_settings() ||
-        !inputs || !prefix || (rows != 2u && rows != 4u && rows != 8u) ||
+        !inputs || !prefix || !ds4_tp_glm5_native_width_valid(rows) ||
         !accepted || accepted > rows || prefix > owner->context_capacity ||
         rows > owner->context_capacity - prefix ||
         ds4_gpu_tensor_bytes(target_hidden) != rows * row ||

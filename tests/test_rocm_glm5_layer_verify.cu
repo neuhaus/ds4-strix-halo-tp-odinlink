@@ -54,7 +54,7 @@ int ds4_tp_verify_layer_agree(ds4_tp *p,uint64_t sequence,uint32_t layer,
         uint32_t frontier,uint32_t rows,uint32_t phase,uint64_t hash,
         int local_ok,char *,size_t) {
     REQUIRE(layer>=3 && layer<45 && layer%4!=3 && phase<2 &&
-        (rows==2 || rows==4 || rows==8) && frontier<=UINT32_MAX-rows &&
+        ds4_tp_glm5_native_width_valid(rows) && frontier<=UINT32_MAX-rows &&
         (p->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
     ++p->layer_agrees[phase];
     if (!local_ok || p->failed || p->fail_agree_phase==(int)phase) {
@@ -684,22 +684,22 @@ int main(int argc,char **argv) {
         } else if (timing) {
             for (unsigned rank=first_rank;rank<end_rank;++rank) {
                 peer.rank=x.tp_rank=rank;
-                for (unsigned m : {2u,4u,8u}) target_timing(x,m);
+                for (unsigned m : glm5_test_verifier_widths()) target_timing(x,m);
             }
         } else if (target) {
             for (unsigned rank=first_rank;rank<(smoke?1u:end_rank);++rank) {
                 peer.rank=x.tp_rank=rank;
                 if (smoke) target_case(x,2,0,1);
-                else for (unsigned m : {2u,4u,8u})
-                    for (unsigned accepted : {0u,m/2u,m})
+                else for (unsigned m : glm5_test_verifier_widths())
+                    for (unsigned accepted=0;accepted<=m;++accepted)
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
                 if (handoff_compare) {
-                    for (unsigned m : {2u,4u,8u}) target_case(x,m,8192u+(m==4),m/2,true);
+                    for (unsigned m : glm5_test_verifier_widths()) target_case(x,m,8192u+(m==4),m/2,true);
                     target_handoff_failure(x);
                 }
-                if (resident_both && !shared_compare && !handoff_compare) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
-                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true,
+                if (resident_both && !shared_compare && !handoff_compare) for (unsigned m : glm5_test_verifier_widths()) target_timing(x,m);
+                if (resident_both) for (unsigned m : glm5_test_verifier_widths()) target_timing(x,m,true,
                     handoff_compare?"DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF":
                     shared_compare?"DS4_ROCM_GLM5_VERIFY_SHARED_Q8":
                     dense_compare?"DS4_ROCM_GLM5_VERIFY_DENSE_Q8":"DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
@@ -708,7 +708,7 @@ int main(int argc,char **argv) {
         else {
             for (unsigned rank=0;rank<2;++rank) {
                 peer.rank=x.tp_rank=rank;
-                for (unsigned il : {0u,3u,44u}) for (unsigned m : {2u,4u,8u})
+                for (unsigned il : {0u,3u,44u}) for (unsigned m : glm5_test_verifier_widths())
                     for (unsigned prefix : {0u,3u}) for (unsigned accepted=0;accepted<=m;++accepted)
                         run_case(x,il,m,prefix,accepted);
                 for (unsigned prefix : {2047u,2048u,8192u,8193u})

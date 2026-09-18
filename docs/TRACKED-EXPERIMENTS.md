@@ -129,7 +129,7 @@ not merge that track. The adaptation, primary-source references and test scope
 are recorded in the same dossier under `research/native-draft-step-plan-20260918.md`.
 This step alone does not enable session drafting or establish acceptance/speed.
 
-The default-off `DS4_GLM5_NATIVE_DRAFT=2/4/8` session experiment connects native
+The default-off `DS4_GLM5_NATIVE_DRAFT=2/4/6/8` session experiment connects native
 drafting, exact target verification and accepted-prefix refresh. Both ranks
 negotiate the width and agree before history publication; failures invalidate
 both states. Socket and controlled-arithmetic tests exercise orchestration,
@@ -137,6 +137,13 @@ including 8K frontiers, but do not establish actual RoCE, 8K model quality,
 representative acceptance or whole-model speed. See the same dossier's
 `research/native-session-plan-91508e1.md` and associated result report. Do not
 enable this experiment for deployment before those checks and advisor review.
+
+Width 6 means six target rows (root plus five proposals), with a distinct
+canonical hello bit41 and exact M6 BF16/Q8 dispatch. It retains the existing
+eight-expert native window and allocates only M2/M4/M6 verifier workspaces.
+Short generation tails select 4/2/1 explicitly. Mixed width encodings and
+workspace/configuration mismatch refuse before drafting; no rounding to M8.
+See `research/native-width6-plan-3fae014.md` in the same dossier for validation.
 
 `DS4_TP_BULK_RECV_READY=1` is a separate default-off transport experiment.
 It negotiates hello bit39 and confirms both mlx5 receive queues before bulk

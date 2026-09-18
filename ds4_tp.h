@@ -58,18 +58,51 @@ enum {
     DS4_TP_CONFIG_BULK_RECV_READY = UINT64_C(1) << 39,
     /* Exact native KDA routed verification with one FFN handoff per layer. */
     DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF = UINT64_C(1) << 40,
+    /* Width six has its own canonical encoding: legacy width bits must be
+     * zero. Bits39/40 already select independent transport behavior. */
+    DS4_TP_CONFIG_GLM5_NATIVE_SIX = UINT64_C(1) << 41,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
     if (!value || !value[0] || (value[0] == '0' && !value[1])) return 0u;
     if (value[1]) return UINT32_MAX;
     return value[0] == '2' ? 2u : value[0] == '4' ? 4u :
-           value[0] == '8' ? 8u : UINT32_MAX;
+           value[0] == '6' ? 6u : value[0] == '8' ? 8u : UINT32_MAX;
+}
+
+static inline bool ds4_tp_glm5_native_width_valid(uint32_t rows) {
+    return rows == 2u || rows == 4u || rows == 6u || rows == 8u;
+}
+
+static inline uint64_t ds4_tp_glm5_native_config(uint32_t rows) {
+    if (rows == 6u) return DS4_TP_CONFIG_GLM5_NATIVE_SIX;
+    const uint64_t code = rows == 2u ? 1u : rows == 4u ? 2u : rows == 8u ? 3u : 0u;
+    /* An invalid request must fail hello even when both peers request it. */
+    if (rows && !code) return DS4_TP_CONFIG_GLM5_NATIVE_SIX |
+        (UINT64_C(1) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT);
+    return code << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
 }
 
 static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
     const uint32_t code = (uint32_t)(config >> DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) & 3u;
+    if (config & DS4_TP_CONFIG_GLM5_NATIVE_SIX) return code ? UINT32_MAX : 6u;
     return code ? 1u << code : 0u;
+}
+
+/* Three exact workspaces: 2, optionally 4, and configured maximum (6 or 8).
+ * Existing width-eight sessions retain their original 8/4/2 tail schedule. */
+static inline uint32_t ds4_tp_glm5_native_workspace_rows(uint32_t maximum, uint32_t slot) {
+    if (!ds4_tp_glm5_native_width_valid(maximum)) return 0u;
+    if (slot == 0u) return 2u;
+    if (slot == 1u) return maximum >= 4u ? 4u : 0u;
+    return slot == 2u && maximum >= 6u ? maximum : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_native_cycle_rows(uint32_t maximum, uint32_t limit) {
+    if (!ds4_tp_glm5_native_width_valid(maximum) || !limit) return 0u;
+    if (limit >= maximum) return maximum;
+    if (limit >= 4u && maximum >= 4u) return 4u;
+    return limit >= 2u ? 2u : 1u;
 }
 
 /* Validate handoff's supported arithmetic/scheduling modes before any layer

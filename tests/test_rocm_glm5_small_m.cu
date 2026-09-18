@@ -37,7 +37,7 @@ static void stream_probe(const Glm5TestGGUF &gguf) {
     REQUIRE(projections.size()==136u);
     std::printf("STREAM_SCOPE projections=%zu weight_bytes_per_rank=%llu\n",
         projections.size(),(unsigned long long)weight_bytes);
-    for (unsigned rank=0;rank<2u;++rank) for (unsigned m : {2u,4u,8u}) {
+    for (unsigned rank=0;rank<2u;++rank) for (unsigned m : glm5_test_verifier_widths()) {
         std::vector<float> host((size_t)m*8192u);
         for (size_t i=0;i<host.size();++i)
             host[i]=(float)((int)((i*193u+(i>>5u)*761u)%997u)-498)/(1001.3f+(float)(i%7u));
@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
         else std::snprintf(name,sizeof(name),"blk.%u.kda_%s.weight",layer,role);
         uint64_t weight;
         REQUIRE(gguf.tensor(name,{k,shared || head ? n : 2u*n},30u,weight));
-        for (unsigned rank=0;rank<2u;++rank) for (unsigned m : {2u,4u,8u}) {
+        for (unsigned rank=0;rank<2u;++rank) for (unsigned m : glm5_test_verifier_widths()) {
             std::vector<float> host_x((size_t)m*k), ref((size_t)m*n), got(ref.size()+16u);
             for (size_t i=0;i<host_x.size();++i)
                 host_x[i] = (float)((int)((i*193u+(i/k)*761u+layer*47u)%997u)-498) /

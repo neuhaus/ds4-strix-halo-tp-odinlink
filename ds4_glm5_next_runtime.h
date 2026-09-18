@@ -215,7 +215,7 @@ int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
  * Use it only until finish/reset/abort, and obey its causal lengths. The
  * caller must finish a successful full layer pass before accepting any rows;
  * on a failed pass invalidate the owning next_state instead. Target MLA
- * supports 2/4/8 rows; a private native owner supports 1..8, permitting M-1
+ * supports 2/4/6/8 rows; a private native owner supports 1..8, permitting M-1
  * proposals for an M-row target pass without an unused extra output head. */
 int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
                                      uint32_t capacity);

@@ -347,7 +347,7 @@ __global__ static void glm5_dense_q8_small_m_kernel(
         float *out0, float *out1, const unsigned char *w0,
         const unsigned char *w1, const float *x, unsigned in_dim,
         unsigned out_dim) {
-    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u, "small M");
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u || Tokens == 8u, "small M");
     constexpr unsigned Panel = 1024u, Rows = 8u;
     __shared__ float sx[Tokens][Panel];
     const unsigned lane = threadIdx.x & 31u;
@@ -403,7 +403,7 @@ extern "C" int ds4_rocm_glm5_dense_q8_small_m(
         const ds4_gpu_tensor *x, uint32_t tokens) {
     const bool pair = out1 != nullptr;
     if (!out0 || !x || !model_map ||
-        (tokens != 2u && tokens != 4u && tokens != 8u) ||
+        (tokens != 2u && tokens != 4u && tokens != 6u && tokens != 8u) ||
         (pair ? (in_dim != 4096u || out_dim != 12288u) :
                 (in_dim != 12288u || out_dim != 4096u))) return 0;
     const char *prefetch = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
@@ -441,10 +441,12 @@ extern "C" int ds4_rocm_glm5_dense_q8_small_m(
     if (pair) {
         if (tokens == 2u) DS4_DENSE_Q8_LAUNCH(2u, true);
         else if (tokens == 4u) DS4_DENSE_Q8_LAUNCH(4u, true);
+        else if (tokens == 6u) DS4_DENSE_Q8_LAUNCH(6u, true);
         else DS4_DENSE_Q8_LAUNCH(8u, true);
     } else {
         if (tokens == 2u) DS4_DENSE_Q8_LAUNCH(2u, false);
         else if (tokens == 4u) DS4_DENSE_Q8_LAUNCH(4u, false);
+        else if (tokens == 6u) DS4_DENSE_Q8_LAUNCH(6u, false);
         else DS4_DENSE_Q8_LAUNCH(8u, false);
     }
 #undef DS4_DENSE_Q8_LAUNCH
@@ -460,7 +462,7 @@ __global__ static void glm5_shared_q8_small_m_kernel(
         float *out0, float *out1, const unsigned char *w0,
         const unsigned char *w1, const float *x, unsigned in_dim,
         unsigned out_dim, uint64_t row_bytes) {
-    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u, "small M");
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u || Tokens == 8u, "small M");
     constexpr unsigned Panel = 1024u, Rows = 8u;
     __shared__ float sx[Tokens][Panel];
     const unsigned lane = threadIdx.x & 31u;
@@ -509,7 +511,7 @@ extern "C" int ds4_rocm_glm5_shared_q8_small_m(
         uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens) {
     const bool pair = out1 != nullptr;
     if (!out0 || !x || !model_map ||
-        (tokens != 2u && tokens != 4u && tokens != 8u) ||
+        (tokens != 2u && tokens != 4u && tokens != 6u && tokens != 8u) ||
         (pair ? (in_dim != 4096u || out_dim != 1024u || row_bytes != 4352u || k_first != 0u) :
                 (in_dim != 1024u || out_dim != 4096u || row_bytes != 2176u ||
                  (k_first != 0u && k_first != 1024u) || offset1 != 0u))) return 0;
@@ -549,10 +551,12 @@ extern "C" int ds4_rocm_glm5_shared_q8_small_m(
     if (pair) {
         if (tokens == 2u) DS4_SHARED_Q8_LAUNCH(2u, true);
         else if (tokens == 4u) DS4_SHARED_Q8_LAUNCH(4u, true);
+        else if (tokens == 6u) DS4_SHARED_Q8_LAUNCH(6u, true);
         else DS4_SHARED_Q8_LAUNCH(8u, true);
     } else {
         if (tokens == 2u) DS4_SHARED_Q8_LAUNCH(2u, false);
         else if (tokens == 4u) DS4_SHARED_Q8_LAUNCH(4u, false);
+        else if (tokens == 6u) DS4_SHARED_Q8_LAUNCH(6u, false);
         else DS4_SHARED_Q8_LAUNCH(8u, false);
     }
 #undef DS4_SHARED_Q8_LAUNCH

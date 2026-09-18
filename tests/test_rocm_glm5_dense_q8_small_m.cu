@@ -49,7 +49,7 @@ int main() {
     REQUIRE(ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     REQUIRE(ds4_gpu_set_model_map_spans(g.map,g.size,offsets,sizes,9,sizes[0]));
     uint64_t compared=0;
-    for (unsigned il=0;il<3;++il) for (unsigned m : {2u,4u,8u}) {
+    for (unsigned il=0;il<3;++il) for (unsigned m : glm5_test_verifier_widths()) {
         Buffer input((uint64_t)m*4096), gate((uint64_t)m*12288), up(gate.count), mid(gate.count), down(input.count);
         Buffer *outputs[]={&gate,&up,&mid,&down};
         std::vector<ds4_gpu_tensor *> xv(m),gv(m),uv(m),mv(m),dv(m);

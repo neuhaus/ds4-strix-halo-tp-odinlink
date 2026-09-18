@@ -48,7 +48,7 @@ static void pair(arm *a, arm *b, int want) {
 }
 
 static void agreement_cases(void) {
-    for (uint32_t rows = 2u; rows <= 8u; rows *= 2u) {
+    for (uint32_t rows = 2u; rows <= 8u; rows += 2u) {
         for (uint32_t phase = 0; phase <= 9u; ++phase) {
             if (phase >= rows && phase < 8u) continue;
             arm a = {.cycle = base, .phase = phase, .ok = 1};
@@ -83,7 +83,7 @@ static void agreement_cases(void) {
 }
 
 static void layer_cases(void) {
-    for (uint32_t rows = 2u; rows <= 8u; rows *= 2u)
+    for (uint32_t rows = 2u; rows <= 8u; rows += 2u)
         for (uint32_t phase = 0u; phase < 2u; ++phase) {
             arm a = {.cycle=base, .phase=phase, .ok=1,
                      .layer_mode=1, .layer=4, .route_hash=UINT64_C(0xfedcba9876543210)};
@@ -112,7 +112,7 @@ static void layer_cases(void) {
 }
 
 static void command_cases(void) {
-    for (unsigned fault = 0; fault < 10u; ++fault) {
+    for (unsigned fault = 0; fault < 11u; ++fault) {
         int sockets[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
         ds4_tp *a = ds4_tp_test_control_create(sockets[0], 0);
         ds4_tp *b = ds4_tp_test_control_create(sockets[1], 1);
@@ -128,6 +128,7 @@ static void command_cases(void) {
         case 7: c.eos = -2; break;
         case 8: c.rows = 2; break;
         case 9: c.rows = 4; break;
+        case 10: c.rows = 6; break;
         }
         const int want = fault == 0 || fault >= 8;
         CHECK(ds4_tp_send_native_cycle(a, &c) == want);
@@ -194,6 +195,42 @@ static void config_cases(void) {
         CHECK(ds4_tp_glm5_native_rows(ac) == (a ? 1u << a : 0u));
         CHECK(ds4_tp_test_hello_validate_prefill_config(ac, bc, error, sizeof(error)) == (a == b));
         ++cases;
+    }
+    CHECK(ds4_tp_glm5_native_rows_parse("6") == 6u);
+    const uint32_t widths[] = {0u, 2u, 4u, 6u, 8u};
+    const uint64_t transport = DS4_TP_CONFIG_BULK_RECV_READY | DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+    for (unsigned a = 0; a < 5; ++a) for (unsigned b = 0; b < 5; ++b) {
+        const uint64_t ac = ds4_tp_glm5_native_config(widths[a]) | transport;
+        const uint64_t bc = ds4_tp_glm5_native_config(widths[b]) | transport;
+        char error[128];
+        CHECK(ds4_tp_glm5_native_rows(ac) == widths[a]);
+        CHECK((ds4_tp_glm5_native_config(widths[a]) & transport) == 0u);
+        CHECK(ds4_tp_test_hello_validate_prefill_config(ac, bc, error, sizeof(error)) == (a == b));
+        ++cases;
+    }
+    for (uint64_t code = 1u; code <= 3u; ++code) {
+        const uint64_t bad = DS4_TP_CONFIG_GLM5_NATIVE_SIX | (code << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT);
+        char error[128];
+        CHECK(ds4_tp_glm5_native_rows(bad) == UINT32_MAX);
+        CHECK(!ds4_tp_test_hello_validate_prefill_config(bad, bad, error, sizeof(error)));
+        CHECK(!ds4_tp_test_hello_validate_prefill_config(bad, transport, error, sizeof(error)));
+        ++cases;
+    }
+    CHECK(ds4_tp_glm5_native_rows(ds4_tp_glm5_native_config(UINT32_MAX)) == UINT32_MAX);
+    const uint32_t tails[] = {0u, 1u, 2u, 2u, 4u, 4u, 6u, 6u, 6u};
+    for (unsigned i = 0; i < 9; ++i) {
+        CHECK(ds4_tp_glm5_native_cycle_rows(6u, i) == tails[i]); ++cases;
+    }
+    CHECK(ds4_tp_glm5_native_cycle_rows(8u, 6u) == 4u);
+    CHECK(ds4_tp_glm5_native_cycle_rows(3u, 8u) == 0u);
+    const uint32_t six_slots[] = {2u, 4u, 6u, 0u};
+    for (unsigned i = 0; i < 4; ++i) {
+        CHECK(ds4_tp_glm5_native_workspace_rows(6u, i) == six_slots[i]); ++cases;
+    }
+    for (unsigned layer = 0; layer < 2; ++layer) for (unsigned peer_rows = 4; peer_rows <= 8; peer_rows += 4) {
+        arm a = {.cycle=base, .ok=1, .layer_mode=layer, .layer=4};
+        a.cycle.rows=6; arm b=a; b.cycle.rows=peer_rows;
+        pair(&a,&b,0);
     }
 }
 

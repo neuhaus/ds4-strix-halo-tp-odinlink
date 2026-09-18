@@ -137,7 +137,7 @@ static int replay_matches(const ds4_glm5_kda_layer_state *s) {
 int ds4_glm5_kda_replay_reserve(ds4_glm5_kda_layer_state *s,
                                uint32_t capacity, uint32_t rank) {
     if (!replay_sources_valid(s) || s->pending_tokens || rank > 1u ||
-        (capacity != 2u && capacity != 4u && capacity != 8u)) return 0;
+        (capacity != 2u && capacity != 4u && capacity != 6u && capacity != 8u)) return 0;
     if (s->replay) return replay_matches(s) && !s->replay->active &&
         s->replay->capacity == capacity && s->replay->rank == rank;
     struct ds4_glm5_kda_replay *r = calloc(1, sizeof(*r));
@@ -175,7 +175,7 @@ int ds4_glm5_kda_verify_ready(const ds4_glm5_kda_layer_state *s,
     return replay_matches(s) && !s->replay->active && !s->pending_tokens &&
         rank == s->replay->rank &&
         s->owner_slot->pending_verifications < s->owner_slot->kda_count &&
-        (tokens == 2u || tokens == 4u || tokens == 8u) &&
+        (tokens == 2u || tokens == 4u || tokens == 6u || tokens == 8u) &&
         tokens <= s->replay->capacity && s->token_count <= UINT64_MAX - tokens;
 }
 

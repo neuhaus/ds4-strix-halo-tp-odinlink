@@ -51685,7 +51685,8 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const uint32_t native_rows = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(e->tp.ctx));
-    if (native_rows != ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"))) {
+    if (native_rows == UINT32_MAX ||
+        native_rows != ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"))) {
         fprintf(stderr, "ds4: native GLM5 draft width must be 0/2/4/8 and match the TP hello\n");
         return 0;
     }
@@ -51791,7 +51792,9 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             return 0;
         }
         s->glm5_native_ws = ds4_glm5_next_draft_workspace_create(capacity);
-        for (uint32_t i = 0u, rows = 2u; rows <= native_rows; ++i, rows *= 2u) {
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uint32_t rows = ds4_tp_glm5_native_workspace_rows(native_rows, i);
+            if (!rows) continue;
             s->glm5_native_verify_ws[i] = ds4_glm5_next_workspace_create_capacity_context(rows, capacity);
             if (!s->glm5_native_verify_ws[i]) return 0;
             ds4_glm5_next_workspace_begin_decode(s->glm5_native_verify_ws[i]);
@@ -54032,8 +54035,7 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
     }
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && e->glm5_next) {
         const uint32_t rows = ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"));
-        const uint64_t code = rows == 2u ? 1u : rows == 4u ? 2u : rows == 8u ? 3u : 0u;
-        config |= code << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+        config |= ds4_tp_glm5_native_config(rows);
         const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
         if (handoff && strcmp(handoff, "1") == 0)
             config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
@@ -70472,8 +70474,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         int limit = max_tokens < accepted_cap ? max_tokens : accepted_cap;
         if (limit > s->ctx_size - s->checkpoint.len) limit = s->ctx_size - s->checkpoint.len;
         if (limit < 1) return 0;
-        uint32_t rows = s->glm5_native_rows;
-        while (rows > (uint32_t)limit) rows /= 2u;
+        const uint32_t rows = ds4_tp_glm5_native_cycle_rows(s->glm5_native_rows, (uint32_t)limit);
         if (rows < 2u || first_token == eos_token) {
             if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
             accepted[0] = first_token;

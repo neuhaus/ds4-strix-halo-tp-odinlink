@@ -2707,7 +2707,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
-    const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 8u) &&
+    const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 6u || n_tok == 8u) &&
         ((in_dim == 4096u &&
           (out_dim == 4096u || out_dim == 128u || out_dim == 32u ||
            out_dim == 154880u)) ||
@@ -2735,10 +2735,12 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             if (in_dim == 128u) {
                 if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 128u);
                 else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 128u);
                 else DS4_SMALL_M_EXACT(8u, 128u);
             } else {
                 if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u);
                 else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 1024u);
                 else DS4_SMALL_M_EXACT(8u, 1024u);
             }
 #undef DS4_SMALL_M_EXACT

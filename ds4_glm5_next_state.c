@@ -108,7 +108,7 @@ static int mla_replay_length_valid(const ds4_glm5_next_mla_state *s,
      * journals also serve short generation tails; target shapes stay fixed. */
     return s && s->owner && s->owner->draft_only ?
         tokens >= 1u && tokens <= 8u :
-        tokens == 2u || tokens == 4u || tokens == 8u;
+        tokens == 2u || tokens == 4u || tokens == 6u || tokens == 8u;
 }
 
 int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *s,

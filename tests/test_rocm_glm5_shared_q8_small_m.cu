@@ -48,7 +48,7 @@ int main() {
     REQUIRE(ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     REQUIRE(ds4_gpu_set_model_map_spans(g.map,g.size,offsets,sizes,126,sizes[0]));
     uint64_t compared=0;
-    for (unsigned il=3;il<45;++il) for (unsigned rank : {0u,1u}) for (unsigned m : {2u,4u,8u}) {
+    for (unsigned il=3;il<45;++il) for (unsigned rank : {0u,1u}) for (unsigned m : glm5_test_verifier_widths()) {
         Buffer input((uint64_t)m*4096), gate((uint64_t)m*1024), up(gate.count), mid(gate.count), down(input.count);
         Buffer *outputs[]={&gate,&up,&mid,&down};
         const uint64_t gate_offset=offsets[(il-3)*3]+rank*1024u*4352u;

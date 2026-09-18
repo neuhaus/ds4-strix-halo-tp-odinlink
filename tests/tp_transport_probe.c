@@ -1,4 +1,4 @@
-/* Diagnostic link wrappers. No engine/GPU object is rebuilt for this probe.
+/* Diagnostic link wrappers. Link around a frozen set of engine/GPU objects.
  * Build with --wrap for the names below; enabled only by DS4_TP_TRANSPORT_PROBE=1.
  * Wall time inside transport includes peer compute skew. Socket time is a
  * subset, never an extra cost to add. No GPU fences or hot-path log writes.
@@ -25,6 +25,7 @@ typedef struct { unsigned long long calls, failures, bytes; double wall, socket;
 static stat stats[PHASES][OPS];
 static unsigned long long phase_calls[PHASES];
 static unsigned long long phase_units[PHASES];
+static unsigned long long verify_width_calls[9];
 static double phase_wall[PHASES];
 static int enabled, probe_rank = -1;
 static pthread_t owner;
@@ -35,6 +36,9 @@ static double now(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 static void report(void) {
+    for (unsigned rows=0; rows<9; ++rows) if (verify_width_calls[rows])
+        fprintf(stderr,"TP_PROBE_WIDTH rank=%d rows=%u calls=%llu\n",
+            probe_rank,rows,verify_width_calls[rows]);
     for (int p=0; p<PHASES; ++p) {
         if (phase_calls[p]) fprintf(stderr,
             "TP_PROBE_SCOPE rank=%d phase=%s calls=%llu units=%llu wall_ms=%.6f\n",
@@ -68,6 +72,7 @@ static int active(void) {
         const int saved=phase; phase=scope; const double probe_start=now(); \
         const int result=__real_##name args; const int saved_errno=errno; \
         phase_wall[scope]+=now()-probe_start; ++phase_calls[scope]; \
+        if ((scope)==VERIFY && (unsigned)(units)<9u) ++verify_width_calls[(unsigned)(units)]; \
         phase_units[scope]+=(units); phase=saved; \
         errno=saved_errno; return result; \
     }
