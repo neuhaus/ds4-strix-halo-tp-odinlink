@@ -12,6 +12,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 #define REQUIRE(x) do { if (!(x)) { \
     std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::exit(1); \
@@ -223,9 +224,9 @@ static void refusal_and_failure(ds4_glm5_next_exec_ctx &x) {
     x.tp->failed=false;
 }
 
-static void serial_target(ds4_glm5_next_exec_ctx &x,State &s,Workspace &w,
-                          unsigned token,ds4_gpu_tensor *hidden,ds4_gpu_tensor *logits) {
-    Tensor scratch(hc_row);
+static void serial_target_reserved(ds4_glm5_next_exec_ctx &x,State &s,Workspace &w,
+                          unsigned token,ds4_gpu_tensor *scratch,
+                          ds4_gpu_tensor *hidden,ds4_gpu_tensor *logits) {
     REQUIRE(ds4_glm5_next_embed_token(&x,token,scratch));
     ds4_gpu_tensor *in=scratch, *out=hidden;
     for (unsigned il=0;il<45;++il) {
@@ -233,6 +234,12 @@ static void serial_target(ds4_glm5_next_exec_ctx &x,State &s,Workspace &w,
         auto *swap=in; in=out; out=swap;
     }
     REQUIRE(ds4_glm5_next_output_logits(&x,w,hidden,logits) && ds4_gpu_synchronize());
+}
+
+static void serial_target(ds4_glm5_next_exec_ctx &x,State &s,Workspace &w,
+                          unsigned token,ds4_gpu_tensor *hidden,ds4_gpu_tensor *logits) {
+    Tensor scratch(hc_row);
+    serial_target_reserved(x,s,w,token,scratch,hidden,logits);
 }
 
 static void equal_target(State &a,State &b) {
@@ -326,7 +333,7 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     Tensor scratch(2*hc_row), hidden(2*hc_row), logits(2u*154880*4u);
     const uint32_t tokens[2]={300,1234};
     REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&state.s,2));
-    // Three exchanges per KDA layer (two attention, one FFN): fail after
+    // Two attention exchanges and one FFN exchange per input: fail after
     // several journals have succeeded, including the first MLA layer.
     x.tp->fail_call=x.tp->calls+20;
     REQUIRE(!ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,2,scratch,hidden,logits));
@@ -337,12 +344,59 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     std::puts("TARGET_VERIFY injected mid-pass exchange failure invalidates whole state PASS");
 }
 
+static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
+    std::printf("TARGET_BUDGET begin rank=%u m=%u simulated_peer=echo\n",x.tp_rank,m);
+    std::fflush(stdout);
+    constexpr uint64_t logit_row=154880u*4u;
+    const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
+    State serial(*x.model), candidate(*x.model);
+    Workspace scalar(1), batch(m);
+    Tensor scratch(hc_row), hidden(hc_row), logits(logit_row);
+    Tensor prefix_hidden(hc_row), prefix_logits(logit_row);
+    Tensor batch_scratch(m*hc_row), batch_hidden(m*hc_row), batch_logits(m*logit_row);
+    REQUIRE(ds4_glm5_next_target_verify_reserve(&x,&candidate.s,m));
+    for (unsigned il=3;il<45;il+=4) { seed_mla(serial,il,0); seed_mla(candidate,il,0); }
+    std::vector<double> times[2];
+    for (unsigned sample=0;sample<13;++sample) for (unsigned turn=0;turn<2;++turn) {
+        const unsigned arm=turn^(sample&1u);
+        State &state=arm?candidate:serial;
+        REQUIRE(ds4_glm5_next_state_reset(&state.s));
+        for (unsigned t=0;t<3;++t)
+            serial_target_reserved(x,state,scalar,991+t,scratch,prefix_hidden,prefix_logits);
+        REQUIRE(ds4_gpu_synchronize());
+        const auto start=std::chrono::steady_clock::now();
+        if (arm) {
+            REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,m,
+                batch_scratch,batch_hidden,batch_logits));
+            REQUIRE(ds4_glm5_next_target_verify_finish(&x,&state.s,m));
+        } else for (unsigned t=0;t<m;++t)
+            serial_target_reserved(x,state,scalar,tokens[t],scratch,hidden,logits);
+        REQUIRE(ds4_gpu_synchronize());
+        const double ms=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-start).count();
+        if (sample>=4) {
+            times[arm].push_back(ms);
+            std::printf("TARGET_BUDGET_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
+                x.tp_rank,m,sample-4,arm?"verify_commit":"serial",ms);
+            std::fflush(stdout);
+        }
+    }
+    equal_target(serial,candidate);
+    auto *last=ds4_gpu_tensor_view(batch_logits,(m-1)*logit_row,logit_row);
+    REQUIRE(last); equal("timed_final_logits",logits,last,154880); ds4_gpu_tensor_free(last);
+    for (auto &v:times) std::sort(v.begin(),v.end());
+    std::printf("TARGET_BUDGET rank=%u m=%u samples=9 serial_median_ms=%.6f "
+        "verify_commit_median_ms=%.6f simulated_peer=echo network_test=0 drafting_test=0\n",
+        x.tp_rank,m,times[0][4],times[1][4]); std::fflush(stdout);
+}
+
 int main(int argc,char **argv) {
+    const bool timing=argc==2 && !std::strcmp(argv[1],"--target-timing");
     const bool target=argc==2 && (!std::strcmp(argv[1],"--target") ||
         !std::strcmp(argv[1],"--target-smoke"));
     const bool smoke=argc==2 && (!std::strcmp(argv[1],"--smoke") ||
         !std::strcmp(argv[1],"--target-smoke"));
-    REQUIRE(argc==1 || target || smoke);
+    REQUIRE(argc==1 || target || smoke || timing);
     const char *path=std::getenv("DS4_GLM5_MODEL");
     REQUIRE(path && std::getenv("DS4_RESEARCH_ROOT"));
     setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1);
@@ -359,7 +413,12 @@ int main(int argc,char **argv) {
         x.tp_slab=slab; x.tp_big_out=out; x.tp_big_in=in;
         x.tp_big_out_host=ds4_gpu_tensor_contents(out); x.tp_big_in_host=ds4_gpu_tensor_contents(in);
         x.tp_sequence=&sequence;
-        if (target) {
+        if (timing) {
+            for (unsigned rank=0;rank<2;++rank) {
+                peer.rank=x.tp_rank=rank;
+                for (unsigned m : {2u,4u,8u}) target_timing(x,m);
+            }
+        } else if (target) {
             for (unsigned rank=0;rank<(smoke?1u:2u);++rank) {
                 peer.rank=x.tp_rank=rank;
                 if (smoke) target_case(x,2,0,1);
@@ -380,10 +439,11 @@ int main(int argc,char **argv) {
                         run_case(x,3,4,prefix,accepted);
             }
         }
-        if (!target) refusal_and_failure(x);
+        if (!target && !timing) refusal_and_failure(x);
     }
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
-        "network_test=0 full_target_test=%u quality_test=0\n",cases,(unsigned long long)compared_values,target?1:0);
+        "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
+        cases,(unsigned long long)compared_values,target||timing?1:0,timing?1:0);
     ds4_gpu_cleanup();
     return 0;
 }
