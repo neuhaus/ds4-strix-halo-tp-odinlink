@@ -17,9 +17,85 @@ extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
     std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::exit(1); \
 } } while (0)
 
+static void stream_probe(const Glm5TestGGUF &gguf) {
+    struct Projection { uint64_t offset; uint32_t k,n; };
+    std::vector<Projection> projections;
+    uint64_t weight_bytes=0;
+    for (unsigned layer=0;layer<45u;++layer) {
+        if (layer%4u==3u) continue;
+        for (const char *role : {"q","k","v","output"}) {
+            const bool output=std::strcmp(role,"output")==0;
+            const uint32_t k=output?8192u:4096u, n=output?2048u:4096u;
+            char name[80];
+            std::snprintf(name,sizeof(name),"blk.%u.kda_%s.weight",layer,role);
+            uint64_t offset;
+            REQUIRE(gguf.tensor(name,{k,2u*n},30u,offset));
+            projections.push_back({offset,k,n});
+            weight_bytes+=(uint64_t)k*n*2u;
+        }
+    }
+    REQUIRE(projections.size()==136u);
+    std::printf("STREAM_SCOPE projections=%zu weight_bytes_per_rank=%llu\n",
+        projections.size(),(unsigned long long)weight_bytes);
+    for (unsigned rank=0;rank<2u;++rank) for (unsigned m : {2u,4u,8u}) {
+        std::vector<float> host((size_t)m*8192u);
+        for (size_t i=0;i<host.size();++i)
+            host[i]=(float)((int)((i*193u+(i>>5u)*761u)%997u)-498)/(1001.3f+(float)(i%7u));
+        ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(host.size()*4u);
+        ds4_gpu_tensor *y=ds4_gpu_tensor_alloc((uint64_t)m*4096u*4u);
+        REQUIRE(x && y && ds4_gpu_tensor_write(x,0u,host.data(),host.size()*4u));
+        ds4_gpu_tensor *xs[2][8]={}, *ys[2][8]={};
+        for (unsigned role=0;role<2u;++role) for (unsigned t=0;t<m;++t) {
+            const uint32_t k=role?8192u:4096u,n=role?2048u:4096u;
+            xs[role][t]=ds4_gpu_tensor_view(x,(uint64_t)t*k*4u,(uint64_t)k*4u);
+            ys[role][t]=ds4_gpu_tensor_view(y,(uint64_t)t*n*4u,(uint64_t)n*4u);
+            REQUIRE(xs[role][t] && ys[role][t]);
+        }
+        auto launch=[&](unsigned arm) {
+            for (const auto &p : projections) {
+                const uint64_t offset=p.offset+(uint64_t)rank*p.k*p.n*2u;
+                if (arm==0u) {
+                    const unsigned role=p.k==8192u;
+                    for (unsigned t=0;t<m;++t)
+                        if (!ds4_gpu_matmul_bf16_tensor(ys[role][t],gguf.map,
+                            gguf.size,offset,p.k,p.n,xs[role][t],1u)) return 0;
+                } else if (!ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,
+                           offset,p.k,p.n,x,m)) return 0;
+            }
+            return 1;
+        };
+        hipEvent_t begin,end;
+        REQUIRE(hipEventCreate(&begin)==hipSuccess && hipEventCreate(&end)==hipSuccess);
+        std::vector<double> times[3];
+        for (unsigned round=0;round<12u;++round) for (unsigned j=0;j<3u;++j) {
+            const unsigned arm=(round+j)%3u;
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm==2u?"1":"0",1)==0);
+            REQUIRE(hipEventRecord(begin,nullptr)==hipSuccess);
+            REQUIRE(launch(arm));
+            REQUIRE(hipEventRecord(end,nullptr)==hipSuccess && hipEventSynchronize(end)==hipSuccess);
+            float ms=0;
+            REQUIRE(hipEventElapsedTime(&ms,begin,end)==hipSuccess && std::isfinite(ms) && ms>0);
+            if (round>=3u) {
+                times[arm].push_back(ms);
+                std::printf("SMALL_M_STREAM_SAMPLE rank=%u m=%u arm=%u round=%u ms=%.6f\n",rank,m,arm,round-3u,ms);
+            }
+        }
+        for (unsigned arm=0;arm<3u;++arm) {
+            std::sort(times[arm].begin(),times[arm].end());
+            std::printf("SMALL_M_STREAM_MEDIAN rank=%u m=%u arm=%u ms=%.6f\n",rank,m,arm,times[arm][4]);
+        }
+        REQUIRE(hipEventDestroy(begin)==hipSuccess && hipEventDestroy(end)==hipSuccess);
+        for (unsigned role=0;role<2u;++role) for (unsigned t=0;t<m;++t) {
+            ds4_gpu_tensor_free(xs[role][t]); ds4_gpu_tensor_free(ys[role][t]);
+        }
+        ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
+    }
+}
+
 int main(int argc, char **argv) {
     const bool baseline = argc == 2 && std::strcmp(argv[1],"--baseline") == 0;
-    REQUIRE(argc == 1 || baseline);
+    const bool stream = argc == 2 && std::strcmp(argv[1],"--stream") == 0;
+    REQUIRE(argc == 1 || baseline || stream);
     const char *model = std::getenv("DS4_GLM5_MODEL");
     REQUIRE(model);
     Glm5TestGGUF gguf;
@@ -148,6 +224,7 @@ int main(int argc, char **argv) {
         }
     }
     std::printf("PASS small-M projection probe baseline=%d candidate_exact_values=%llu\n",baseline,(unsigned long long)exact_values);
+    if (stream) stream_probe(gguf);
     ds4_gpu_cleanup();
     return 0;
 }
