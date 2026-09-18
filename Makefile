@@ -775,6 +775,9 @@ tests/test_tp_native_cycle: tests/test_tp_native_cycle.c tests/ds4_tp_hello_test
 test-tp-native-cycle: tests/test_tp_native_cycle
 	./tests/test_tp_native_cycle
 
+tests/test_tp_bulk_ready: tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o $(LDLIBS)
+
 tests/test_glm5_native_session: tests/test_glm5_native_session.c ds4_glm5_native_session.inc tests/ds4_tp_hello_test.o ds4_tp.h ds4.h ds4_glm5_next_exec.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_glm5_native_session.c tests/ds4_tp_hello_test.o $(LDLIBS)
 

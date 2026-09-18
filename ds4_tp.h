@@ -630,6 +630,9 @@ int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
 /* Socket-only control fixture: no RDMA payload capability is manufactured. */
 ds4_tp *ds4_tp_test_control_create(int fd, int rank);
 void ds4_tp_test_control_destroy(ds4_tp *tp);
+int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
+                            uint64_t offset, uint64_t round_bytes,
+                            unsigned timeout_ms);
 #endif
 
 int ds4_tp_recv_command(

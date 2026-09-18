@@ -254,6 +254,15 @@ int main(void) {
         prefill | DS4_TP_CONFIG_BULK_RECV_READY, 1, NULL);
     ok &= check_prefill("hello mismatched-bulk-receive-ready",
         prefill | DS4_TP_CONFIG_BULK_RECV_READY, prefill, 0, NULL);
+    if ((DS4_TP_CONFIG_BULK_RECV_READY &
+         ((UINT64_C(3) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) |
+          DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA |
+          DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH |
+          DS4_TP_PREFILL_CONFIG_RESUMED | DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE |
+          DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT | UINT64_C(0xffffffff))) != 0u) {
+        fprintf(stderr, "FAIL bulk receive-ready bit overlap\n");
+        ok = 0;
+    }
     ok &= check_prefill(
         "hello mismatched-prefill-config",
         prefill,

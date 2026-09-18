@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
     ds4_tp_identity id = {};
     id.gguf_bytes = 1u; id.model_id = 0x42554c4bu;
     id.n_layer = 64u; id.n_embd = 4096u; id.n_vocab = 1u;
-    id.quant_bits = 4u; id.ctx_size = 256u;
+    id.quant_bits = 4u; id.ctx_size = 1024u;
     id.prefill_config = ready ? DS4_TP_CONFIG_BULK_RECV_READY : 0u;
     char err[512] = {};
     ds4_tp *tp = nullptr;
@@ -64,12 +64,13 @@ int main(int argc, char **argv) {
     auto *recv = (uint32_t *)((char *)slab + ds4_tp_slab_big_in_offset(tp));
     const uint32_t rank = leader ? 0u : 1u;
     uint32_t seq = 0;
-    for (uint32_t rows : {1u, 2u, 4u, 8u}) {
+    for (uint32_t rows : {1u, 2u, 4u, 8u, 256u, 257u, 512u, 513u}) {
         const uint32_t values = rows * 4096u;
+        const unsigned repeats = rows <= 8u ? 32u : 2u;
         std::vector<double> samples;
         for (unsigned sample = 0; sample < 10; ++sample) {
             double elapsed = 0;
-            for (unsigned repeat = 0; repeat < 32; ++repeat) {
+            for (unsigned repeat = 0; repeat < repeats; ++repeat) {
                 ++seq;
                 for (uint32_t i = 0; i < values; ++i) send[i] = word(seq, rank, i);
                 std::memset(recv, 0, values * sizeof(uint32_t));
@@ -81,9 +82,9 @@ int main(int argc, char **argv) {
                 for (uint32_t i = 0; i < values; ++i) CHECK(recv[i] == word(seq, rank ^ 1u, i));
             }
             if (sample) {
-                samples.push_back(elapsed / 32);
+                samples.push_back(elapsed / repeats);
                 std::printf("BULK_SAMPLE rank=%u ready=%u rows=%u sample=%u ms=%.6f\n",
-                    rank, ready, rows, sample - 1, elapsed / 32);
+                    rank, ready, rows, sample - 1, elapsed / repeats);
             }
         }
         std::sort(samples.begin(), samples.end());

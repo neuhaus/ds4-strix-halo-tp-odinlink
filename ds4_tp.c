@@ -490,6 +490,71 @@ static int tp_read_full(int fd, void *buf, size_t len) {
     return 1;
 }
 
+typedef struct {
+    uint32_t magic, chunks;
+    uint64_t bytes, offset, round_bytes;
+} ds4_tp_bulk_ready_record;
+_Static_assert(sizeof(ds4_tp_bulk_ready_record) == 32, "bulk ready wire record");
+static int tp_native_io(int fd, void *data, size_t bytes, int writing, double deadline);
+
+static int tp_bulk_ready_fail(ds4_tp *tp) {
+    /* Receives are already posted. This is terminal: park the QP before
+     * cleanup releases the slab, wake the peer, and forbid gate re-entry. */
+    ds4_tp_mark_failed(tp);
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active && tp->rdma.qp) {
+        struct ibv_qp_attr attr = {0};
+        attr.qp_state = IBV_QPS_ERR;
+        if (tp->rdma.api.modify_qp(tp->rdma.qp, &attr, IBV_QP_STATE) != 0)
+            fprintf(stderr, "ds4-tp: bulk ready could not park failed QP: %s\n", strerror(errno));
+    }
+#endif
+    if (tp->data_fd >= 0) shutdown(tp->data_fd, SHUT_RDWR);
+    if (tp->control_fd >= 0) shutdown(tp->control_fd, SHUT_RDWR);
+    return 0;
+}
+
+/* Kept outside the verbs guard so socket tests exercise the production
+ * rendezvous, including partial records and backpressured writes. */
+static int tp_bulk_ready_exchange(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
+                                  uint64_t offset, uint64_t round_bytes,
+                                  double deadline) {
+    if (ds4_tp_failed(tp)) return 0;
+    ds4_tp_bulk_ready_record mine = {0}, theirs = {0};
+    mine.magic = DS4_TP_BATCH_MAGIC;
+    mine.chunks = chunks;
+    mine.bytes = bytes;
+    mine.offset = offset;
+    mine.round_bytes = round_bytes;
+    if (!tp_native_io(tp->data_fd, &mine, sizeof(mine), 1, deadline) ||
+        !tp_native_io(tp->data_fd, &theirs, sizeof(theirs), 0, deadline)) {
+        fprintf(stderr, "ds4-tp: bulk receive-ready I/O closed or deadline expired\n");
+        return tp_bulk_ready_fail(tp);
+    }
+    if (memcmp(&mine, &theirs, sizeof(mine))) {
+        fprintf(stderr, "ds4-tp: bulk receive-ready mismatch: "
+                "local=(%x,%u,%llu,%llu,%llu) peer=(%x,%u,%llu,%llu,%llu)\n",
+                mine.magic, mine.chunks, (unsigned long long)mine.bytes,
+                (unsigned long long)mine.offset, (unsigned long long)mine.round_bytes,
+                theirs.magic, theirs.chunks, (unsigned long long)theirs.bytes,
+                (unsigned long long)theirs.offset, (unsigned long long)theirs.round_bytes);
+        return tp_bulk_ready_fail(tp);
+    }
+    return 1;
+}
+
+#ifdef DS4_TP_TEST_HOOKS
+int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
+                            uint64_t offset, uint64_t round_bytes,
+                            unsigned timeout_ms) {
+    tp->data_fd = tp->control_fd;
+    const int ok = tp_bulk_ready_exchange(tp, chunks, bytes, offset, round_bytes,
+                                         tp_now_sec() + timeout_ms / 1000.0);
+    tp->data_fd = -1;
+    return ok;
+}
+#endif
+
 static void tp_socket_tune(int fd) {
     int one = 1;
 #ifdef SO_NOSIGPIPE
@@ -1273,6 +1338,10 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
 
 static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
+    if ((tp->prefill_config & DS4_TP_CONFIG_BULK_RECV_READY) && !r->is_mlx5) {
+        tp_set_err(err, errlen, "tp rdma: bulk receive-ready requires mlx5");
+        return 0;
+    }
     const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                        IBV_ACCESS_REMOTE_WRITE;
     /* ConnectX-4 Lx cannot register this gfx1151 hipMalloc allocation at all,
@@ -1949,6 +2018,7 @@ static int tp_rdma_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                  uint64_t seq,
                                  const void *registered_payload) {
+    if (ds4_tp_failed(tp)) return 0;
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
@@ -2267,7 +2337,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      ds4_tp_big_wave_ready_fn ready,
                                      void *ready_ud) {
     ds4_tp_rdma *r = &tp->rdma;
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    if (ds4_tp_failed(tp) || !tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
     const bool recv_ready =
         (tp->prefill_config & DS4_TP_CONFIG_BULK_RECV_READY) != 0u;
     if (recv_ready && !r->is_mlx5) {
@@ -2301,7 +2371,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
      * the full completion-poll loop). Split it so a real policy decision
      * (selective signaling, window resizing, provider wakeup) can be aimed at
      * whichever piece actually dominates, instead of guessing. */
-    static double g_bg_postrecv_s, g_bg_postsend_s;
+    static double g_bg_postrecv_s, g_bg_ready_s, g_bg_postsend_s;
     static double g_bg_towait_first_s, g_bg_towait_lastrecv_s, g_bg_towait_lastsend_s;
     static uint64_t g_bg_empty_polls, g_bg_rounds;
     static uint64_t g_bg_gates;
@@ -2403,18 +2473,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
              * backoff even for a 16 KiB payload. This negotiated metadata
              * rendezvous confirms both receive queues before either SEND.
              * Payloads remain entirely in the existing registered slab. */
-            struct {
-                uint32_t magic, chunks;
-                uint64_t bytes, offset, round_bytes;
-            } mine = {DS4_TP_BATCH_MAGIC, chunks, bytes, off, round_bytes},
-              theirs = {0};
-            if (!tp_write_full(tp->data_fd, &mine, sizeof(mine)) ||
-                !tp_read_full(tp->data_fd, &theirs, sizeof(theirs)) ||
-                memcmp(&mine, &theirs, sizeof(mine))) {
-                fprintf(stderr, "ds4-tp: bulk receive-ready exchange failed\n");
-                ds4_tp_mark_failed(tp);
+            const double ready_start = g_bg_trace ? tp_now_sec() : 0.0;
+            if (!tp_bulk_ready_exchange(tp, chunks, bytes, off, round_bytes,
+                                         tp_now_sec() + tp->timeout_sec)) {
                 return 0;
             }
+            if (g_bg_trace) g_bg_ready_s += tp_now_sec() - ready_start;
         }
         atomic_thread_fence(memory_order_release);
         struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
@@ -2618,11 +2682,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             const double rounds = g_bg_rounds > 0 ? (double)g_bg_rounds : 1.0;
             fprintf(stderr,
                     "ds4-tp: big-gate breakdown (%llu rounds) | post_recv %.1f us/round | "
-                    "post_send %.1f us/round | to-first-CQE %.1f us/round | "
+                    "receive-ready %.1f us/round | post_send %.1f us/round | to-first-CQE %.1f us/round | "
                     "to-last-recv %.1f us/round | to-last-send %.1f us/round | "
                     "empty polls %.1f/round\n",
                     (unsigned long long)g_bg_rounds,
                     g_bg_postrecv_s * 1e6 / rounds,
+                    g_bg_ready_s * 1e6 / rounds,
                     g_bg_postsend_s * 1e6 / rounds,
                     g_bg_towait_first_s * 1e6 / rounds,
                     g_bg_towait_lastrecv_s * 1e6 / rounds,
@@ -2928,6 +2993,7 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     DS4_TP_TEST_COUNT_EXCHANGE();
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active)
         return tp_rdma_gate_exchange(tp, layer, gate, seq, NULL);
@@ -3009,7 +3075,7 @@ int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
     DS4_TP_TEST_COUNT_EXCHANGE();
-    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    if (!tp || ds4_tp_failed(tp) || tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
@@ -3125,7 +3191,7 @@ static void tp_big_gate_profile_record(const char *payload_kind,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     DS4_TP_TEST_COUNT_EXCHANGE();
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (!tp || ds4_tp_failed(tp) || tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const int profile_enabled = tp_big_gate_profile_enabled();
     const double profile_t0 = profile_enabled ? tp_now_sec() : 0.0;
@@ -3191,7 +3257,7 @@ int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
                                    ds4_tp_big_wave_ready_fn ready,
                                    void *ready_ud) {
     DS4_TP_TEST_COUNT_EXCHANGE();
-    if (!tp || tp->data_fd < 0 || !out || !in || !bytes || !wave_bytes ||
+    if (!tp || ds4_tp_failed(tp) || tp->data_fd < 0 || !out || !in || !bytes || !wave_bytes ||
         waves < 2u || bytes % wave_bytes != 0u ||
         bytes / wave_bytes != waves || !ready) {
         return 0;
