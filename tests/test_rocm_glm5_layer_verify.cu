@@ -390,8 +390,9 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
 }
 
 int main(int argc,char **argv) {
+    const bool resident_both=argc==3 && !std::strcmp(argv[1],"--target-resident-both");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
-        !std::strcmp(argv[1],"--target-resident-timing"));
+        !std::strcmp(argv[1],"--target-resident-timing") || resident_both);
     REQUIRE(!resident || !std::strcmp(argv[2],"0") || !std::strcmp(argv[2],"1"));
     const unsigned resident_rank=resident && !std::strcmp(argv[2],"1")?1u:0u;
     const bool timing=(argc==2 && !std::strcmp(argv[1],"--target-timing")) ||
@@ -457,6 +458,7 @@ int main(int argc,char **argv) {
                     for (unsigned accepted : {0u,m/2u,m})
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
+                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
             }
         } else if (smoke) run_case(x,0,4,3,2);
         else {
@@ -474,7 +476,7 @@ int main(int argc,char **argv) {
     }
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
-        cases,(unsigned long long)compared_values,target||timing?1:0,timing?1:0);
+        cases,(unsigned long long)compared_values,target||timing?1:0,timing||resident_both?1:0);
     if (resident) ds4_gpu_q4k_kshard_release();
     ds4_gpu_cleanup();
     return 0;
