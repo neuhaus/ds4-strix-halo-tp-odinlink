@@ -56,7 +56,10 @@ int main(int argc, char **argv) {
     const bool shared_a = argc == 3 && std::strcmp(argv[2],"--shared-a") == 0;
     const bool fused_shared_a = argc == 3 &&
         std::strcmp(argv[2],"--fused-shared-a") == 0;
-    REQUIRE(argc != 3 || coalesced || m96 || shared_a || fused_shared_a);
+    const bool native_qkv = argc == 3 &&
+        std::strcmp(argv[2],"--fused-native-qkv") == 0;
+    REQUIRE(argc != 3 || coalesced || m96 || shared_a || fused_shared_a ||
+            native_qkv);
     const bool compare_modes = coalesced || m96;
     if (m96) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96";
     const char *skinny = argc >= 2 ? argv[1] : "0";
@@ -69,6 +72,8 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
                    shared_a ? "1" : "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                   "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
                    "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE", "0", 1) == 0);
     if (m96) for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
@@ -135,10 +140,13 @@ int main(int argc, char **argv) {
                 candidate[4],candidate[5],gguf.map,gguf.size,
                 local[0],local[1],local[2],local[3],local[4],local[5],
                 4096,q_width,128,widths[5],input,rows); };
-            const bool fused_eligible = fused_shared_a && rank < 2u &&
+            const bool fused_eligible = (fused_shared_a || native_qkv) &&
+                rank < 2u &&
                 rows >= 1024u;
             REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
                            fused_eligible ? "1" : "0", 1) == 0);
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
+                           native_qkv && fused_eligible ? "1" : "0", 1) == 0);
             REQUIRE(setenv(weight_selector,compare_modes ? "1" : "0",1) == 0);
             REQUIRE(launch() == 1);
             if (fused_eligible) {
@@ -210,12 +218,25 @@ int main(int argc, char **argv) {
                     different += std::memcmp(&a[j],&b[j],sizeof(float)) != 0;
                     max_abs = std::fmax(max_abs,std::fabs(double(a[j])-b[j]));
                 }
-                std::printf("layer=%u rank=%u rows=%u projection=%s values=%zu different=%zu max_abs=%.9g\n",
-                    layer,rank,rows,names[i],count,different,max_abs);
-                exact = exact && different == 0;
+                double error2 = 0.0, norm2 = 0.0;
+                for (size_t j=0; j<count; ++j) {
+                    const double error = double(a[j]) - double(b[j]);
+                    error2 += error * error;
+                    norm2 += double(a[j]) * double(a[j]);
+                }
+                const double nrmse = std::sqrt(error2 /
+                    std::fmax(norm2, 1e-30));
+                std::printf("layer=%u rank=%u rows=%u projection=%s values=%zu different=%zu max_abs=%.9g nrmse=%.9g\n",
+                    layer,rank,rows,names[i],count,different,max_abs,nrmse);
+                if (native_qkv && fused_eligible && i < 3u) {
+                    REQUIRE(std::isfinite(nrmse) && nrmse < 0.01 &&
+                            max_abs < 0.1);
+                } else {
+                    exact = exact && different == 0;
+                }
                 total += count;
             }
-            REQUIRE(exact);
+            REQUIRE(exact || (native_qkv && fused_eligible));
             if (shared_a && layer == 0u && rank < 2u) {
                 hipEvent_t begin, end;
                 REQUIRE(hipEventCreate(&begin) == hipSuccess);
@@ -249,6 +270,8 @@ int main(int argc, char **argv) {
                 for (unsigned arm = 0u; arm < 2u; ++arm) {
                     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
                                    arm ? "1" : "0", 1) == 0);
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
+                                   native_qkv && arm ? "1" : "0", 1) == 0);
                     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
                                    "0", 1) == 0);
                     REQUIRE(ds4_gpu_synchronize());
@@ -263,6 +286,8 @@ int main(int argc, char **argv) {
                 }
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
                                "1", 1) == 0);
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
+                               native_qkv ? "1" : "0", 1) == 0);
                 std::printf("timing fused_shared_a layer=%u rank=%u rows=%u "
                             "baseline_ms=%.6f fused_ms=%.6f speedup=%.4f\n",
                             layer, rank, rows, elapsed[0], elapsed[1],
@@ -306,7 +331,7 @@ int main(int argc, char **argv) {
             }
             ds4_gpu_tensor_free(input);
             std::fflush(stdout);
-            REQUIRE(exact);
+            REQUIRE(exact || (native_qkv && fused_eligible));
         }
     }
     if (coalesced) {

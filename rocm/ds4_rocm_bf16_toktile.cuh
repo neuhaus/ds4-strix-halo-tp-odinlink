@@ -732,6 +732,7 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_kernel(
  * stride-256 accumulation order is unchanged; this is a launch/weight-pointer
  * fusion experiment, not a new arithmetic path.  All six weights remain
  * independent views into the original GGUF mapping. */
+template <bool NativeQKV = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -794,7 +795,8 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel(
                 const uint16_t hi = ds4_bf16_rne_bits(xv);
                 const float hi_f = __uint_as_float((uint32_t)hi << 16u);
                 sh_a_hi[j] = hi;
-                sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+                sh_a_lo[j] = NativeQKV ? 0u :
+                    ds4_bf16_rne_bits(xv - hi_f);
             } else {
                 sh_a_hi[j] = 0u;
                 sh_a_lo[j] = 0u;
@@ -824,10 +826,12 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel(
                     a, reinterpret_cast<const Bf16 *>(
                         sh_a_hi + mt * BM * BK), BK);
                 rocwmma::mma_sync(acc[p][nt], a, b, acc[p][nt]);
-                rocwmma::load_matrix_sync(
-                    a, reinterpret_cast<const Bf16 *>(
-                        sh_a_lo + mt * BM * BK), BK);
-                rocwmma::mma_sync(acc[p][nt], a, b, acc[p][nt]);
+                if constexpr (!NativeQKV) {
+                    rocwmma::load_matrix_sync(
+                        a, reinterpret_cast<const Bf16 *>(
+                            sh_a_lo + mt * BM * BK), BK);
+                    rocwmma::mma_sync(acc[p][nt], a, b, acc[p][nt]);
+                }
             }
         __syncthreads();
     }
