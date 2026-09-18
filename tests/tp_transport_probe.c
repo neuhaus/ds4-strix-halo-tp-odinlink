@@ -8,6 +8,7 @@
 #include "ds4_glm5_next_exec.h"
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,14 +18,16 @@
 #include <unistd.h>
 
 enum { OUTSIDE, PREFILL, ORDINARY, NATIVE, DRAFT, VERIFY, REFRESH, PHASES };
-enum { GATE, AUX, BULK, LOGITS, HASH, AGREE, ROUTE, COMPUTE, COMMAND, ACK, GPU_SYNC, OPS };
+enum { GATE, AUX, BULK, LOGITS, HASH, AGREE_START, AGREE_DRAFT, AGREE_FINISH, ROUTE, COMPUTE, COMMAND, ACK, GPU_SYNC, BATCH, WAVES, OPS };
 static const char *phase_names[] = {"outside","prefill","ordinary","native_other","draft","verify","refresh"};
-static const char *op_names[] = {"gate","aux","bulk","logits","route_hash","native_agree","layer_route","layer_compute","command_send","command_ack","gpu_sync"};
+static const char *op_names[] = {"gate","aux","bulk","logits","route_hash","native_start","native_proposal","native_finish","layer_route","layer_compute","command_send","command_ack","gpu_sync","unexpected_batch","unexpected_waves"};
 typedef struct { unsigned long long calls, failures, bytes; double wall, socket; } stat;
 static stat stats[PHASES][OPS];
 static unsigned long long phase_calls[PHASES];
+static unsigned long long phase_units[PHASES];
 static double phase_wall[PHASES];
-static int enabled = -1, probe_rank = -1;
+static int enabled, probe_rank = -1;
+static pthread_t owner;
 static __thread int phase, depth;
 static __thread double socket_time;
 static double now(void) {
@@ -34,8 +37,9 @@ static double now(void) {
 static void report(void) {
     for (int p=0; p<PHASES; ++p) {
         if (phase_calls[p]) fprintf(stderr,
-            "TP_PROBE_SCOPE rank=%d phase=%s calls=%llu wall_ms=%.6f\n",
-            probe_rank,phase_names[p],phase_calls[p],phase_wall[p]*1000);
+            "TP_PROBE_SCOPE rank=%d phase=%s calls=%llu units=%llu wall_ms=%.6f\n",
+            probe_rank,p==NATIVE ? "native_cycle_inclusive" : phase_names[p],
+            phase_calls[p],phase_units[p],phase_wall[p]*1000);
         for (int o=0; o<OPS; ++o) {
             const stat *s=&stats[p][o]; if (!s->calls) continue;
             fprintf(stderr,
@@ -44,45 +48,51 @@ static void report(void) {
         }
     }
 }
+__attribute__((constructor)) static void init(void) {
+    const char *e=getenv("DS4_TP_TRANSPORT_PROBE");
+    enabled=e && !strcmp(e,"1");
+    owner=pthread_self();
+    if (enabled) atexit(report);
+}
 static int active(void) {
-    if (enabled<0) {
-        const char *e=getenv("DS4_TP_TRANSPORT_PROBE");
-        enabled=e && !strcmp(e,"1");
-        if (enabled) atexit(report);
+    if (enabled && !pthread_equal(owner,pthread_self())) {
+        fprintf(stderr,"TP_PROBE invalid: transport/scope called from another thread\n");
+        _Exit(3);
     }
     return enabled;
 }
-#define SCOPE(name, params, args, scope) \
+#define SCOPE(name, params, args, scope, units) \
     extern int __real_##name params; \
     int __wrap_##name params { \
         if (!active()) return __real_##name args; \
         const int saved=phase; phase=scope; const double probe_start=now(); \
         const int result=__real_##name args; const int saved_errno=errno; \
-        phase_wall[scope]+=now()-probe_start; ++phase_calls[scope]; phase=saved; \
+        phase_wall[scope]+=now()-probe_start; ++phase_calls[scope]; \
+        phase_units[scope]+=(units); phase=saved; \
         errno=saved_errno; return result; \
     }
 SCOPE(ds4_session_sync,
-    (ds4_session *s,const ds4_tokens *p,char *e,size_t n),(s,p,e,n),PREFILL)
+    (ds4_session *s,const ds4_tokens *p,char *e,size_t n),(s,p,e,n),PREFILL,0)
 SCOPE(ds4_session_eval,
-    (ds4_session *s,int t,char *e,size_t n),(s,t,e,n),ORDINARY)
+    (ds4_session *s,int t,char *e,size_t n),(s,t,e,n),ORDINARY,1)
 SCOPE(ds4_session_eval_speculative_argmax,
     (ds4_session *s,int t,int m,int eos,int *a,int cap,char *e,size_t n),
-    (s,t,m,eos,a,cap,e,n),NATIVE)
+    (s,t,m,eos,a,cap,e,n),NATIVE,0)
 SCOPE(ds4_session_tp_glm5_native_cycle,
     (ds4_session *s,uint64_t id,uint64_t c,uint32_t p,int root,uint32_t rows,int eos,char *e,size_t n),
-    (s,id,c,p,root,rows,eos,e,n),NATIVE)
+    (s,id,c,p,root,rows,eos,e,n),NATIVE,0)
 SCOPE(ds4_glm5_next_draft_step,
     (const ds4_glm5_next_exec_ctx *x,ds4_glm5_next_mla_state *s,ds4_glm5_next_workspace *w,
      const ds4_gpu_tensor *prev,uint32_t token,ds4_gpu_tensor *h,ds4_gpu_tensor *l),
-    (x,s,w,prev,token,h,l),DRAFT)
+    (x,s,w,prev,token,h,l),DRAFT,1)
 SCOPE(ds4_glm5_next_target_verify,
     (const ds4_glm5_next_exec_ctx *x,ds4_glm5_next_state *s,ds4_glm5_next_workspace *b,
      ds4_glm5_next_workspace *w,const uint32_t *t,uint32_t n,ds4_gpu_tensor *a,
-     ds4_gpu_tensor *h,ds4_gpu_tensor *l),(x,s,b,w,t,n,a,h,l),VERIFY)
+     ds4_gpu_tensor *h,ds4_gpu_tensor *l),(x,s,b,w,t,n,a,h,l),VERIFY,n)
 SCOPE(ds4_glm5_next_draft_refresh,
     (const ds4_glm5_next_exec_ctx *x,ds4_glm5_next_state *s,ds4_glm5_next_workspace *w,
      const ds4_gpu_tensor *h,const uint32_t *t,uint32_t p,uint32_t n,uint32_t k,ds4_gpu_tensor *prev),
-    (x,s,w,h,t,p,n,k,prev),REFRESH)
+    (x,s,w,h,t,p,n,k,prev),REFRESH,k)
 
 #define CALL(name, params, args, op, payload) \
     extern int __real_##name params; \
@@ -106,13 +116,18 @@ CALL(ds4_tp_aux_gate_exchange,
     (ds4_tp *tp,uint32_t l),(tp,l),AUX,ds4_tp_aux_payload_bytes(tp))
 CALL(ds4_tp_big_gate_exchange,
     (ds4_tp *tp,uint32_t l,uint64_t q,const void *o,void *i,uint64_t b),(tp,l,q,o,i,b),BULK,b)
+CALL(ds4_tp_batch_gate_exchange,
+    (ds4_tp *tp,uint32_t l,uint32_t r,uint64_t q),(tp,l,r,q),BATCH,r*ds4_tp_vec_bytes(tp))
+CALL(ds4_tp_big_gate_exchange_waves,
+    (ds4_tp *tp,uint32_t l,uint64_t q,const void *o,void *i,uint64_t b,uint64_t wb,
+     uint32_t w,ds4_tp_big_wave_ready_fn fn,void *ud),(tp,l,q,o,i,b,wb,w,fn,ud),WAVES,b)
 CALL(ds4_tp_exchange_logits_halves,
     (ds4_tp *tp,float *l,uint32_t n),(tp,l,n),LOGITS,(uint64_t)n*sizeof(float))
 CALL(ds4_tp_hash_check,
     (ds4_tp *tp,uint64_t q,uint64_t h,char *e,size_t n),(tp,q,h,e,n),HASH,0)
 CALL(ds4_tp_native_agree,
     (ds4_tp *tp,const ds4_tp_native_cycle *c,uint32_t p,uint32_t a,const uint32_t t[8],int ok,char *e,size_t n),
-    (tp,c,p,a,t,ok,e,n),AGREE,0)
+    (tp,c,p,a,t,ok,e,n),(p==0 ? AGREE_START : p<8 ? AGREE_DRAFT : AGREE_FINISH),0)
 CALL(ds4_tp_verify_layer_agree,
     (ds4_tp *tp,uint64_t q,uint32_t l,uint32_t f,uint32_t r,uint32_t p,uint64_t h,int ok,char *e,size_t n),
     (tp,q,l,f,r,p,h,ok,e,n),(p ? COMPUTE : ROUTE),0)
