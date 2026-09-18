@@ -72,6 +72,17 @@ static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
     return code ? 1u << code : 0u;
 }
 
+/* Validate handoff's supported arithmetic/scheduling modes before any layer
+ * exchanges. This does not enable handoff or replace native-width/hello checks. */
+static inline bool ds4_tp_glm5_handoff_modes_valid(const char *paired,
+        const char *overlap, const char *window_overlap, const char *window_scratch) {
+    if (paired && (paired[0] != '0' || paired[1])) return false;
+    if (overlap && ((overlap[0] != '0' && overlap[0] != '1') || overlap[1])) return false;
+    return !(overlap && overlap[0] == '1' &&
+        window_overlap && window_overlap[0] == '1' && !window_overlap[1] &&
+        window_scratch && window_scratch[0] == '1' && !window_scratch[1]);
+}
+
 static inline uint64_t ds4_tp_prefill_config_encode(
         uint32_t min_attn,
         uint32_t min_ffn,

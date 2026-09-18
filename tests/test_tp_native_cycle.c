@@ -169,6 +169,18 @@ static void malformed_cases(void) {
 }
 
 static void config_cases(void) {
+    CHECK(ds4_tp_glm5_handoff_modes_valid(NULL,NULL,NULL,NULL));
+    CHECK(ds4_tp_glm5_handoff_modes_valid("0","1",NULL,NULL));
+    CHECK(ds4_tp_glm5_handoff_modes_valid("0","0","1","1"));
+    CHECK(!ds4_tp_glm5_handoff_modes_valid("0","1","1","1"));
+    const char *bad_modes[] = {"", "2", "01", "1 ", "invalid"};
+    for (unsigned i=0;i<sizeof(bad_modes)/sizeof(bad_modes[0]);++i) {
+        CHECK(!ds4_tp_glm5_handoff_modes_valid(bad_modes[i],"0",NULL,NULL));
+        CHECK(!ds4_tp_glm5_handoff_modes_valid("0",bad_modes[i],NULL,NULL));
+        cases+=2;
+    }
+    CHECK(!ds4_tp_glm5_handoff_modes_valid("1","0",NULL,NULL));
+    cases+=5;
     const char *values[] = {NULL, "", "0", "2", "4", "8", "1", "3", "16", "02", "-2", "2 ", " 2", "x"};
     const uint32_t expected[] = {0, 0, 0, 2, 4, 8, UINT32_MAX, UINT32_MAX, UINT32_MAX,
         UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};

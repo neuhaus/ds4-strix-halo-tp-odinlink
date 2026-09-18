@@ -51692,11 +51692,17 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
     const bool use_handoff = handoff && strcmp(handoff, "1") == 0;
     const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    const bool handoff_modes_valid = !use_handoff || ds4_tp_glm5_handoff_modes_valid(
+        getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE"),
+        getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP"),
+        getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP"),
+        getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH"));
     if ((handoff && strcmp(handoff, "0") && strcmp(handoff, "1")) ||
         use_handoff != ((ds4_tp_prefill_config(e->tp.ctx) &
             DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
-        (use_handoff && (!native_rows || !shared || strcmp(shared, "1")))) {
-        fprintf(stderr, "ds4: native FFN handoff requires matching hello, native draft and shared-Q8 batch\n");
+        (use_handoff && (!native_rows || !shared || strcmp(shared, "1"))) ||
+        !handoff_modes_valid) {
+        fprintf(stderr, "ds4: native FFN handoff requires matching hello, native draft, shared-Q8 batch and compatible scalar/shared-route settings\n");
         return 0;
     }
     uint32_t workspace_capacity = 1u;

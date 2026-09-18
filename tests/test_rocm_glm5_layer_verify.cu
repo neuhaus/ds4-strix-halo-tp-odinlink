@@ -28,6 +28,7 @@ struct ds4_tp {
     unsigned calls = 0, fail_call = 0, bulk_calls = 0, aux_calls = 0;
     unsigned layer_agrees[2] = {}, handoff_bulk_calls = 0, handoff_pending = 0;
     int fail_agree_phase = -1;
+    bool fail_handoff_bulk = false;
     uint64_t handoff_sequence = 0, handoff_hash = 0;
     uint32_t handoff_layer = 0, handoff_frontier = 0, handoff_rows = 0;
     uint64_t prefill_config = 0;
@@ -93,6 +94,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *p,uint32_t layer,uint64_t sequence,const vo
         REQUIRE(p->handoff_pending==2 && layer==p->handoff_layer &&
             sequence==p->handoff_sequence+1 && bytes==p->handoff_rows*16384u);
         p->handoff_pending=0; ++p->handoff_bulk_calls;
+        if (p->fail_handoff_bulk) { ds4_tp_mark_failed(p); return 0; }
     }
     ++p->bulk_calls;
     if (++p->calls==p->fail_call) return 0;
@@ -286,9 +288,10 @@ static void equal_target(State &a,State &b) {
     for (unsigned il=0;il<45;++il) equal_layer(a,b,il);
 }
 
-static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,unsigned accepted) {
-    std::printf("TARGET_VERIFY begin rank=%u m=%u prefix=%u accepted=%u simulated_peer=echo\n",
-        x.tp_rank,m,prefix,accepted); std::fflush(stdout);
+static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,unsigned accepted,
+                        bool synthetic_frontier=false) {
+    std::printf("TARGET_VERIFY begin rank=%u m=%u prefix=%u accepted=%u simulated_peer=echo synthetic_frontier=%u\n",
+        x.tp_rank,m,prefix,accepted,synthetic_frontier); std::fflush(stdout);
     constexpr uint64_t logit_row=154880u*4u;
     const uint32_t tokens[8]={300,1234,57,902,341,765,88,42};
     State base(*x.model), reference(*x.model), candidate(*x.model);
@@ -298,9 +301,15 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
     Tensor next_a(hc_row), next_b(hc_row), logit_a(logit_row), logit_b(logit_row);
     // Match even physically inactive tail entries without changing model data.
     for (unsigned il=3;il<45;il+=4) {
-        seed_mla(base,il,0); seed_mla(reference,il,0); seed_mla(candidate,il,0);
+        const unsigned p=synthetic_frontier?prefix:0u;
+        seed_mla(base,il,p); seed_mla(reference,il,p); seed_mla(candidate,il,p);
     }
-    for (unsigned t=0;t<prefix;++t) {
+    if (synthetic_frontier) for (unsigned il=0;il<45;++il) if (il%4!=3) {
+        base.s.kda.layer[il].token_count=prefix;
+        reference.s.kda.layer[il].token_count=prefix;
+        candidate.s.kda.layer[il].token_count=prefix;
+    }
+    for (unsigned t=0;!synthetic_frontier && t<prefix;++t) {
         serial_target(x,base,scalar,991+t,next_a,logit_a);
         serial_target(x,reference,scalar,991+t,next_a,logit_a);
         serial_target(x,candidate,scalar,991+t,next_a,logit_a);
@@ -466,16 +475,24 @@ static void target_handoff_failure(ds4_glm5_next_exec_ctx &x) {
         x.tp->fail_agree_phase=phase; fails(); x.tp->fail_agree_phase=-1;
         REQUIRE(x.tp->layer_agrees[phase]==before+1 && x.tp->handoff_bulk_calls==bulk_before);
     }
+    const auto bulk_before=x.tp->handoff_bulk_calls;
+    x.tp->fail_handoff_bulk=true; fails(); x.tp->fail_handoff_bulk=false;
+    REQUIRE(x.tp->handoff_bulk_calls==bulk_before+1);
     const char *overlap=std::getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
     const bool had_overlap=overlap!=nullptr;
     const std::string overlap_value=overlap?overlap:"";
     const auto before=x.tp->layer_agrees[0];
     const auto compute_before=x.tp->layer_agrees[1];
-    REQUIRE(setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP","invalid",1)==0); fails();
+    REQUIRE(ds4_glm5_next_layer_verify_reserve(&x,4,&state.s,2));
+    REQUIRE(ds4_gpu_tensor_fill_f32(scratch,0.125f,2*16384u));
+    REQUIRE(setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP","invalid",1)==0);
+    REQUIRE(!ds4_glm5_next_layer_verify(&x,4,&state.s,batch,scalar,scratch,hidden,2));
+    REQUIRE(!state.s.valid && !state.s.kda.pending_verifications && x.tp->failed);
+    x.tp->failed=false;
     REQUIRE(x.tp->layer_agrees[0]==before+1 && x.tp->layer_agrees[1]==compute_before);
     REQUIRE((had_overlap?setenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP",overlap_value.c_str(),1):
         unsetenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP"))==0);
-    std::puts("TARGET_HANDOFF invalid selector/hello/shared, local failure and both agreement failures refuse PASS");
+    std::puts("TARGET_HANDOFF invalid selector/hello/shared, local failure, both agreement and bulk failures refuse PASS");
 }
 
 static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false,
@@ -673,7 +690,10 @@ int main(int argc,char **argv) {
                     for (unsigned accepted : {0u,m/2u,m})
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
-                if (handoff_compare) target_handoff_failure(x);
+                if (handoff_compare) {
+                    for (unsigned m : {2u,4u,8u}) target_case(x,m,8192u+(m==4),m/2,true);
+                    target_handoff_failure(x);
+                }
                 if (resident_both && !shared_compare && !handoff_compare) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
                 if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true,
                     handoff_compare?"DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF":
