@@ -34,6 +34,8 @@ struct Buffer {
 
 int main() {
     const char *path=std::getenv("DS4_GLM5_MODEL"); REQUIRE(path);
+    // Match the production GLM selector and the full-target fixture.
+    REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1)==0);
     Glm5TestGGUF g; REQUIRE(g.open_file(path));
     uint64_t offsets[9], sizes[9];
     for (unsigned il=0;il<3;++il) for (unsigned p=0;p<3;++p) {
@@ -96,6 +98,9 @@ int main() {
             std::printf("DENSE_Q8_EXACT layer=%u m=%u seed=%u PASS\n",il,m,seed); std::fflush(stdout);
         }
         if (il==0) {
+            REQUIRE(unsetenv("DS4_GLM5_NEXT_ENABLE_ORDINARY")==0);
+            REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,m));
+            REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1)==0);
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,up.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,1));
             REQUIRE(!ds4_rocm_glm5_dense_q8_small_m(gate.view,gate.view,g.map,g.size,offsets[0],offsets[1],4096,12288,input.view,m));
             auto *short_out=ds4_gpu_tensor_view(gate.view,0,gate.count*4-4); REQUIRE(short_out);

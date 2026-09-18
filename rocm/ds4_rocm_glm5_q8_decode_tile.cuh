@@ -370,8 +370,10 @@ __global__ static void glm5_dense_q8_small_m_kernel(
 #pragma unroll
                 for (unsigned t = 0u; t < Tokens; ++t) {
                     const float xv = sx[t][b * 32u + lane];
-                    sum0[t] += d0 * (float)q0 * xv;
-                    sum1[t] += d1 * (float)q1 * xv;
+                    // The production pair's fast-math ISA rounds d*x before
+                    // FMA with q. Sharing d*q across tokens changes rounding.
+                    sum0[t] = fmaf(q8_exact_ordered_mul(d0, xv), (float)q0, sum0[t]);
+                    sum1[t] = fmaf(q8_exact_ordered_mul(d1, xv), (float)q1, sum1[t]);
                 }
             } else {
                 const float scaled = q8_exact_ordered_mul(d0, (float)q0);
