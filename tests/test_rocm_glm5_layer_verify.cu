@@ -225,8 +225,12 @@ static void run_case(ds4_glm5_next_exec_ctx &x,unsigned il,unsigned m,unsigned p
     auto *verify_inputs=ds4_gpu_tensor_view(inputs,0,m*hc_row); REQUIRE(verify_inputs);
     const unsigned aux_before=x.tp->aux_calls;
     const unsigned bulk_before=x.tp->bulk_calls;
+    const unsigned handoff_before=x.tp->handoff_bulk_calls;
+    const unsigned agree_before=x.tp->layer_agrees[0];
     REQUIRE(ds4_glm5_next_layer_verify(&x,il,&candidate.s,batch,scalar,verify_inputs,got,m));
     REQUIRE(x.tp->aux_calls==aux_before && x.tp->bulk_calls>bulk_before);
+    if (il%4==3 && (x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF))
+        REQUIRE(x.tp->handoff_bulk_calls==handoff_before+1 && x.tp->layer_agrees[0]==agree_before+1);
     REQUIRE(!ds4_glm5_next_layer_verify(&x,il,&candidate.s,batch,scalar,verify_inputs,got,m) && candidate.s.valid);
     equal_layer(base,candidate,il);
     auto *one=ds4_gpu_tensor_view(inputs,0,hc_row); REQUIRE(one);
@@ -544,6 +548,7 @@ static void mla_handoff_failures(ds4_glm5_next_exec_ctx &x) {
         REQUIRE(ds4_gpu_tensor_fill_f32(input,0.125f,6*16384u));
         const auto calls=x.tp->calls;
         const auto agrees=x.tp->layer_agrees[0];
+        const auto bulks=x.tp->handoff_bulk_calls;
         if (failure==0) REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF","invalid",1)==0);
         if (failure==1) x.tp->prefill_config &= ~DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
         // Fail each end of the attention staging loop before the FFN handoff.
@@ -553,7 +558,9 @@ static void mla_handoff_failures(ds4_glm5_next_exec_ctx &x) {
         if (failure<2) REQUIRE(state.s.valid && x.tp->calls==calls &&
             x.tp->layer_agrees[0]==agrees && !state.s.pending_mla_verifications);
         else REQUIRE(!state.s.valid && !state.s.pending_mla_verifications &&
-            x.tp->failed && !ds4_glm5_next_layer_verify_finish(&x,3,&state.s,1));
+            x.tp->failed && x.tp->layer_agrees[0]==agrees+1 &&
+            x.tp->handoff_bulk_calls==bulks &&
+            !ds4_glm5_next_layer_verify_finish(&x,3,&state.s,1));
         REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF","1",1)==0);
         x.tp->prefill_config=config; x.tp->fail_call=0; x.tp->fail_agree_phase=-1;
         x.tp->failed=false;
@@ -668,6 +675,7 @@ int main(int argc,char **argv) {
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
     const bool shared_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-shared-both");
     const bool mla_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-mla-handoff-both");
+    const auto verifier_widths=mla_compare?std::vector<unsigned>{2u,4u,6u}:glm5_test_verifier_widths();
     const bool handoff_compare=mla_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-handoff-both"));
     const bool resident_both=dense_compare || shared_compare || handoff_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
@@ -711,10 +719,14 @@ int main(int argc,char **argv) {
         if (mla_compare) {
             REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF") &&
                 !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF"),"1"));
-            const auto widths=glm5_test_verifier_widths();
-            peer.prefill_config |= ds4_tp_glm5_native_config(widths.back()) |
+            REQUIRE(glm5_test_verifier_widths()==std::vector<unsigned>{6u});
+            peer.prefill_config |= ds4_tp_glm5_native_config(6u) |
                 DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
-            std::puts("TARGET_SETTINGS mla_ffn_handoff=1 canonical_native_width=1");
+            const char *overlap=std::getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
+            const char *owned=std::getenv("DS4_GLM5_MLA_OWNED_HEADS");
+            std::printf("TARGET_SETTINGS mla_ffn_handoff=1 native_maximum=6 target_rows=2/4/6 hello=0x%016llx overlap=%s owned_heads=%s\n",
+                (unsigned long long)peer.prefill_config,
+                overlap?overlap:"unset",owned?owned:"unset");
         }
         if (resident) {
             Glm5NextKShardPlan plan;
@@ -765,12 +777,12 @@ int main(int argc,char **argv) {
             for (unsigned rank=first_rank;rank<(smoke?1u:end_rank);++rank) {
                 peer.rank=x.tp_rank=rank;
                 if (smoke) target_case(x,2,0,1);
-                else for (unsigned m : glm5_test_verifier_widths())
+                else for (unsigned m : verifier_widths)
                     for (unsigned accepted=0;accepted<=m;++accepted)
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
                 if (handoff_compare) {
-                    for (unsigned m : glm5_test_verifier_widths()) {
+                    for (unsigned m : verifier_widths) {
                         target_case(x,m,8192u+(m==4),m/2,true);
                         if (m==6u) target_case(x,m,8195u,5u,true);
                         if (mla_compare) for (unsigned prefix : {2047u,2048u})

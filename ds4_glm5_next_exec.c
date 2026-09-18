@@ -4579,7 +4579,10 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     const uint64_t config = ds4_tp_prefill_config(ctx->tp);
     if ((mla_option && strcmp(mla_option, "0") && strcmp(mla_option, "1")) ||
         mla_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
-        !ds4_tp_glm5_mla_handoff_config_valid(config)) return 0;
+        !ds4_tp_glm5_mla_handoff_config_valid(config)) {
+        fprintf(stderr, "ds4: native MLA FFN verifier selector/hello mismatch or missing prerequisites\n");
+        return 0;
+    }
     const bool batch_mla = !is_kda && mla_requested;
     const bool batch_shared = (is_kda || batch_mla) && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
         shared_option && strcmp(shared_option, "1") == 0;
@@ -4591,6 +4594,7 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
             DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
         (handoff_requested && (!shared_option || strcmp(shared_option, "1")))) return 0;
     const bool batch_handoff = handoff_requested && batch_shared;
+    if (batch_mla && !batch_handoff) return 0;
     if (batch_shared) {
         const char *pair = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
         if (!layer->is_trunk || scalar_w->draft_only ||
