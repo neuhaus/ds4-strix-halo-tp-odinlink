@@ -187,3 +187,13 @@ before the shared projection and one FFN handoff. Prefill, native drafting,
 model bytes and expert-window capacity are unchanged. Selector/configuration
 mismatch refuses. This is default-off Lane A research; the plan and measured
 results belong in `research/mla-ffn-handoff-plan-710f97e.md` in the dossier.
+
+`DS4_ROCM_GLM5_VERIFY_FFN_QUEUE=1` queues the existing resident M1 expert
+kernels and activation copies across verifier rows on stream0, with one
+completion fence before phase1 status agreement. It requires native drafting,
+FFN handoff, and negotiated bit43; malformed or mismatched settings refuse.
+The default-off control completes each row separately. No prefill, model,
+weight allocation or native draft-window change is involved. Fixture-only
+HIP event wrappers measure packed expert device intervals separately from
+complete loop wall time; they are not linked into model executables. The plan
+is `research/ffn-queue-plan-d65372d.md` in the candidate dossier.

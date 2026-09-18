@@ -64,6 +64,8 @@ enum {
     /* Extend exact shared-Q8/FFN handoff batching to native MLA verification.
      * Attention remains causal M1; this changes the order of TP gates. */
     DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF = UINT64_C(1) << 42,
+    /* Queue resident verifier expert rows, completing before phase1 agree. */
+    DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE = UINT64_C(1) << 43,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
@@ -94,6 +96,12 @@ static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
 
 static inline bool ds4_tp_glm5_mla_handoff_config_valid(uint64_t config) {
     return !(config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) ||
+        (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline bool ds4_tp_glm5_ffn_queue_config_valid(uint64_t config) {
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) ||
         (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
          (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
 }

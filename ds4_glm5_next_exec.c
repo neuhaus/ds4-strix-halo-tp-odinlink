@@ -4453,6 +4453,8 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
     const uint64_t q4_down_half = (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
     const uint64_t sequence = *ctx->tp_sequence;
+    const bool queue_experts = (ds4_tp_prefill_config(ctx->tp) &
+        DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u;
     int32_t ids[8u * GLM5_EXPERTS_USED] = {0};
     float weights[8u * GLM5_EXPERTS_USED] = {0};
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -4510,8 +4512,16 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
                 scalar->router_weights, GLM5_EXPERTS_USED, 10.0f,
                 scalar->ffn_hidden, NULL, il) &&
             ds4_gpu_add_tensor(local, scalar->routed_out,
-                scalar->shared_out, GLM5_WIDTH) && ds4_gpu_synchronize();
+                scalar->shared_out, GLM5_WIDTH) &&
+            (queue_experts || ds4_gpu_synchronize());
         ds4_gpu_tensor_free(local);
+    }
+    if (queue_experts) {
+        /* All copies, packed kernels and adds use stream0. The row view owns
+         * no storage. Drain even on an enqueue failure, and report completion
+         * status before phase1 agreement; the later payload fence is too late. */
+        const int completed = ds4_gpu_synchronize();
+        ok = ok && completed;
     }
     /* Failure is always exchanged before either side posts the bulk payload. */
     if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 1u,
@@ -4577,6 +4587,14 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     const char *mla_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
     const bool mla_requested = mla_option && strcmp(mla_option, "1") == 0;
     const uint64_t config = ds4_tp_prefill_config(ctx->tp);
+    const char *queue_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
+    const bool queue_requested = queue_option && strcmp(queue_option, "1") == 0;
+    if ((queue_option && strcmp(queue_option, "0") && strcmp(queue_option, "1")) ||
+        queue_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u) ||
+        !ds4_tp_glm5_ffn_queue_config_valid(config)) {
+        fprintf(stderr, "ds4: native FFN queue selector/hello mismatch or missing prerequisites\n");
+        return 0;
+    }
     if ((mla_option && strcmp(mla_option, "0") && strcmp(mla_option, "1")) ||
         mla_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
         !ds4_tp_glm5_mla_handoff_config_valid(config)) {
@@ -4679,8 +4697,8 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         if (ok) {
             static int reported[2][2];
             if (!reported[ctx->tp_rank][batch_mla]) {
-                fprintf(stderr, "ds4: native %s FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0\n",
-                    batch_mla ? "MLA" : "KDA", ctx->tp_rank);
+                fprintf(stderr, "ds4: native %s FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0 expert_completion=%s\n",
+                    batch_mla ? "MLA" : "KDA", ctx->tp_rank, queue_requested ? "layer" : "row");
                 reported[ctx->tp_rank][batch_mla] = 1;
             }
         }

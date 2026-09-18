@@ -401,6 +401,11 @@ static int tp_hello_validate_prefill_config(uint64_t local, uint64_t peer,
         tp_set_err(err, errlen, "tp hello: MLA FFN handoff requires native width and FFN handoff");
         return 0;
     }
+    if (!ds4_tp_glm5_ffn_queue_config_valid(local) ||
+        !ds4_tp_glm5_ffn_queue_config_valid(peer)) {
+        tp_set_err(err, errlen, "tp hello: FFN queue requires native width and FFN handoff");
+        return 0;
+    }
     if (local == peer) return 1;
     tp_set_err(err, errlen,
                "tp hello: prefill config mismatch (local=0x%016llx peer=0x%016llx)",
