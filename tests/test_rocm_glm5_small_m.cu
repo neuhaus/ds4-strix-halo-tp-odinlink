@@ -1,0 +1,119 @@
+#include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
+extern "C" {
+#include "ds4_tp.h"
+}
+#include "glm5_gguf_test.hpp"
+#include <hip/hip_runtime.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
+#define REQUIRE(x) do { if (!(x)) { \
+    std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); std::exit(1); \
+} } while (0)
+
+int main(int argc, char **argv) {
+    const bool baseline = argc == 2 && std::strcmp(argv[1],"--baseline") == 0;
+    REQUIRE(argc == 1 || baseline);
+    const char *model = std::getenv("DS4_GLM5_MODEL");
+    REQUIRE(model);
+    Glm5TestGGUF gguf;
+    REQUIRE(gguf.open_file(model));
+    ds4_gpu_config config = {};
+    config.n_gpus = 1;
+    REQUIRE(ds4_gpu_init_multi(&config));
+    REQUIRE(ds4_gpu_set_model_fd_for_map(gguf.fd,gguf.map));
+    REQUIRE(ds4_gpu_set_model_map(gguf.map,gguf.size));
+    uint64_t exact_values = 0;
+    for (unsigned layer : {0u,1u,44u}) for (const char *role : {"q","k","v","output"}) {
+        if (baseline && (layer != 0u || (std::strcmp(role,"q") && std::strcmp(role,"output")))) continue;
+        const bool output = std::strcmp(role,"output") == 0;
+        const uint32_t k = output ? 8192u : 4096u;
+        const uint32_t n = output ? 2048u : 4096u;
+        char name[80];
+        std::snprintf(name,sizeof(name),"blk.%u.kda_%s.weight",layer,role);
+        uint64_t weight;
+        REQUIRE(gguf.tensor(name,{k,2u*n},30u,weight));
+        for (unsigned rank=0;rank<2u;++rank) for (unsigned m : {2u,4u,8u}) {
+            std::vector<float> host_x((size_t)m*k), ref((size_t)m*n), got(ref.size()+16u);
+            for (size_t i=0;i<host_x.size();++i)
+                host_x[i] = (float)((int)((i*193u+(i/k)*761u+layer*47u)%997u)-498) /
+                    (1001.3f+(float)(i%7u));
+            ds4_gpu_tensor *x=ds4_gpu_tensor_alloc(host_x.size()*sizeof(float));
+            ds4_gpu_tensor *storage=ds4_gpu_tensor_alloc(got.size()*sizeof(float));
+            ds4_gpu_tensor *y=ds4_gpu_tensor_view(storage,0u,ref.size()*sizeof(float));
+            REQUIRE(x && storage && y);
+            REQUIRE(ds4_gpu_tensor_write(x,0u,host_x.data(),host_x.size()*sizeof(float)));
+            std::vector<ds4_gpu_tensor *> xs(m),ys(m);
+            for (unsigned t=0;t<m;++t) {
+                xs[t]=ds4_gpu_tensor_view(x,(uint64_t)t*k*4u,(uint64_t)k*4u);
+                ys[t]=ds4_gpu_tensor_view(y,(uint64_t)t*n*4u,(uint64_t)n*4u);
+                REQUIRE(xs[t] && ys[t]);
+            }
+            const uint64_t offset=weight+(uint64_t)rank*k*n*2u;
+            auto launch=[&](unsigned arm) {
+                if (arm == 0u) {
+                    for (unsigned t=0;t<m;++t)
+                        if (!ds4_gpu_matmul_bf16_tensor(ys[t],gguf.map,gguf.size,
+                                offset,k,n,xs[t],1u)) return 0;
+                    return 1;
+                }
+                return ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,offset,k,n,x,m);
+            };
+            const unsigned arms=baseline ? 2u : 3u;
+            for (unsigned arm=0;arm<arms;++arm) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm==2u?"1":"0",1)==0);
+                REQUIRE(ds4_gpu_tensor_fill_f32(storage,12345.0f,got.size()));
+                REQUIRE(launch(arm) && ds4_gpu_synchronize());
+                REQUIRE(ds4_gpu_tensor_read(storage,0u,got.data(),got.size()*sizeof(float)));
+                uint64_t mismatches=0;
+                double max_abs=0;
+                for (size_t i=0;i<ref.size();++i) {
+                    REQUIRE(std::isfinite(got[i]));
+                    if (arm==0u) ref[i]=got[i];
+                    else {
+                        mismatches += std::memcmp(&ref[i],&got[i],sizeof(float)) != 0;
+                        max_abs=std::max(max_abs,std::fabs((double)ref[i]-got[i]));
+                    }
+                }
+                for (size_t i=ref.size();i<got.size();++i) REQUIRE(got[i]==12345.0f);
+                if (arm) std::printf("SMALL_M_NUMERIC layer=%u role=%s rank=%u m=%u arm=%u different=%llu max_abs=%.9g\n",
+                    layer,role,rank,m,arm,(unsigned long long)mismatches,max_abs);
+                if (arm==2u) { REQUIRE(mismatches==0u); exact_values+=ref.size(); }
+            }
+            if (layer==0u && (output || std::strcmp(role,"q")==0)) {
+                hipEvent_t begin,end;
+                REQUIRE(hipEventCreate(&begin)==hipSuccess && hipEventCreate(&end)==hipSuccess);
+                std::vector<double> times[3];
+                for (unsigned round=0;round<12u;++round) for (unsigned j=0;j<arms;++j) {
+                    const unsigned arm=(round+j)%arms;
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm==2u?"1":"0",1)==0);
+                    REQUIRE(hipEventRecord(begin,nullptr)==hipSuccess);
+                    for (unsigned repeat=0;repeat<3u;++repeat) REQUIRE(launch(arm));
+                    REQUIRE(hipEventRecord(end,nullptr)==hipSuccess && hipEventSynchronize(end)==hipSuccess);
+                    float ms=0;
+                    REQUIRE(hipEventElapsedTime(&ms,begin,end)==hipSuccess && std::isfinite(ms) && ms>0);
+                    if (round>=3u) {
+                        times[arm].push_back(ms/3.0);
+                        std::printf("SMALL_M_SAMPLE role=%s rank=%u m=%u arm=%u round=%u ms=%.6f\n",role,rank,m,arm,round-3u,ms/3.0);
+                    }
+                }
+                for (unsigned arm=0;arm<arms;++arm) {
+                    std::sort(times[arm].begin(),times[arm].end());
+                    std::printf("SMALL_M_MEDIAN role=%s rank=%u m=%u arm=%u ms=%.6f\n",role,rank,m,arm,times[arm][4]);
+                }
+                REQUIRE(hipEventDestroy(begin)==hipSuccess && hipEventDestroy(end)==hipSuccess);
+            }
+            for (unsigned t=0;t<m;++t) { ds4_gpu_tensor_free(xs[t]); ds4_gpu_tensor_free(ys[t]); }
+            ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(storage); ds4_gpu_tensor_free(x);
+        }
+    }
+    std::printf("PASS small-M projection probe baseline=%d candidate_exact_values=%llu\n",baseline,(unsigned long long)exact_values);
+    ds4_gpu_cleanup();
+    return 0;
+}

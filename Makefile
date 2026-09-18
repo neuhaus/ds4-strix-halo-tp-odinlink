@@ -338,6 +338,12 @@ test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 		./tests/test_rocm_glm5_kda_layer
 
 .PHONY: test-rocm-glm5-mhc-layer
+tests/test_rocm_glm5_small_m.o: tests/test_rocm_glm5_small_m.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_small_m: tests/test_rocm_glm5_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_mhc_layer.o: tests/test_rocm_glm5_mhc_layer.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
