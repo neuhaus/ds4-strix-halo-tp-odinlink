@@ -186,8 +186,10 @@ int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
 /* Research full-target transaction. Reserve every trunk journal first;
  * partial reservation failure retains bounded storage owned/freed by state.
  * Caller owns exact M-row hidden scratch, hidden output and vocabulary logits
- * (M=2/4/8), plus distinct scalar/decode and M-row workspaces. No GPU allocation
- * occurs in the pass. Buffers must not alias each other or workspace/TP storage.
+ * (M=2/4/8), plus distinct scalar/decode and M-row workspaces. The wrapper
+ * allocates no GPU storage; scalar FFNs retain their ordinary residency policy.
+ * Preload the production compressed slices before an allocation-free timed
+ * pass. Buffers must not alias each other or workspace/TP storage.
  * Input IDs are validated before any work; successful verification computes
  * all 45 layers and every output head, synchronizes, and leaves live state
  * pending at its original common frontier. The model, settings and transport

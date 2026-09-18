@@ -20,6 +20,8 @@ extern "C" {
 
 struct ds4_tp {
     unsigned rank = 0;
+    uint32_t features = DS4_TP_FEATURE_GLM5_KDA_TP |
+        DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE | DS4_TP_FEATURE_GLM5_SMALL_GATE;
     unsigned char *slab = nullptr;
     bool capable = true, failed = false;
     unsigned calls = 0, fail_call = 0, bulk_calls = 0, aux_calls = 0;
@@ -30,10 +32,7 @@ int ds4_tp_rank(const ds4_tp *p) { return p->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *p) { return p->capable; }
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *p) { return p->capable; }
 bool ds4_tp_big_gate_is_direct(const ds4_tp *p,const void *,const void *,uint64_t) { return p->capable; }
-uint32_t ds4_tp_runtime_features(const ds4_tp *) {
-    return DS4_TP_FEATURE_GLM5_KDA_TP | DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE |
-        DS4_TP_FEATURE_GLM5_SMALL_GATE;
-}
+uint32_t ds4_tp_runtime_features(const ds4_tp *p) { return p->features; }
 uint64_t ds4_tp_prefill_config(const ds4_tp *) { return 0; }
 uint64_t ds4_tp_vec_bytes(const ds4_tp *) { return 16384; }
 uint64_t ds4_tp_aux_payload_bytes(const ds4_tp *) { return 8192; }
@@ -391,9 +390,14 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m) {
 }
 
 int main(int argc,char **argv) {
-    const bool timing=argc==2 && !std::strcmp(argv[1],"--target-timing");
-    const bool target=argc==2 && (!std::strcmp(argv[1],"--target") ||
-        !std::strcmp(argv[1],"--target-smoke"));
+    const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
+        !std::strcmp(argv[1],"--target-resident-timing"));
+    REQUIRE(!resident || !std::strcmp(argv[2],"0") || !std::strcmp(argv[2],"1"));
+    const unsigned resident_rank=resident && !std::strcmp(argv[2],"1")?1u:0u;
+    const bool timing=(argc==2 && !std::strcmp(argv[1],"--target-timing")) ||
+        (resident && !std::strcmp(argv[1],"--target-resident-timing"));
+    const bool target=resident || (argc==2 && (!std::strcmp(argv[1],"--target") ||
+        !std::strcmp(argv[1],"--target-smoke")));
     const bool smoke=argc==2 && (!std::strcmp(argv[1],"--smoke") ||
         !std::strcmp(argv[1],"--target-smoke"));
     REQUIRE(argc==1 || target || smoke || timing);
@@ -403,23 +407,50 @@ int main(int argc,char **argv) {
     setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY","1",1);
     Glm5TestGGUF g; REQUIRE(g.open_file(path));
     ds4_glm5_next_model_offsets model={}; REQUIRE(glm5_next_bind_real_offsets(g,model));
-    REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(g.fd,g.map) && ds4_gpu_set_model_map(g.map,g.size));
+    REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(g.fd,g.map));
+    if (!resident) REQUIRE(ds4_gpu_set_model_map(g.map,g.size));
     {
         Tensor slab(65536,true), out(8*4096*4,true), in(8*4096*4,true);
         ds4_tp peer; peer.slab=(unsigned char *)ds4_gpu_tensor_contents(slab);
+        if (resident) {
+            Glm5NextKShardPlan plan;
+            REQUIRE(glm5_next_build_kshard_plan(g,model,plan));
+            uint64_t free_bytes=0,total_bytes=0;
+            REQUIRE(ds4_gpu_memory_info(&free_bytes,&total_bytes) &&
+                plan.dense_total_bytes+plan.packed_total_bytes+(UINT64_C(3)<<30)<free_bytes);
+            ds4_gpu_set_glm_model(true);
+            ds4_gpu_set_q8_cache_suppressed(1);
+            peer.rank=resident_rank;
+            peer.features|=DS4_TP_FEATURE_Q4K_KSHARD | DS4_TP_FEATURE_Q4K_WMMA;
+            ds4_gpu_set_tp_runtime_features(peer.rank,peer.features);
+            REQUIRE(ds4_gpu_q4k_kshard_install(g.map,g.size,g.fd,peer.rank,
+                plan.dense_offsets.data(),plan.dense_sizes.data(),plan.dense_offsets.size(),
+                plan.dense_max_tensor_bytes,plan.layers.data(),plan.layers.size()));
+            ds4_gpu_q4k_kshard_windows windows={};
+            REQUIRE(ds4_gpu_q4k_kshard_windows_get(&windows) && windows.rank==peer.rank &&
+                windows.n_layers==42 && windows.row_count==1024 &&
+                windows.down_column_byte_count==576 &&
+                ds4_gpu_q4k_packed_slice_bytes()==plan.packed_total_bytes);
+            std::printf("TARGET_RESIDENCY rank=%u dense_bytes=%llu packed_bytes=%llu "
+                "weights=original_q4k simulated_peer=echo\n",peer.rank,
+                (unsigned long long)plan.dense_total_bytes,
+                (unsigned long long)plan.packed_total_bytes); std::fflush(stdout);
+        }
         uint64_t sequence=0;
         ds4_glm5_next_exec_ctx x={};
         x.model=&model; x.model_map=g.map; x.model_size=g.size; x.tp=&peer;
         x.tp_slab=slab; x.tp_big_out=out; x.tp_big_in=in;
         x.tp_big_out_host=ds4_gpu_tensor_contents(out); x.tp_big_in_host=ds4_gpu_tensor_contents(in);
         x.tp_sequence=&sequence;
+        const unsigned first_rank=resident?resident_rank:0u;
+        const unsigned end_rank=resident?resident_rank+1u:2u;
         if (timing) {
-            for (unsigned rank=0;rank<2;++rank) {
+            for (unsigned rank=first_rank;rank<end_rank;++rank) {
                 peer.rank=x.tp_rank=rank;
                 for (unsigned m : {2u,4u,8u}) target_timing(x,m);
             }
         } else if (target) {
-            for (unsigned rank=0;rank<(smoke?1u:2u);++rank) {
+            for (unsigned rank=first_rank;rank<(smoke?1u:end_rank);++rank) {
                 peer.rank=x.tp_rank=rank;
                 if (smoke) target_case(x,2,0,1);
                 else for (unsigned m : {2u,4u,8u})
@@ -444,6 +475,7 @@ int main(int argc,char **argv) {
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
         cases,(unsigned long long)compared_values,target||timing?1:0,timing?1:0);
+    if (resident) ds4_gpu_q4k_kshard_release();
     ds4_gpu_cleanup();
     return 0;
 }
