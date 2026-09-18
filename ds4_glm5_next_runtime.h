@@ -92,6 +92,7 @@ typedef struct {
 } ds4_glm5_next_model_offsets;
 
 struct ds4_glm5_next_state;
+struct ds4_glm5_next_mla_replay;
 
 typedef struct {
     ds4_gpu_tensor *compact_kv;
@@ -116,6 +117,7 @@ typedef struct {
     uint32_t first_valid;
     bool valid;
     struct ds4_glm5_next_state *owner;
+    struct ds4_glm5_next_mla_replay *replay;
 } ds4_glm5_next_mla_state;
 
 typedef struct ds4_glm5_next_state {
@@ -125,6 +127,7 @@ typedef struct ds4_glm5_next_state {
     uint32_t context_capacity;
     uint32_t mla_count;
     uint64_t bytes;
+    uint32_t pending_mla_verifications;
     bool valid;
 } ds4_glm5_next_state;
 
@@ -179,6 +182,32 @@ int ds4_glm5_next_mla_append_plan(
         const ds4_glm5_next_mla_state *mla, uint32_t *tail_slot,
         uint32_t *pool_index, bool *publish_pool);
 int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
+
+/* Explicit small-batch verifier storage; no ordinary-path allocation. The
+ * borrowed view shares append-only KV/pools but owns private tails/counters.
+ * Use it only until finish/reset/abort, and obey its causal lengths. The
+ * caller must finish a successful full layer pass before accepting any rows;
+ * on a failed pass invalidate the owning next_state instead. */
+int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
+                                     uint32_t capacity);
+uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *mla);
+int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *mla,
+                                    uint32_t tokens,
+                                    ds4_glm5_next_mla_state **view);
+/* Record normalized index keys and raw pool gates before workspace reuse.
+ * Rows are contiguous in token order; staging may precede append_commit.
+ * Ordinary unreserved/inactive states take a no-op path. */
+int ds4_glm5_next_mla_verify_record(ds4_glm5_next_mla_state *view,
+                                     uint32_t position,
+                                     const ds4_gpu_tensor *keys,
+                                     uint64_t key_offset,
+                                     const ds4_gpu_tensor *gates,
+                                     uint64_t gate_offset,
+                                     uint32_t tokens);
+/* accepted counts consumed input rows, including the root, not predictions.
+ * Zero discards a completed pass. No weights, full-KV copies or GPU readback. */
+int ds4_glm5_next_mla_verify_finish(ds4_glm5_next_mla_state *mla,
+                                     uint32_t accepted);
 
 #ifdef __cplusplus
 }

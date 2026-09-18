@@ -350,6 +350,12 @@ tests/test_rocm_glm5_small_m_kda.o: tests/test_rocm_glm5_small_m_kda.cu tests/gl
 tests/test_rocm_glm5_small_m_kda: tests/test_rocm_glm5_small_m_kda.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_rocm_glm5_mla_replay.o: tests/test_rocm_glm5_mla_replay.cu tests/glm5_gguf_test.hpp ds4_glm5_next_runtime.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_replay: tests/test_rocm_glm5_mla_replay.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_mhc_layer.o: tests/test_rocm_glm5_mhc_layer.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 

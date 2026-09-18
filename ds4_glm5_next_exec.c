@@ -2261,6 +2261,10 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                             (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
                             w->mla_pool_gate_raw,
                             0u, GLM5_INDEX_DIM * sizeof(float)) &&
+        ds4_glm5_next_mla_verify_record(
+            mla, mla->token_count, mla->index_tail,
+            (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
+            w->mla_pool_gate_raw, 0u, 1u) &&
         mla_publish_completed_pool(
             ctx, m, mla, w, pool_index, publish_pool) &&
         ds4_gpu_glm_fill_selected_range_tensor(w->mla_selected_token,
@@ -2394,6 +2398,10 @@ static int mla_sparse_selection_attention(
             mla->pool_gate_tail,
             (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
             w->mla_pool_gate_raw, 0u, GLM5_INDEX_DIM * sizeof(float)) &&
+        ds4_glm5_next_mla_verify_record(
+            mla, mla->token_count, mla->index_tail,
+            (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
+            w->mla_pool_gate_raw, 0u, 1u) &&
         mla_publish_completed_pool(
             ctx, m, mla, w, pool_index, publish_pool) &&
         ds4_gpu_matmul_bf16_tensor(
@@ -2518,6 +2526,10 @@ static int mla_sparse_selection_from_prelude_row(
               mla->pool_gate_tail, (uint64_t)tail_slot * index_k_row,
               batch_w->mla_pool_gate_raw, (uint64_t)row * index_k_row,
               index_k_row) &&
+          ds4_glm5_next_mla_verify_record(
+              mla, mla->token_count, batch_w->mla_index_k_norm,
+              (uint64_t)row * index_k_row, batch_w->mla_pool_gate_raw,
+              (uint64_t)row * index_k_row, 1u) &&
           mla_publish_completed_pool(
               ctx, m, mla, scalar_w, pool_index, publish_pool))) &&
         (batched_scores ?
@@ -2569,6 +2581,9 @@ static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
     if (!ctx || !offsets || !mla || !w || n_tokens == 0u ||
         mla->token_count != pos0 || mla->complete_pools != pos0 / 4u ||
         mla->tail_count != pos0 % 4u) return 0;
+    if (!ds4_glm5_next_mla_verify_record(
+            mla, pos0, w->mla_index_k_norm, 0u, w->mla_pool_gate_raw, 0u,
+            n_tokens)) return 0;
 #ifdef DS4_ROCM_BUILD
     const char *batch_pool_value =
         getenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE");
@@ -4180,7 +4195,8 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 const ds4_gpu_tensor *hc_in,
                                 ds4_gpu_tensor *hc_out) {
     const uint64_t hc_bytes = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out ||
         ds4_gpu_tensor_bytes(hc_in) < hc_bytes ||
         ds4_gpu_tensor_bytes(hc_out) < hc_bytes ||
@@ -4219,7 +4235,8 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       uint32_t n_tokens) {
     const uint64_t hc_row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         (uint64_t)n_tokens > UINT64_MAX / hc_row_bytes ||
@@ -4262,7 +4279,8 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         const ds4_gpu_tensor *hc_in,
         ds4_gpu_tensor *hc_out,
         uint32_t n_tokens) {
-    if (!context_valid(ctx) || !state || !state->valid || !batch_w ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !batch_w ||
         !scalar_w || batch_w == scalar_w || !hc_in || !hc_out ||
         hc_in == hc_out || n_tokens == 0u ||
         batch_w->capacity_tokens != n_tokens ||
@@ -4497,7 +4515,8 @@ int ds4_glm5_next_kda_attention_forward_test(
         uint32_t n_tokens) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens || il >= ctx->model->trunk_count ||
         ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_KDA ||
@@ -4525,7 +4544,8 @@ int ds4_glm5_next_mla_attention_forward_test(
         uint32_t n_tokens) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         il >= ctx->model->trunk_count ||
@@ -4586,7 +4606,8 @@ int ds4_glm5_next_mla_sparse_attention_forward_test(
         uint32_t top_k) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->pending_mla_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || w->capacity_tokens != 1u ||
         il >= ctx->model->trunk_count || top_k == 0u ||
         top_k > DS4_GLM5_NEXT_INDEX_TOP_K ||
