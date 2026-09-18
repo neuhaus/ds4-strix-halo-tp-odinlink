@@ -151,3 +151,12 @@ expert entries in the native workspace's existing eight-slot window. Its
 This remains default-off, with native owner/model/rank binding and terminal
 consumer synchronization required. The rationale and validation scope are in
 `research/native-window-reuse-plan-48bb294.md` in the same dossier.
+
+`DS4_ROCM_GLM5_VERIFY_SHARED_Q8=1` is a default-off exact shared-expert
+batch experiment for resident KDA routed trunk layers in the target verifier.
+It retains scalar mHC prefixes and original Q8_0 bytes, then shares weights
+across M2/4/8 using existing activation scratch. Router agreement, routed Q4_K
+evaluation and TP exchanges remain per token. Unsupported shared-pair modes
+or nonresident layouts refuse. MLA and ordinary decode are unchanged by the
+selector. See `research/shared-q8-integration-plan-d02a636.md` for the bounded
+hypothesis and required real-weight, network and promotion checks.

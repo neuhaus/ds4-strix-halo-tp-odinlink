@@ -383,12 +383,34 @@ static void target_failure(ds4_glm5_next_exec_ctx &x) {
     x.tp->fail_call=0; x.tp->failed=false;
     REQUIRE(ds4_glm5_next_state_reset(&state.s));
     std::puts("TARGET_VERIFY injected mid-pass exchange failure invalidates whole state PASS");
+    const char *shared=std::getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    if (shared && !std::strcmp(shared,"1")) {
+        REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8","invalid",1)==0);
+        REQUIRE(!ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,2,scratch,hidden,logits));
+        REQUIRE(!state.s.valid && !state.s.verification.tokens &&
+            !state.s.kda.pending_verifications && !state.s.pending_mla_verifications);
+        REQUIRE(ds4_glm5_next_state_reset(&state.s));
+        REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8","1",1)==0);
+        const char *pair=std::getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+        const bool had_pair=pair!=nullptr;
+        const std::string pair_value=pair?pair:"";
+        REQUIRE(setenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE","1",1)==0);
+        REQUIRE(!ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,2,scratch,hidden,logits));
+        REQUIRE(!state.s.valid && !state.s.verification.tokens &&
+            !state.s.kda.pending_verifications && !state.s.pending_mla_verifications);
+        REQUIRE(ds4_glm5_next_state_reset(&state.s));
+        REQUIRE(had_pair?setenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE",pair_value.c_str(),1)==0:
+            unsetenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE")==0);
+        std::puts("TARGET_VERIFY invalid shared selector and incompatible paired arithmetic refuse PASS");
+    }
 }
 
 static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false,
                          const char *switch_name="DS4_ROCM_GLM5_BF16_VERIFY_HEAD") {
     const bool dense_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
-    const char *tag=heads_only?(dense_compare?"DENSE_Q8_BUDGET":"HEAD_BUDGET"):"TARGET_BUDGET";
+    const bool shared_compare=!std::strcmp(switch_name,"DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    const char *tag=heads_only?(shared_compare?"SHARED_Q8_BUDGET":
+        dense_compare?"DENSE_Q8_BUDGET":"HEAD_BUDGET"):"TARGET_BUDGET";
     const char *old_option=std::getenv(switch_name);
     const bool had_option=old_option!=nullptr;
     const std::string old_value=old_option?old_option:"";
@@ -432,7 +454,8 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
             times[arm].push_back(ms);
             std::printf("%s_SAMPLE rank=%u m=%u round=%u arm=%s ms=%.6f\n",
                 tag,x.tp_rank,m,sample-4,
-                arm?"verify_commit":heads_only?(dense_compare?"scalar_dense_verify":"scalar_head_verify"):"serial",ms);
+                arm?"verify_commit":heads_only?(shared_compare?"scalar_shared_verify":
+                    dense_compare?"scalar_dense_verify":"scalar_head_verify"):"serial",ms);
             std::fflush(stdout);
         }
     }
@@ -477,7 +500,8 @@ int main(int argc,char **argv) {
     const bool warm=argc==3 && !std::strcmp(argv[1],"--native-warm");
     const bool native=refresh || warm || (argc==3 && !std::strcmp(argv[1],"--native-draft"));
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
-    const bool resident_both=dense_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
+    const bool shared_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-shared-both");
+    const bool resident_both=dense_compare || shared_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
         !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile || native);
@@ -502,6 +526,11 @@ int main(int argc,char **argv) {
         REQUIRE(std::getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD") &&
             !std::strcmp(std::getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD"),"1") && model.output_type==30u);
         std::puts("TARGET_SETTINGS dense_q8=1 bf16_head=1 model_head_type=30");
+    }
+    if (shared_compare) {
+        REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8") &&
+            !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8"),"1"));
+        std::puts("TARGET_SETTINGS shared_q8=1 scalar_prefix=1 weights=original");
     }
     REQUIRE(ds4_gpu_init() && ds4_gpu_set_model_fd_for_map(g.fd,g.map));
     if (!resident) REQUIRE(ds4_gpu_set_model_map(g.map,g.size));
@@ -561,8 +590,9 @@ int main(int argc,char **argv) {
                     for (unsigned accepted : {0u,m/2u,m})
                         target_case(x,m,m==2?0u:3u,accepted);
                 target_failure(x);
-                if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
+                if (resident_both && !shared_compare) for (unsigned m : {2u,4u,8u}) target_timing(x,m);
                 if (resident_both) for (unsigned m : {2u,4u,8u}) target_timing(x,m,true,
+                    shared_compare?"DS4_ROCM_GLM5_VERIFY_SHARED_Q8":
                     dense_compare?"DS4_ROCM_GLM5_VERIFY_DENSE_Q8":"DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
             }
         } else if (smoke) run_case(x,0,4,3,2);

@@ -1,10 +1,11 @@
 // Exercise the actual executor seam; discard unrelated executor functions at
 // link time. GPU operations and peer checks are deterministic boundary mocks.
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include "../ds4_glm5_next_exec.c"
 
-struct ds4_gpu_tensor { uint64_t bytes; void *data; };
 struct ds4_tp { int rank, failed, peer_result; bool rdma; };
 static char events[32];
 static unsigned event_count, fail_op;
@@ -19,9 +20,9 @@ static int event(char ch) {
 }
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *t) { return t ? t->bytes : 0; }
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *data, uint64_t bytes) {
-    if (!t || !t->data || off>t->bytes || bytes>t->bytes-off) return 0;
+    if (!t || !t->ptr || off>t->bytes || bytes>t->bytes-off) return 0;
     if (!event(t==workspace->router_selected ? 'I' : 'W')) return 0;
-    memcpy(data,(const char *)t->data+off,bytes); return 1;
+    memcpy(data,(const char *)t->ptr+off,bytes); return 1;
 }
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma; }
@@ -69,8 +70,8 @@ int main(void) {
     ds4_tp tp = {.rdma=true,.peer_result=1};
     int32_t ids[8]={0,1,2,3,4,5,6,287};
     float weights[8]={0.1f,0.2f,0.3f,0.4f,0.5f,0.6f,0.7f,0.8f};
-    ds4_gpu_tensor selected={sizeof(ids),ids}, rw={sizeof(weights),weights};
-    ds4_gpu_tensor shared[5]={{0}}, slab={16384,NULL};
+    ds4_gpu_tensor selected={.ptr=ids,.bytes=sizeof(ids)}, rw={.ptr=weights,.bytes=sizeof(weights)};
+    ds4_gpu_tensor shared[5]={{0}}, slab={.bytes=16384};
     ds4_glm5_next_workspace w={.decode_phase=true,.router_selected=&selected,
         .router_weights=&rw,.shared_gate=&shared[0],.shared_up=&shared[1],
         .shared_mid=&shared[2],.shared_out=&shared[3],.ffn_hidden=&shared[4]};
