@@ -24,6 +24,19 @@ int ds4_rocm_glm5_dense_q8_small_m(
         uint32_t in_dim, uint32_t out_dim,
         const ds4_gpu_tensor *x, uint32_t tokens);
 
+/* Production-unused shared-expert Q8_0 leaf, M=2/4/8, same settings as above.
+ * Pair: rank-local gate/up K4096/N1024, row_bytes=4352, k_first=0.
+ * Single: down K1024/N4096, full row_bytes=2176, k_first=0 or1024;
+ * offset0 names the unsliced tensor, offset1 must be zero. Original strides
+ * and scalar scale*code rounding are retained; no persistent weight copy.
+ * Caller must establish Q8_0 tensor types. Invalid shapes/bounds/overlap refuse. */
+int ds4_rocm_glm5_shared_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens);
+
 /* Reserve the bounded sparse-attention Lane-B tile workspace before timed
  * prefill. A positive return means reserved, zero is a hard backend failure,
  * and -1 means the backend does not provide the specialization. */

@@ -450,3 +450,111 @@ extern "C" int ds4_rocm_glm5_dense_q8_small_m(
 #undef DS4_DENSE_Q8_LAUNCH
     return cuda_ok(cudaGetLastError(), "GLM5 dense Q8 small-M exact launch");
 }
+
+/* Shared experts use two scalar M1 projections, unlike the dense paired
+ * oracle above. Round scale*code once, then reuse that original Q8 block for
+ * each independent token accumulator. Retain the full GGUF down-row stride.
+ * This leaf is not selected by production dispatch. */
+template <unsigned Tokens, bool Pair>
+__global__ static void glm5_shared_q8_small_m_kernel(
+        float *out0, float *out1, const unsigned char *w0,
+        const unsigned char *w1, const float *x, unsigned in_dim,
+        unsigned out_dim, uint64_t row_bytes) {
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u, "small M");
+    constexpr unsigned Panel = 1024u, Rows = 8u;
+    __shared__ float sx[Tokens][Panel];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * Rows + (threadIdx.x >> 5u);
+    float sum0[Tokens] = {}, sum1[Tokens] = {};
+    for (unsigned first = 0u; first < in_dim; first += Panel) {
+        for (unsigned i = threadIdx.x; i < Tokens * Panel; i += Rows * 32u)
+            sx[i / Panel][i % Panel] = x[(uint64_t)(i / Panel) * in_dim + first + i % Panel];
+        __syncthreads();
+        for (unsigned b = 0u; b < Panel / 32u; ++b) {
+            const uint64_t offset = (uint64_t)row * row_bytes + (first / 32u + b) * 34u;
+            const unsigned char *a = w0 + offset;
+            const float d0 = q8_0_scale_broadcast_w32(a);
+            const float scaled0 = q8_exact_ordered_mul(d0, (float)((const int8_t *)(a + 2u))[lane]);
+            float scaled1 = 0.0f;
+            if constexpr (Pair) {
+                const unsigned char *c = w1 + offset;
+                const float d1 = q8_0_scale_broadcast_w32(c);
+                scaled1 = q8_exact_ordered_mul(d1, (float)((const int8_t *)(c + 2u))[lane]);
+            }
+#pragma unroll
+            for (unsigned t = 0u; t < Tokens; ++t) {
+                const float xv = sx[t][b * 32u + lane];
+                sum0[t] += scaled0 * xv;
+                if constexpr (Pair) sum1[t] += scaled1 * xv;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned t = 0u; t < Tokens; ++t) {
+        const float value0 = warp_sum_f32(sum0[t]);
+        if (lane == 0u) out0[(uint64_t)t * out_dim + row] = value0;
+        if constexpr (Pair) {
+            const float value1 = warp_sum_f32(sum1[t]);
+            if (lane == 0u) out1[(uint64_t)t * out_dim + row] = value1;
+        }
+    }
+}
+
+extern "C" int ds4_rocm_glm5_shared_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens) {
+    const bool pair = out1 != nullptr;
+    if (!out0 || !x || !model_map ||
+        (tokens != 2u && tokens != 4u && tokens != 8u) ||
+        (pair ? (in_dim != 4096u || out_dim != 1024u || row_bytes != 4352u || k_first != 0u) :
+                (in_dim != 1024u || out_dim != 4096u || row_bytes != 2176u ||
+                 (k_first != 0u && k_first != 1024u) || offset1 != 0u))) return 0;
+    const char *prefetch = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
+    const char *nt = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    const char *rows = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    if (glm5_q8_decode_tile_mode() != 1 || g_quality_mode ||
+        !cuda_runtime_config()->q8_decode_sharedx_64k ||
+        !prefetch || strcmp(prefetch, "8") != 0 ||
+        (nt && strcmp(nt, "0") != 0 && strcmp(nt, "1") != 0) ||
+        (rows && strcmp(rows, "8") != 0 && strcmp(rows, "16") != 0 && strcmp(rows, "32") != 0))
+        return 0;
+    const uint64_t x_bytes = (uint64_t)tokens * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)tokens * out_dim * sizeof(float);
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    if (!cuda_tensor_has_bytes(x, x_bytes) || !cuda_tensor_has_bytes(out0, out_bytes) ||
+        (pair && !cuda_tensor_has_bytes(out1, out_bytes)) ||
+        !cuda_model_range_fits(model_size, offset0, weight_bytes) || offset0 % 2u ||
+        (pair && (!cuda_model_range_fits(model_size, offset1, weight_bytes) || offset1 % 2u))) return 0;
+    auto disjoint = [](const ds4_gpu_tensor *a, uint64_t na,
+                       const ds4_gpu_tensor *b, uint64_t nb) {
+        const uintptr_t ap = (uintptr_t)a->ptr, bp = (uintptr_t)b->ptr;
+        return ap && bp && ap % 4u == 0u && bp % 4u == 0u &&
+            (ap <= bp ? na <= bp - ap : nb <= ap - bp);
+    };
+    if (!disjoint(out0, out_bytes, x, x_bytes) ||
+        (pair && (!disjoint(out1, out_bytes, x, x_bytes) ||
+                  !disjoint(out0, out_bytes, out1, out_bytes)))) return 0;
+    const auto *w0 = (const unsigned char *)cuda_model_range_ptr(model_map, offset0, weight_bytes, "shared_q8_small_m");
+    const auto *w1 = pair ? (const unsigned char *)cuda_model_range_ptr(model_map, offset1, weight_bytes, "shared_q8_small_m_pair") : nullptr;
+    if (!w0 || (pair && !w1)) return 0;
+    w0 += (uint64_t)(k_first / 32u) * 34u;
+#define DS4_SHARED_Q8_LAUNCH(M, P) \
+    glm5_shared_q8_small_m_kernel<M, P><<<out_dim / 8u, 256u>>>( \
+        (float *)out0->ptr, pair ? (float *)out1->ptr : nullptr, w0, w1, \
+        (const float *)x->ptr, in_dim, out_dim, row_bytes)
+    if (pair) {
+        if (tokens == 2u) DS4_SHARED_Q8_LAUNCH(2u, true);
+        else if (tokens == 4u) DS4_SHARED_Q8_LAUNCH(4u, true);
+        else DS4_SHARED_Q8_LAUNCH(8u, true);
+    } else {
+        if (tokens == 2u) DS4_SHARED_Q8_LAUNCH(2u, false);
+        else if (tokens == 4u) DS4_SHARED_Q8_LAUNCH(4u, false);
+        else DS4_SHARED_Q8_LAUNCH(8u, false);
+    }
+#undef DS4_SHARED_Q8_LAUNCH
+    return cuda_ok(cudaGetLastError(), "GLM5 shared Q8 small-M exact launch");
+}
