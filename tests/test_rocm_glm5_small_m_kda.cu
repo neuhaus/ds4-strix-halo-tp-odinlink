@@ -5,6 +5,7 @@ extern "C" {
 #include "ds4_tp.h"
 }
 #include "glm5_gguf_test.hpp"
+#include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -107,9 +108,73 @@ static uint64_t compare(const std::vector<float> &ref,
     return different;
 }
 
+static void time_kda(const Glm5TestGGUF &g,
+                     const ds4_glm5_kda_weight_offsets &weights) {
+    // Local warm-weight stage budget, not a target-verifier throughput test.
+    for (unsigned rank=0;rank<2;++rank) for (unsigned m : {2u,4u,8u}) {
+        HeadState state(rank);
+        ds4_glm5_kda_workspace scalar = {}, batch = {};
+        REQUIRE(ds4_glm5_kda_workspace_init(&scalar,1));
+        REQUIRE(ds4_glm5_kda_workspace_init(&batch,m));
+        std::vector<float> host((7u+m)*4096u);
+        for (size_t i=0;i<host.size();++i)
+            host[i]=(float)((int)((i*193u+(i/4096u)*761u)%997u)-498)/1001.3f;
+        auto *input=ds4_gpu_tensor_alloc(host.size()*4u);
+        auto *output=ds4_gpu_tensor_alloc((uint64_t)m*4096u*4u);
+        REQUIRE(input && output && ds4_gpu_tensor_write(input,0,host.data(),host.size()*4u));
+        std::vector<ds4_gpu_tensor *> rows;
+        for (unsigned t=0;t<7u+m;++t) {
+            rows.push_back(ds4_gpu_tensor_view(input,(uint64_t)t*4096u*4u,4096u*4u));
+            REQUIRE(rows.back());
+        }
+        auto *group=ds4_gpu_tensor_view(input,7u*4096u*4u,(uint64_t)m*4096u*4u);
+        REQUIRE(group);
+        auto run=[&](const ds4_gpu_tensor *x, unsigned count,
+                     ds4_glm5_kda_workspace &ws) {
+            REQUIRE(ds4_glm5_kda_layer_begin(&state.local,&ws,&weights,g.map,
+                g.size,x,output,count,1.0e-5f,rank*32u,32u));
+            REQUIRE(ds4_glm5_kda_layer_commit(&state.local,count));
+        };
+        hipEvent_t start,end;
+        REQUIRE(hipEventCreate(&start)==hipSuccess && hipEventCreate(&end)==hipSuccess);
+        std::vector<double> samples[3];
+        for (unsigned round=0;round<12;++round) for (unsigned j=0;j<3;++j) {
+            const unsigned arm=(round+j)%3u;
+            REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT",arm==2?"1":"0",1)==0);
+            REQUIRE(ds4_glm5_kda_slot_reset(&state.slot));
+            state.local.token_count=0;
+            state.local.pending_tokens=0;
+            state.local.valid=true;
+            for (unsigned t=0;t<7;++t) run(rows[t],1,scalar);
+            REQUIRE(hipEventRecord(start,nullptr)==hipSuccess);
+            if (arm==0) for (unsigned t=0;t<m;++t) run(rows[7+t],1,scalar);
+            else run(group,m,batch);
+            REQUIRE(hipEventRecord(end,nullptr)==hipSuccess && hipEventSynchronize(end)==hipSuccess);
+            float ms=0;
+            REQUIRE(hipEventElapsedTime(&ms,start,end)==hipSuccess && std::isfinite(ms) && ms>0);
+            if (round>=3) {
+                samples[arm].push_back(ms);
+                std::printf("SMALL_M_KDA_SAMPLE rank=%u m=%u arm=%u round=%u ms=%.6f\n",
+                    rank,m,arm,round-3,ms);
+            }
+        }
+        for (unsigned arm=0;arm<3;++arm) {
+            std::sort(samples[arm].begin(),samples[arm].end());
+            std::printf("SMALL_M_KDA_MEDIAN rank=%u m=%u arm=%u ms=%.6f\n",
+                rank,m,arm,samples[arm][4]);
+        }
+        REQUIRE(hipEventDestroy(start)==hipSuccess && hipEventDestroy(end)==hipSuccess);
+        ds4_gpu_tensor_free(group);
+        for (auto *row : rows) ds4_gpu_tensor_free(row);
+        ds4_gpu_tensor_free(output); ds4_gpu_tensor_free(input);
+        ds4_glm5_kda_workspace_free(&batch); ds4_glm5_kda_workspace_free(&scalar);
+    }
+}
+
 int main(int argc, char **argv) {
     const bool diagnostic=argc==2 && std::strcmp(argv[1],"--diagnostic")==0;
-    REQUIRE(argc==1 || diagnostic);
+    const bool timing=argc==2 && std::strcmp(argv[1],"--timing")==0;
+    REQUIRE(argc==1 || diagnostic || timing);
     const char *path=std::getenv("DS4_GLM5_MODEL");
     REQUIRE(path);
     Glm5TestGGUF g;
@@ -195,5 +260,6 @@ int main(int argc, char **argv) {
     std::printf("SMALL_M_KDA_RESULT diagnostic=%d candidate_values=%llu different=%llu\n",
         diagnostic,(unsigned long long)candidate_values,(unsigned long long)candidate_different);
     REQUIRE(diagnostic || candidate_different==0);
+    if (timing) time_kda(g,bind(g,0));
     return 0;
 }
