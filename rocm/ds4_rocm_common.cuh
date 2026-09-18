@@ -527,6 +527,43 @@ __global__ static void matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kern
     if (lane == 0u) out[row] = acc;
 }
 
+/* Small target-verification batches reuse unchanged BF16 weights across
+ * independent token accumulators. Keep the M1 lane/K traversal and reduction;
+ * activation panels bound LDS at 32 KiB even for eight tokens. */
+template <uint32_t Tokens>
+__global__ static void matmul_bf16_f32_small_m_exact_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 8u,
+                  "supported small verification batches");
+    constexpr uint32_t PanelK = 1024u;
+    constexpr uint32_t Rows = 8u;
+    __shared__ float panel[Tokens][PanelK];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = blockIdx.x * Rows + (tid >> 5u);
+    float sum[Tokens] = {};
+    for (uint32_t first = 0u; first < in_dim; first += PanelK) {
+        for (uint32_t i = tid; i < Tokens * PanelK; i += Rows * 32u)
+            panel[i / PanelK][i % PanelK] =
+                x[(uint64_t)(i / PanelK) * in_dim + first + i % PanelK];
+        __syncthreads();
+        const uint16_t *wr = weight + (uint64_t)row * in_dim + first;
+        for (uint32_t k = lane; k < PanelK; k += 32u) {
+            const float w = __uint_as_float((uint32_t)wr[k] << 16u);
+#pragma unroll
+            for (uint32_t t = 0u; t < Tokens; ++t)
+                sum[t] += w * panel[t][k];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t t = 0u; t < Tokens; ++t) {
+        const float value = warp_sum_f32(sum[t]);
+        if (lane == 0u) out[(uint64_t)t * out_dim + row] = value;
+    }
+}
+
 /* Decode-only GLM KDA projection candidate.  The six matrices retain their
  * independent GGUF addresses; only the input vector is staged once per
  * block.  Twenty-four waves cover eight rows each of Q/K/V and one wave each

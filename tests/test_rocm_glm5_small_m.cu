@@ -86,6 +86,40 @@ int main(int argc, char **argv) {
                     layer,role,rank,m,arm,(unsigned long long)mismatches,max_abs);
                 if (arm==2u) { REQUIRE(mismatches==0u); exact_values+=ref.size(); }
             }
+            if (!baseline && layer==0u && !output && rank==0u && m==2u) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","invalid",1)==0);
+                REQUIRE(!launch(2u));
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1)==0);
+                REQUIRE(setenv("DS4_ROCM_DISABLE_BF16_SHAREDX","1",1)==0);
+                REQUIRE(!launch(2u));
+                REQUIRE(unsetenv("DS4_ROCM_DISABLE_BF16_SHAREDX")==0);
+                REQUIRE(setenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER","1",1)==0);
+                REQUIRE(!launch(2u));
+                REQUIRE(unsetenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER")==0);
+                ds4_gpu_tensor *short_y=ds4_gpu_tensor_view(y,0u,ref.size()*4u-4u);
+                REQUIRE(short_y && !ds4_gpu_matmul_bf16_tensor(short_y,gguf.map,
+                    gguf.size,offset,k,n,x,m));
+                ds4_gpu_tensor_free(short_y);
+                REQUIRE(!ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,
+                    gguf.size-2u,k,n,x,m));
+                REQUIRE(launch(0u) && ds4_gpu_synchronize());
+                REQUIRE(ds4_gpu_tensor_read(y,0u,got.data(),ref.size()*4u));
+                REQUIRE(std::memcmp(ref.data(),got.data(),ref.size()*4u)==0);
+                std::puts("PASS small-M guards and unchanged M1 under opt-in");
+            }
+            if (!baseline && layer==0u && !output && rank==0u && m==8u) {
+                for (unsigned tail : {3u,7u}) {
+                    std::vector<float> control((size_t)tail*n), candidate(control.size());
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","0",1)==0);
+                    REQUIRE(ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,offset,k,n,x,tail) && ds4_gpu_synchronize());
+                    REQUIRE(ds4_gpu_tensor_read(y,0u,control.data(),control.size()*4u));
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1)==0);
+                    REQUIRE(ds4_gpu_matmul_bf16_tensor(y,gguf.map,gguf.size,offset,k,n,x,tail) && ds4_gpu_synchronize());
+                    REQUIRE(ds4_gpu_tensor_read(y,0u,candidate.data(),candidate.size()*4u));
+                    REQUIRE(std::memcmp(control.data(),candidate.data(),control.size()*4u)==0);
+                }
+                std::puts("PASS unsupported M3/M7 keep incumbent dispatch");
+            }
             if (layer==0u && (output || std::strcmp(role,"q")==0)) {
                 hipEvent_t begin,end;
                 REQUIRE(hipEventCreate(&begin)==hipSuccess && hipEventCreate(&end)==hipSuccess);

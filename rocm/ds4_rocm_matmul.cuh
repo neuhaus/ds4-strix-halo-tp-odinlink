@@ -2707,6 +2707,30 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
+    const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 8u) &&
+        ((in_dim == 4096u && out_dim == 4096u) ||
+         (in_dim == 8192u && out_dim == 2048u));
+    if (small_m_shape) {
+        const char *small_m = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT");
+        if (small_m && strcmp(small_m, "0") != 0 && strcmp(small_m, "1") != 0)
+            return 0;
+        if (small_m && strcmp(small_m, "1") == 0) {
+            const char *split = getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
+            const char *legacy = getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
+            if (getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") ||
+                (split && strcmp(split, "0") != 0) ||
+                (legacy && strcmp(legacy, "0") != 0)) return 0;
+#define DS4_SMALL_M_EXACT(T) \
+            matmul_bf16_f32_small_m_exact_kernel<T><<<out_dim / 8u, 256u>>>( \
+                (float *)out->ptr, (const uint16_t *)wptr, \
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim)
+            if (n_tok == 2u) DS4_SMALL_M_EXACT(2u);
+            else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u);
+            else DS4_SMALL_M_EXACT(8u);
+#undef DS4_SMALL_M_EXACT
+            return cuda_ok(cudaGetLastError(), "BF16 small-M exact launch");
+        }
+    }
     if (n_tok == 1u && in_dim <= 8192u &&
         in_dim * sizeof(float) <= 65536u &&
         getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {
