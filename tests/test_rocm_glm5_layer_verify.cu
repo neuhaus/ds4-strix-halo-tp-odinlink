@@ -35,6 +35,7 @@ struct ds4_tp {
     uint64_t latency_seq = 0;
     unsigned handoff_fences=0;
     bool fail_completion=false;
+    unsigned fail_enqueue_call=0, packed_calls=0;
 };
 #include "glm5_ffn_queue_probe.hpp"
 extern "C" {
@@ -578,7 +579,7 @@ static void mla_handoff_failures(ds4_glm5_next_exec_ctx &x) {
 
 static void queue_handoff_failures(ds4_glm5_next_exec_ctx &x) {
     const auto config=x.tp->prefill_config;
-    for (unsigned il : {3u,4u}) for (unsigned failure=0;failure<3;++failure) {
+    for (unsigned il : {3u,4u}) for (unsigned failure=0;failure<4;++failure) {
         State state(*x.model);
         Workspace scalar(1), batch(6);
         Tensor input(6*hc_row), output(6*hc_row);
@@ -589,6 +590,7 @@ static void queue_handoff_failures(ds4_glm5_next_exec_ctx &x) {
         if (failure==0) REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE","invalid",1)==0);
         if (failure==1) x.tp->prefill_config &= ~DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE;
         if (failure==2) x.tp->fail_completion=true;
+        if (failure==3) x.tp->fail_enqueue_call=3;
         REQUIRE(!ds4_glm5_next_layer_verify(&x,il,&state.s,batch,scalar,input,output,6));
         if (failure<2) REQUIRE(state.s.valid && x.tp->calls==calls &&
             x.tp->layer_agrees[1]==compute && !state.s.pending_mla_verifications &&
@@ -597,10 +599,11 @@ static void queue_handoff_failures(ds4_glm5_next_exec_ctx &x) {
             !state.s.kda.pending_verifications && x.tp->failed &&
             x.tp->layer_agrees[1]==compute+1 && x.tp->handoff_bulk_calls==bulks &&
             x.tp->handoff_fences==1 && !x.tp->fail_completion);
+        if (failure==3) REQUIRE(x.tp->packed_calls==3 && !x.tp->fail_enqueue_call);
         REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE","1",1)==0);
         x.tp->prefill_config=config; x.tp->failed=false;
     }
-    std::puts("FFN_QUEUE selector/hello/completed-fence failures refuse before payload on MLA/KDA PASS");
+    std::puts("FFN_QUEUE selector/hello/completed-fence/partial-enqueue failures refuse before payload on MLA/KDA PASS");
 }
 
 static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=false,

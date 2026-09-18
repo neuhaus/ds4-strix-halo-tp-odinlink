@@ -24,6 +24,7 @@ static bool queue_probe_active() {
 }
 static void queue_probe_begin(ds4_tp *p) {
     p->handoff_fences=0;
+    p->packed_calls=0;
     queue_event_count=0;
     if (queue_probe_active()) queue_loop_start=std::chrono::steady_clock::now();
 }
@@ -86,6 +87,13 @@ int __wrap_ds4_gpu_routed_moe_one_packed_q4k_tensor(
         out,gate,up,mid,down,map,size,gate_off,up_off,down_off,total,gate_row,
         down_row,row_base,row_count,column_base,column_count,selected,weights,
         used,clamp,x,add,layer);
+    if (queue_test_peer && queue_test_peer->handoff_pending==1 &&
+        ++queue_test_peer->packed_calls==queue_test_peer->fail_enqueue_call) {
+        REQUIRE(ok && !observe);
+        queue_test_peer->fail_enqueue_call=0;
+        // Real work was queued: exercise draining after partial submission.
+        return 0;
+    }
     if (observe) {
         REQUIRE(ok && hipEventRecord(queue_events[slot][1],0)==hipSuccess);
         queue_event_count++;
