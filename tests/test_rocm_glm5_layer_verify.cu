@@ -78,16 +78,19 @@ struct Tensor {
 };
 struct State {
     ds4_glm5_next_state s = {};
-    explicit State(const ds4_glm5_next_model_offsets &m) {
+    explicit State(const ds4_glm5_next_model_offsets &m, bool draft=false) {
         FILE *quiet=std::fopen("/dev/null","w"); REQUIRE(quiet);
-        REQUIRE(ds4_glm5_next_state_init(&s,&m,context,quiet));
+        REQUIRE(draft ? ds4_glm5_next_draft_state_init(&s,&m,context,quiet) :
+            ds4_glm5_next_state_init(&s,&m,context,quiet));
         std::fclose(quiet);
     }
     ~State() { ds4_glm5_next_state_free(&s); }
 };
 struct Workspace {
     ds4_glm5_next_workspace *p;
-    explicit Workspace(unsigned m) : p(ds4_glm5_next_workspace_create_capacity_context(m,context)) {
+    explicit Workspace(unsigned m, bool draft=false) : p(draft ?
+        ds4_glm5_next_draft_workspace_create(context) :
+        ds4_glm5_next_workspace_create_capacity_context(m,context)) {
         REQUIRE(p); ds4_glm5_next_workspace_begin_decode(p);
     }
     ~Workspace() { ds4_glm5_next_workspace_destroy(p); }
@@ -110,7 +113,7 @@ static void equal(const char *name,ds4_gpu_tensor *a,ds4_gpu_tensor *b,uint64_t 
 }
 static void equal_layer(State &a,State &b,unsigned il) {
     REQUIRE(a.s.valid && b.s.valid);
-    if (il%4!=3) {
+    if (il<45 && il%4!=3) {
         auto &x=a.s.kda.layer[il], &y=b.s.kda.layer[il];
         REQUIRE(x.token_count==y.token_count);
         equal("recurrent",x.recurrent,y.recurrent,64u*128*128);
@@ -459,12 +462,15 @@ static void target_profile(ds4_glm5_next_exec_ctx &x) {
     std::printf("VERIFY_PROFILE_DONE rank=%u simulated_peer=echo network_test=0 quality_test=0\n",x.tp_rank);
 }
 
+#include "glm5_native_draft_checks.hpp"
+
 int main(int argc,char **argv) {
+    const bool native=argc==3 && !std::strcmp(argv[1],"--native-draft");
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
     const bool resident_both=dense_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
     const bool resident=argc==3 && (!std::strcmp(argv[1],"--target-resident") ||
-        !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile);
+        !std::strcmp(argv[1],"--target-resident-timing") || resident_both || profile || native);
     REQUIRE(!resident || !std::strcmp(argv[2],"0") || !std::strcmp(argv[2],"1"));
     const unsigned resident_rank=resident && !std::strcmp(argv[2],"1")?1u:0u;
     const bool timing=(argc==2 && !std::strcmp(argv[1],"--target-timing")) ||
@@ -494,7 +500,7 @@ int main(int argc,char **argv) {
         ds4_tp peer; peer.slab=(unsigned char *)ds4_gpu_tensor_contents(slab);
         if (resident) {
             Glm5NextKShardPlan plan;
-            REQUIRE(glm5_next_build_kshard_plan(g,model,plan));
+            REQUIRE(glm5_next_build_kshard_plan(g,model,plan,native));
             uint64_t free_bytes=0,total_bytes=0;
             REQUIRE(ds4_gpu_memory_info(&free_bytes,&total_bytes) &&
                 plan.dense_total_bytes+plan.packed_total_bytes+(UINT64_C(3)<<30)<free_bytes);
@@ -524,7 +530,10 @@ int main(int argc,char **argv) {
         x.tp_sequence=&sequence;
         const unsigned first_rank=resident?resident_rank:0u;
         const unsigned end_rank=resident?resident_rank+1u:2u;
-        if (profile) {
+        if (native) {
+            peer.rank=x.tp_rank=resident_rank;
+            native_draft_checks(x);
+        } else if (profile) {
             peer.rank=x.tp_rank=resident_rank;
             target_profile(x);
         } else if (timing) {
@@ -560,7 +569,8 @@ int main(int argc,char **argv) {
     }
     std::printf("PASS verification cases=%u compared_float_values=%llu simulated_peer=echo "
         "network_test=0 full_target_test=%u quality_test=0 timing_test=%u\n",
-        cases,(unsigned long long)compared_values,target||timing?1:0,timing||resident_both?1:0);
+        cases,(unsigned long long)compared_values,!native && (target||timing)?1:0,
+        timing||resident_both?1:0);
     if (resident) ds4_gpu_q4k_kshard_release();
     ds4_gpu_cleanup();
     return 0;
