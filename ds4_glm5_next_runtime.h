@@ -214,7 +214,9 @@ int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
  * borrowed view shares append-only KV/pools but owns private tails/counters.
  * Use it only until finish/reset/abort, and obey its causal lengths. The
  * caller must finish a successful full layer pass before accepting any rows;
- * on a failed pass invalidate the owning next_state instead. */
+ * on a failed pass invalidate the owning next_state instead. Target MLA
+ * supports 2/4/8 rows; a private native owner supports 1..8, permitting M-1
+ * proposals for an M-row target pass without an unused extra output head. */
 int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
                                      uint32_t capacity);
 uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *mla);

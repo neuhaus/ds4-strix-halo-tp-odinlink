@@ -121,6 +121,26 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
         const ds4_gpu_tensor *previous_normalized_hidden, uint32_t shifted_token,
         ds4_gpu_tensor *normalized_hidden, ds4_gpu_tensor *logits);
 
+/* Retire a completed M-1 native proposal journal and rebuild K accepted
+ * input rows from actual normalized target hidden, using scalar teacher
+ * arithmetic. Before the cycle target consumed N inputs, private draft N-1.
+ * target_hidden contains exactly M rows (M=2/4/8), input_tokens the verified
+ * [root, proposals...], and K includes root (1..M). previous_hidden initially
+ * holds target h[N-1]. Warm [previous, target_hidden[0..K-2]] with inputs[0..K-1],
+ * then replace previous_hidden with target_hidden[K-1]. The correction/bonus
+ * token remains unconsumed. A scalar draft-only workspace and independent
+ * target/previous buffers are required; no GPU storage or payload exchange.
+ * Preflight refusal preserves the journal. Any execution failure invalidates
+ * the private owner; caller must also invalidate its target/session. This
+ * rank-local helper does not select K, verify tokens, commit target state or
+ * publish history. Both ranks must agree on those outcomes before continuing.
+ * Keep target hidden and input tokens immutable throughout the call. */
+int ds4_glm5_next_draft_refresh(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *draft_state, ds4_glm5_next_workspace *workspace,
+        const ds4_gpu_tensor *target_hidden, const uint32_t *input_tokens,
+        uint32_t target_prefix, uint32_t verified_rows, uint32_t accepted_inputs,
+        ds4_gpu_tensor *previous_hidden);
+
 #ifdef DS4_TP_TEST_HOOKS
 uint64_t ds4_glm5_next_mla_stage_capture_bytes(uint32_t n_tokens);
 int ds4_glm5_next_mla_stage_capture_dump(

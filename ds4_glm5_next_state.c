@@ -102,10 +102,19 @@ static int mla_view_valid(const ds4_glm5_next_mla_state *s) {
         s->tail_count == s->token_count % 4u;
 }
 
+static int mla_replay_length_valid(const ds4_glm5_next_mla_state *s,
+                                    uint32_t tokens) {
+    /* A target M-row pass needs only M-1 native proposals. Private native
+     * journals also serve short generation tails; target shapes stay fixed. */
+    return s && s->owner && s->owner->draft_only ?
+        tokens >= 1u && tokens <= 8u :
+        tokens == 2u || tokens == 4u || tokens == 8u;
+}
+
 int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *s,
                                      uint32_t capacity) {
     if (!mla_sources_valid(s) || s->owner->pending_mla_verifications ||
-        (capacity != 2u && capacity != 4u && capacity != 8u)) return 0;
+        !mla_replay_length_valid(s, capacity)) return 0;
     if (s->replay) return mla_replay_matches(s) && !s->replay->active &&
         s->replay->capacity == capacity;
     struct ds4_glm5_next_mla_replay *r = calloc(1, sizeof(*r));
@@ -139,7 +148,7 @@ uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *s) {
 int ds4_glm5_next_mla_verify_ready(const ds4_glm5_next_mla_state *s,
                                     uint32_t tokens) {
     if (!mla_replay_matches(s) || s->replay->active ||
-        (tokens != 2u && tokens != 4u && tokens != 8u) ||
+        !mla_replay_length_valid(s, tokens) ||
         tokens > s->replay->capacity || tokens > s->capacity_tokens - s->token_count ||
         s->owner->pending_mla_verifications >= s->owner->mla_count) return 0;
     return 1;

@@ -397,7 +397,10 @@ static int test_mla_replay(bool draft) {
           "initialize replay owner");
     ds4_glm5_next_mla_state *s = &state.mla[draft ? 45 : 3], *view = NULL;
     CHECK(!ds4_glm5_next_mla_replay_bytes(s) &&
-          !ds4_glm5_next_mla_replay_reserve(s, 3u), "explicit legal capacity");
+          !ds4_glm5_next_mla_replay_reserve(s, 9u) &&
+          !ds4_glm5_next_mla_replay_reserve(s, 0u), "explicit legal capacity");
+    if (!draft) CHECK(!ds4_glm5_next_mla_replay_reserve(s, 3u),
+                     "target reservation still excludes draft-only lengths");
     ds4_glm5_next_mla_state alias = *s;
     CHECK(!ds4_glm5_next_mla_replay_reserve(&alias, 4u), "reject borrowed owner");
     for (int fail = 1; fail <= 4; ++fail) {
@@ -416,7 +419,8 @@ static int test_mla_replay(bool draft) {
     CHECK(ds4_glm5_next_mla_verify_ready(s, 2u) &&
           ds4_glm5_next_mla_verify_ready(s, 4u) &&
           !ds4_glm5_next_mla_verify_ready(s, 8u) &&
-          !ds4_glm5_next_mla_verify_ready(s, 3u) &&
+          ds4_glm5_next_mla_verify_ready(s, 3u) == (int)draft &&
+          ds4_glm5_next_mla_verify_ready(s, 1u) == (int)draft &&
           !ds4_glm5_next_mla_verify_ready(NULL, 4u), "MLA readiness bounds");
     CHECK(!ds4_glm5_next_mla_verify_begin(s, 8u, &view) && !view &&
           ds4_glm5_next_mla_verify_begin(s, 4u, &view) &&
@@ -513,6 +517,45 @@ static int test_mla_replay(bool draft) {
     ds4_glm5_next_state_free(&state);
     CHECK(free_calls == alloc_calls - 4, "all successful allocations freed");
     fclose(stream);
+    return 1;
+}
+
+static int test_native_journal_lengths(void) {
+    for (uint32_t n = 1u; n <= 8u; ++n) {
+        reset_fakes();
+        ds4_glm5_next_model_offsets model;
+        make_valid(&model);
+        ds4_glm5_next_state state = {0};
+        FILE *stream = tmpfile();
+        CHECK(stream && ds4_glm5_next_draft_state_init(&state, &model, 16u, stream),
+              "native journal state");
+        ds4_glm5_next_mla_state *s = &state.mla[45], *view = NULL;
+        CHECK(ds4_glm5_next_mla_replay_reserve(s, n) &&
+              ds4_glm5_next_mla_replay_bytes(s) == (8u + 2u * n) * 512u,
+              "native journal bounded at every short length");
+        const int allocations = alloc_calls;
+        for (uint32_t accepted = 0; accepted <= n; ++accepted) {
+            CHECK(ds4_glm5_next_state_reset(&state), "reset native prefix");
+            for (uint32_t i = 0; i < 3u; ++i)
+                CHECK(ds4_glm5_next_mla_append_commit(s), "seed native prefix");
+            CHECK(ds4_glm5_next_mla_verify_begin(s, n, &view), "begin short proposal chain");
+            for (uint32_t i = 0; i < n; ++i) {
+                CHECK(!ds4_glm5_next_mla_verify_finish(s, 0u), "incomplete chain cannot retire");
+                CHECK(ds4_glm5_next_mla_verify_record(view, 3u + i,
+                          s->index_tail, 0, s->pool_gate_tail, 0, 1u) &&
+                      ds4_glm5_next_mla_append_commit(view), "stage short proposal");
+            }
+            CHECK(ds4_glm5_next_mla_verify_pending(s, 3u, n) &&
+                  ds4_glm5_next_mla_verify_finish(s, accepted) &&
+                  s->token_count == 3u + accepted && !state.pending_mla_verifications &&
+                  !ds4_glm5_next_mla_append_commit(view) &&
+                  ds4_glm5_next_mla_append_commit(s), "retire and resume short journal");
+        }
+        CHECK(alloc_calls == allocations, "short cycles allocate no GPU storage");
+        ds4_glm5_next_state_free(&state);
+        CHECK(free_calls == alloc_calls, "short journal storage released");
+        fclose(stream);
+    }
     return 1;
 }
 
@@ -654,6 +697,7 @@ int main(void) {
     ok &= test_draft_lifecycle();
     ok &= test_mla_replay(false);
     ok &= test_mla_replay(true);
+    ok &= test_native_journal_lengths();
 #ifdef DS4_GLM5_TARGET_COMMIT_TEST
     ok &= test_target_commit();
 #endif

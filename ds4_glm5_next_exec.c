@@ -4766,6 +4766,59 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
     return ok;
 }
 
+int ds4_glm5_next_draft_refresh(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *target_hidden, const uint32_t *inputs,
+        uint32_t prefix, uint32_t rows, uint32_t accepted,
+        ds4_gpu_tensor *previous) {
+    const uint64_t row = GLM5_WIDTH * sizeof(float);
+    if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
+        !owner || !owner->valid || !owner->draft_only || owner->draft_model != ctx->model ||
+        !w || !w->draft_only || !w->decode_phase || w->capacity_tokens != 1u ||
+        !draft_binding_matches(ctx, owner, w) || !native_draft_settings() ||
+        !inputs || !prefix || (rows != 2u && rows != 4u && rows != 8u) ||
+        !accepted || accepted > rows || prefix > owner->context_capacity ||
+        rows > owner->context_capacity - prefix ||
+        ds4_gpu_tensor_bytes(target_hidden) != rows * row ||
+        ds4_gpu_tensor_bytes(previous) != row ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)target_hidden, previous)) return 0;
+    ds4_glm5_next_mla_state *s = &owner->mla[DS4_GLM5_NEXT_TRUNK_COUNT];
+    if (owner->pending_mla_verifications != 1u ||
+        w->sparse_pool_capacity < s->capacity_pools ||
+        !ds4_glm5_next_mla_verify_pending(s, prefix - 1u, rows - 1u)) return 0;
+    ds4_gpu_tensor *buffers[] = {(ds4_gpu_tensor *)target_hidden, previous};
+    for (unsigned i = 0; i < 2u; ++i)
+        if (!target_buffers_disjoint(buffers[i], ctx->tp_big_out) ||
+            !target_buffers_disjoint(buffers[i], ctx->tp_big_in) ||
+            (ctx->tp_slab && !target_buffers_disjoint(buffers[i], ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < rows; ++t) if (inputs[t] >= GLM5_VOCAB) return 0;
+
+    /* Create metadata views before retiring the journal so allocation refusal
+     * leaves it usable. No GPU storage is allocated or copied here. */
+    ds4_gpu_tensor *hidden[8] = {0};
+    uint32_t prepared = 0;
+    while (prepared < accepted) {
+        hidden[prepared] = ds4_gpu_tensor_view((ds4_gpu_tensor *)target_hidden,
+            prepared * row, row);
+        if (!hidden[prepared]) break;
+        ++prepared;
+    }
+    if (prepared != accepted) {
+        for (uint32_t t = 0; t < prepared; ++t) ds4_gpu_tensor_free(hidden[t]);
+        return 0;
+    }
+    draft_bind(ctx, owner, w);
+    int ok = ds4_glm5_next_mla_verify_finish(s, 0u);
+    for (uint32_t t = 0; ok && t < accepted; ++t)
+        ok = ds4_glm5_next_draft_warm_rows(ctx, owner, w,
+            t ? hidden[t - 1u] : previous, &inputs[t], 1u);
+    if (ok) ok = ds4_gpu_tensor_copy(previous, 0, hidden[accepted - 1u], 0, row) &&
+        ds4_gpu_synchronize();
+    for (uint32_t t = 0; t < prepared; ++t) ds4_gpu_tensor_free(hidden[t]);
+    if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(owner); }
+    return ok;
+}
+
 static int target_output_logits_rows(const ds4_glm5_next_exec_ctx *ctx,
                                     ds4_glm5_next_workspace *batch_w,
                                     ds4_glm5_next_workspace *scalar_w,

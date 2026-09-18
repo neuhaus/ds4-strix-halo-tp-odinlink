@@ -465,8 +465,9 @@ static void target_profile(ds4_glm5_next_exec_ctx &x) {
 #include "glm5_native_draft_checks.hpp"
 
 int main(int argc,char **argv) {
+    const bool refresh=argc==3 && !std::strcmp(argv[1],"--native-refresh");
     const bool warm=argc==3 && !std::strcmp(argv[1],"--native-warm");
-    const bool native=warm || (argc==3 && !std::strcmp(argv[1],"--native-draft"));
+    const bool native=refresh || warm || (argc==3 && !std::strcmp(argv[1],"--native-draft"));
     const bool dense_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-dense-both");
     const bool resident_both=dense_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-both"));
     const bool profile=argc==3 && !std::strcmp(argv[1],"--target-resident-profile");
@@ -533,8 +534,9 @@ int main(int argc,char **argv) {
         const unsigned end_rank=resident?resident_rank+1u:2u;
         if (native) {
             peer.rank=x.tp_rank=resident_rank;
+            if (refresh) native_refresh_checks(x);
             if (warm) native_warm_checks(x);
-            native_draft_checks(x);
+            if (!refresh) native_draft_checks(x);
         } else if (profile) {
             peer.rank=x.tp_rank=resident_rank;
             target_profile(x);

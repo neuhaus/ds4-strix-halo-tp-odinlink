@@ -344,3 +344,163 @@ static void native_draft_checks(ds4_glm5_next_exec_ctx &x) {
     }
     std::puts("PASS native draft equations, chained logits, accepted-prefix state and continuation; simulated_peer=echo network_test=0 quality_test=0");
 }
+
+static unsigned native_argmax(ds4_gpu_tensor *logits) {
+    const auto values=read(logits,154880);
+    return (unsigned)(std::max_element(values.begin(),values.end())-values.begin());
+}
+
+static void native_refresh_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,unsigned k) {
+    State candidate(*x.model,true), teacher(*x.model,true);
+    Workspace cw(1,true), tw(1,true), hw(m,true);
+    seed_mla(candidate,45,prefix); seed_mla(teacher,45,prefix);
+    REQUIRE(ds4_glm5_next_mla_replay_reserve(&candidate.s.mla[45],m-1));
+    Tensor previous(native_row), teacher_previous(native_row), chain(native_row);
+    Tensor h(native_row), rh(native_row), logits(native_vocab), rl(native_vocab);
+    Tensor hc(m*hc_row), target(m*native_row);
+    REQUIRE(ds4_gpu_tensor_fill_f32(previous,0.0625f,4096) &&
+        ds4_gpu_tensor_copy(teacher_previous,0,previous,0,native_row));
+    unsigned root=73;
+    for(unsigned cycle=0;cycle<2;++cycle) {
+        const unsigned start=candidate.s.mla[45].token_count;
+        const unsigned accepted=cycle ? (k==m ? 1u : m) : k;
+        ds4_glm5_next_mla_state *view=nullptr;
+        REQUIRE(ds4_glm5_next_mla_verify_begin(&candidate.s.mla[45],m-1,&view));
+        std::vector<unsigned> tokens(m); tokens[0]=root;
+        REQUIRE(ds4_gpu_tensor_copy(chain,0,previous,0,native_row));
+        for(unsigned t=0;t<m-1;++t) {
+            REQUIRE(ds4_glm5_next_draft_step(&x,view,cw,chain,tokens[t],h,logits));
+            tokens[t+1]=native_argmax(logits);
+            REQUIRE(ds4_gpu_tensor_copy(chain,0,h,0,native_row));
+        }
+        std::vector<float> target_hc(m*16384u);
+        for(size_t i=0;i<target_hc.size();++i)
+            target_hc[i]=float(int((i*193+cycle*731+prefix*17+k*29)%997)-498)/501.3f;
+        REQUIRE(ds4_gpu_tensor_write(hc,0,target_hc.data(),m*hc_row) &&
+            ds4_glm5_next_draft_target_hidden(&x,hw,hc,target));
+        const unsigned calls=x.tp->calls; const uint64_t seq=*x.tp_sequence;
+        auto intact=[&]() {
+            REQUIRE(candidate.s.valid && x.tp->calls==calls && *x.tp_sequence==seq &&
+                ds4_glm5_next_mla_verify_pending(&candidate.s.mla[45],start,m-1));
+            equal("refresh-refusal-previous",previous,teacher_previous,4096);
+        };
+        REQUIRE(!ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+2,m,accepted,previous));
+        intact();
+        REQUIRE(!ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+1,m,0,previous));
+        intact();
+        REQUIRE(!ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+1,m,m+1,previous));
+        intact();
+        const unsigned last=tokens.back(); tokens.back()=154880;
+        REQUIRE(!ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+1,m,accepted,previous));
+        tokens.back()=last; intact();
+        auto other=x; other.model_size--;
+        REQUIRE(!ds4_glm5_next_draft_refresh(&other,&candidate.s,cw,target,tokens.data(),start+1,m,accepted,previous));
+        intact();
+        auto *alias=ds4_gpu_tensor_view(target,0,native_row); REQUIRE(alias);
+        REQUIRE(!ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+1,m,accepted,alias));
+        ds4_gpu_tensor_free(alias); intact();
+        REQUIRE(ds4_glm5_next_draft_refresh(&x,&candidate.s,cw,target,tokens.data(),start+1,m,accepted,previous));
+        REQUIRE(x.tp->calls==calls && *x.tp_sequence==seq &&
+            candidate.s.mla[45].token_count==start+accepted && !candidate.s.pending_mla_verifications);
+        // Independent teacher executes the full draft, not the refresh/warm helper.
+        for(unsigned t=0;t<accepted;++t) {
+            REQUIRE(ds4_glm5_next_draft_step(&x,&teacher.s.mla[45],tw,teacher_previous,tokens[t],rh,rl));
+            REQUIRE(ds4_gpu_tensor_copy(teacher_previous,0,target,t*native_row,native_row));
+        }
+        equal_layer(candidate,teacher,45);
+        equal("refresh-next-predecessor",previous,teacher_previous,4096);
+        // The correction is unconsumed until the next cycle starts.
+        root=(tokens[accepted-1]+113+cycle)%154880;
+    }
+    REQUIRE(ds4_glm5_next_draft_step(&x,&candidate.s.mla[45],cw,previous,root,h,logits));
+    REQUIRE(ds4_glm5_next_draft_step(&x,&teacher.s.mla[45],tw,teacher_previous,root,rh,rl));
+    equal("refreshed-continuation-hidden",h,rh,4096);
+    equal("refreshed-continuation-logits",logits,rl,154880);
+    equal_layer(candidate,teacher,45); ++cases;
+    std::printf("REFRESH_CASE rank=%u M=%u prefix=%u first_accepted=%u cycles=2 bitwise=pass\n",
+        x.tp_rank,m,prefix,k); std::fflush(stdout);
+}
+
+static void native_refresh_target_cycles(ds4_glm5_next_exec_ctx &x,unsigned m) {
+    State target(*x.model), serial(*x.model), draft(*x.model,true), teacher(*x.model,true);
+    Workspace scalar(1), batch(m), dw(1,true), tw(1,true);
+    Tensor hc(hc_row), ref_hc(hc_row), scalar_logits(native_vocab), ref_logits(native_vocab);
+    Tensor scratch(m*hc_row), verified(m*hc_row), logits(m*native_vocab), hidden(m*native_row);
+    Tensor previous(native_row), ref_previous(native_row), chain(native_row), h(native_row), rh(native_row);
+    Tensor draft_logits(native_vocab), teacher_logits(native_vocab);
+    for(unsigned il=3;il<45;il+=4) { seed_mla(target,il,0); seed_mla(serial,il,0); }
+    seed_mla(draft,45,0); seed_mla(teacher,45,0);
+    serial_target(x,target,scalar,991,hc,scalar_logits);
+    serial_target(x,serial,scalar,991,ref_hc,ref_logits);
+    REQUIRE(ds4_glm5_next_draft_target_hidden(&x,dw,hc,previous) &&
+        ds4_glm5_next_draft_target_hidden(&x,tw,ref_hc,ref_previous) &&
+        ds4_glm5_next_target_verify_reserve(&x,&target.s,m) &&
+        ds4_glm5_next_mla_replay_reserve(&draft.s.mla[45],m-1));
+    unsigned root=native_argmax(scalar_logits);
+    for(unsigned cycle=0;cycle<3;++cycle) {
+        const unsigned prefix=(unsigned)target.s.kda.layer[0].token_count;
+        REQUIRE(draft.s.mla[45].token_count+1==prefix);
+        ds4_glm5_next_mla_state *view=nullptr;
+        REQUIRE(ds4_glm5_next_mla_verify_begin(&draft.s.mla[45],m-1,&view) &&
+            ds4_gpu_tensor_copy(chain,0,previous,0,native_row));
+        std::vector<unsigned> inputs(m); inputs[0]=root;
+        for(unsigned t=0;t<m-1;++t) {
+            REQUIRE(ds4_glm5_next_draft_step(&x,view,dw,chain,inputs[t],h,draft_logits));
+            inputs[t+1]=native_argmax(draft_logits);
+            REQUIRE(ds4_gpu_tensor_copy(chain,0,h,0,native_row));
+        }
+        REQUIRE(ds4_glm5_next_target_verify(&x,&target.s,batch,scalar,inputs.data(),m,scratch,verified,logits));
+        const auto values=read(logits,(uint64_t)m*154880);
+        std::vector<unsigned> predictions(m);
+        for(unsigned t=0;t<m;++t) {
+            auto begin=values.begin()+t*154880u;
+            predictions[t]=(unsigned)(std::max_element(begin,begin+154880)-begin);
+        }
+        unsigned accepted=1;
+        while(accepted<m && inputs[accepted]==predictions[accepted-1]) ++accepted;
+        REQUIRE(ds4_glm5_next_draft_target_hidden(&x,batch,verified,hidden));
+        const auto sequence=*x.tp_sequence;
+        REQUIRE(ds4_glm5_next_draft_refresh(&x,&draft.s,dw,hidden,inputs.data(),prefix,m,accepted,previous) &&
+            *x.tp_sequence==sequence && ds4_glm5_next_target_verify_finish(&x,&target.s,accepted));
+        for(unsigned t=0;t<accepted;++t) {
+            REQUIRE(inputs[t]==native_argmax(ref_logits));
+            // Teacher native step consumes the prior target hidden and current input.
+            REQUIRE(ds4_glm5_next_draft_step(&x,&teacher.s.mla[45],tw,ref_previous,inputs[t],rh,teacher_logits));
+            serial_target(x,serial,scalar,inputs[t],ref_hc,ref_logits);
+            REQUIRE(ds4_glm5_next_draft_target_hidden(&x,tw,ref_hc,ref_previous));
+        }
+        equal_target(target,serial); equal_layer(draft,teacher,45);
+        equal("integrated-refresh-predecessor",previous,ref_previous,4096);
+        auto *last=ds4_gpu_tensor_view(logits,(accepted-1)*native_vocab,native_vocab); REQUIRE(last);
+        equal("integrated-refresh-target-logits",last,ref_logits,154880); ds4_gpu_tensor_free(last);
+        root=predictions[accepted-1]; REQUIRE(root==native_argmax(ref_logits));
+        REQUIRE(draft.s.mla[45].token_count+1==target.s.kda.layer[0].token_count);
+        std::printf("REFRESH_TARGET rank=%u M=%u cycle=%u accepted=%u target_prefix=%u bitwise=pass\n",
+            x.tp_rank,m,cycle,accepted,(unsigned)target.s.kda.layer[0].token_count);
+        std::fflush(stdout); ++cases;
+    }
+}
+
+static void native_refresh_checks(ds4_glm5_next_exec_ctx &x) {
+    for(unsigned m : {2u,4u,8u}) for(unsigned prefix : {0u,3u,8191u,8192u})
+        for(unsigned k=1;k<=m;++k) native_refresh_case(x,m,prefix,k);
+    // An incomplete journal is refused before rollback. A late GPU range
+    // refusal after rollback/KV writes poisons the private owner.
+    auto model=*x.model; auto broken=x; broken.model=&model;
+    State state(model,true); Workspace w(1,true);
+    Tensor previous(native_row), target(4*native_row), h(native_row), logits(native_vocab);
+    REQUIRE(ds4_gpu_tensor_fill_f32(previous,0.0625f,4096) &&
+        ds4_gpu_tensor_fill_f32(target,0.125f,4*4096) &&
+        ds4_glm5_next_mla_replay_reserve(&state.s.mla[45],3));
+    ds4_glm5_next_mla_state *view=nullptr;
+    const unsigned tokens[4]={73,113,227,331};
+    REQUIRE(ds4_glm5_next_mla_verify_begin(&state.s.mla[45],3,&view));
+    REQUIRE(!ds4_glm5_next_draft_refresh(&broken,&state.s,w,target,tokens,1,4,2,previous) && state.s.valid);
+    for(unsigned t=0;t<3;++t)
+        REQUIRE(ds4_glm5_next_draft_step(&broken,view,w,previous,tokens[t],h,logits));
+    model.layer[45].mla.index_k=x.model_size-1; // backend failure injection, original model bytes unchanged
+    REQUIRE(!ds4_glm5_next_draft_refresh(&broken,&state.s,w,target,tokens,1,4,2,previous) &&
+        !state.s.valid && !state.s.mla[45].valid && !state.s.pending_mla_verifications);
+    for(unsigned m : {2u,4u,8u}) native_refresh_target_cycles(x,m);
+    std::puts("PASS native target-hidden refresh and greedy cycles; simulated_peer=echo network_test=0 quality_test=0");
+}
