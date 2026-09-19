@@ -2842,6 +2842,11 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
         if candidate_dump.get("model") != candidate_model["path"]:
             raise GateError("candidate teacher logits came from a different model path")
     candidate_identity = read_manifest(candidate_manifest)
+    for field, producer in (
+            ("quality_launcher_sha256", repo / "run-tp-quality-score.sh"),
+            ("worker_supervisor_sha256", repo / "scripts/tp-worker-supervisor.sh")):
+        if candidate_identity.get(field) != sha256(producer):
+            raise GateError(f"quality candidate {field} differs from the active verifier")
     if (candidate_identity.get("model") != candidate_model["path"] or
             candidate_identity.get("model_size") != str(candidate_model["size"]) or
             candidate_identity.get("model_sample_sha256") != candidate_model["sample_sha256"] or
@@ -2898,6 +2903,7 @@ def verify_quality_evidence(repo: Path, root: Path, summary_path: Path,
         recomputed = rerun_json_tool([
             sys.executable, str(repo / "scripts" / "compare-quality-scores.py"),
             str(reference), str(candidate), "--thresholds", str(threshold),
+            "--require-candidate-status",
         ], "quality score")
     ignored = {"thresholds_sha256"}
     if {key: value for key, value in recorded.items() if key not in ignored} != {

@@ -93,6 +93,8 @@ endif
 test-quality-gates:
 	python3 tests/test_rocm_toolchain.py
 	bash tests/test_quality_env.sh
+	python3 tests/test_quality_completion.py
+	python3 tests/test_quality_terminal_proof.py
 	python3 tests/test_glm5_tp_layout.py
 	./tests/test_baseline_genesis.sh
 	python3 tests/test_frontier_logits_gate.py
