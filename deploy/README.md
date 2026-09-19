@@ -58,7 +58,8 @@ GLM ordinary mode also uses synchronous gates, but disables the temporal
 compressor and compact top-two sampling (`DS4_ROCM_TEMPORAL_COMPRESSOR=0`,
 `DS4_TP_GREEDY_TOP2=0`). See the [GLM deployment settings](../README.md#glm-53-deployment)
 for its model-specific context and prefill configuration. The SDK migration's
-quality acceptance remains pending as recorded in the [performance table](../README.md).
+[one-time quality exception](../docs/ROCM10-MIGRATION.md) records the accepted
+limitations and preserves the failed quality results.
 Set `PREFILL_FFN_WAVEFRONT=0`, `Q8_M256_K128=0`,
 `HC_STAGE_EXACT_COOP=0`, or `INDEXER_TOPK_RADIX_TREE=0` in the deployment
 config for a symmetric rollback; no extra shell environment is required.

@@ -55,7 +55,8 @@ and quality results are retained in
 `$DS4_RESEARCH_ROOT/candidates/glm53-mtp-20260919/`. The user waived repeated
 timing for this SDK migration; these rates remain individual observations.
 The pinned binaries, live SDK mappings, 4K/8K screens and deployment preflight
-are checked. Numerical/quality acceptance remains pending: paired likelihood
-tests show small, inconclusive shifts across SDKs.
+are checked. The user approved a [one-time quality exception](ROCM10-MIGRATION.md)
+for the failed DeepSeek Q2/Q4 and GLM Q2 checks. Their results remain failures;
+the original quality anchor and thresholds are unchanged.
 Older ROCm 7.14 aggregate evidence remains in
 `$DS4_RESEARCH_ROOT/candidates/glm53-flash-roce-v2-successor-71e6a24/`.
