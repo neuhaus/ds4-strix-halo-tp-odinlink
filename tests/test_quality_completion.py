@@ -94,10 +94,10 @@ os.execv('/usr/bin/grep', ['grep', *sys.argv[1:]])
                         DS4_QUALITY_OUT=str(self.out), DS4_PEER_QUALITY_OUT=str(self.peer),
                         DS4_QUALITY_MANIFEST=str(self.inputs), DS4_QUALITY_MAX_CASES="1")
 
-    def run_launcher(self, *settings, tag="fixture"):
+    def run_launcher(self, *settings, tag="fixture", cwd=None):
         return subprocess.run(["bash", str(self.repo / "run-tp-quality-score.sh"),
                                tag, str(self.model), *settings],
-                              env=self.env, capture_output=True, text=True, timeout=30)
+                              env=self.env, cwd=cwd, capture_output=True, text=True, timeout=30)
 
     def status(self, rank):
         return dict(line.split("=", 1) for line in
@@ -180,6 +180,35 @@ raise SystemExit(int(os.environ.get('DS4_TEST_COORD_RC', '0')))
         self.assertIn("negotiated=0x000780c9", meta["coordinator_features"])
         terminal_proof(self.out / "fixture.tsv", meta, required=True)
         self.assertEqual(len((directory / "files.sha256").read_text().splitlines()), 2)
+
+    def test_teacher_scores_the_hashed_fixture_from_foreign_cwd(self):
+        directory = self.teacher_fixture()
+        foreign = self.root / 'foreign'
+        foreign.mkdir()
+        for parent, contents in ((self.repo, 'trusted repository prompt'),
+                                 (foreign, 'different caller prompt')):
+            (parent / 'prompt.txt').write_text(contents)
+            (parent / 'continuation.txt').write_text('fixture continuation')
+        self.inputs.write_text('fixture\tprompt.txt\tcontinuation.txt\n')
+        self.env['DS4_QUALITY_MANIFEST'] = '../manifest.tsv'
+        self.model = Path('../unchanged.gguf')
+        scorer = self.repo / 'gguf-tools/quality-testing/score_official'
+        program = scorer.read_text().replace(
+            'from pathlib import Path\n',
+            'from pathlib import Path\n'
+            "prompt_path = Path(Path(sys.argv[2]).read_text().split('\\t')[1])\n"
+            "if prompt_path.read_text() != 'trusted repository prompt':\n"
+            '    raise SystemExit(23)\n', 1)
+        scorer.write_text(program)
+        result = self.run_launcher(cwd=foreign)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta = dict(line.split('=', 1) for line in (directory / 'manifest').read_text().splitlines())
+        expected = subprocess.check_output([
+            sys.executable, str(self.repo / 'scripts/compare-teacher-logits.py'),
+            '--validate-capture', '--root', str(self.repo), '--fixture', str(self.inputs),
+            '--start-case', '0', '--cases', '1'], text=True).strip()
+        self.assertEqual(meta['fixture_content_sha256'], expected)
+        terminal_proof(self.out / 'fixture.tsv', meta, required=True)
 
     def test_deepseek_teacher_rejects_wrong_architecture(self):
         self.teacher_fixture(architecture="glm5-next")

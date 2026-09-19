@@ -61,6 +61,9 @@ PEER_OUT=${DS4_PEER_QUALITY_OUT:-$DS4_PEER_RESEARCH_ROOT/accuracy-acceleration-2
   echo "error: quality output directories must be absolute" >&2; exit 2;
 }
 SCORER=$REPO/gguf-tools/quality-testing/score_official
+# Keep explicit input paths relative to the caller while the scorer below
+# resolves the fixture's repository-relative entries from the attested root.
+MODEL=$(realpath -e -- "$MODEL")
 MODEL_ARCH=$(python3 "$REPO/scripts/gguf_tensor_types.py" --architecture "$MODEL") || {
   echo "error: unable to inspect model architecture" >&2; exit 1;
 }
@@ -71,6 +74,7 @@ elif [[ $MODEL_ARCH == glm5-next ]]; then
 else
   MANIFEST=$REPO/gguf-tools/quality-testing/data/flash/manifest.tsv
 fi
+MANIFEST=$(realpath -e -- "$MANIFEST")
 TEACHER_LOGITS_DIR=${DS4_QUALITY_TEACHER_LOGITS_DIR:-}
 TEACHER_ARM=${DS4_QUALITY_TEACHER_ARM:-}
 COORD_LOG=$OUT/coordinator-$TAG.log
@@ -512,12 +516,15 @@ printf -v WORKER_STATUS_Q '%q' "$REMOTE_WORKER_STATUS"
 
 SCORER_EXTRA_ARGS=()
 [[ -z $TEACHER_LOGITS_DIR ]] || SCORER_EXTRA_ARGS+=(--teacher-logits-dir "$TEACHER_LOGITS_DIR")
-"$SUPERVISOR" "$COORD_STATUS" "${COMMON_ENV[@]}" "$SCORER" "$MODEL" "$MANIFEST" "$SCORES" "$CONTEXT" \
-  --start-case "$START_CASE" --max-cases "$MAX_CASES" \
-  "${SCORER_EXTRA_ARGS[@]}" \
-  --role coordinator --tensor-parallel \
-  --listen 0.0.0.0 "$PORT" --transport rdma --rocm \
-  "${LOCAL_RDMA_ARGS[@]}" >"$COORD_LOG" 2>&1 &
+(
+  cd -- "$REPO"
+  exec "$SUPERVISOR" "$COORD_STATUS" "${COMMON_ENV[@]}" "$SCORER" "$MODEL" "$MANIFEST" "$SCORES" "$CONTEXT" \
+    --start-case "$START_CASE" --max-cases "$MAX_CASES" \
+    "${SCORER_EXTRA_ARGS[@]}" \
+    --role coordinator --tensor-parallel \
+    --listen 0.0.0.0 "$PORT" --transport rdma --rocm \
+    "${LOCAL_RDMA_ARGS[@]}"
+) >"$COORD_LOG" 2>&1 &
 COORD_PID=$!
 COORD_RC=0
 wait "$COORD_PID" || COORD_RC=$?
