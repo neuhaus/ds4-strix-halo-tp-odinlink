@@ -2565,6 +2565,10 @@ def reject_open_scope_candidates(root: Path, scope_sha256: str) -> None:
     for dossier, candidate in candidate_values(root):
         identities = {dossier.name, str(candidate.get("candidate_id", ""))}
         registered = identities & initialized.keys()
+        if registered and candidate.get("candidate_id") != dossier.name:
+            raise GateError(
+                "performance policy amendment cannot audit conflicting "
+                f"candidate identities in dossier {dossier.name!r}")
         if ((registered and registered <= finished) or
                 (not registered and not candidate_is_open(dossier))):
             continue
@@ -2575,7 +2579,8 @@ def reject_open_scope_candidates(root: Path, scope_sha256: str) -> None:
         # and must not force unrelated, durable tracks to be closed.
         if unassigned and "promotion_intent" not in candidate and not registered:
             continue
-        if scope == scope_sha256 or unassigned or (registered and scope is None):
+        if (scope == scope_sha256 or unassigned or
+                (scope is None and (registered or "promotion_intent" in candidate))):
             raise GateError(
                 f"performance policy amendment cannot observe open candidate "
                 f"{candidate.get('candidate_id')!r}; close it and initialize a "

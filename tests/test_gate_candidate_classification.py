@@ -100,6 +100,34 @@ class CandidateClassification(unittest.TestCase):
             self.event(kind, name=name)
         self.check()
 
+    def test_new_dossier_cannot_claim_finished_identity(self):
+        for kind in ('candidate-close', 'candidate-promote'):
+            name = kind
+            self.note(name, promotion_intent=None)
+            self.event(name=name)
+            self.event(kind, name=name)
+            path = self.note('rogue-' + name, promotion_intent={})
+            path.write_text(json.dumps(dict(candidate_id=name, baseline_id='',
+                                            promotion_intent={})))
+            self.blocked()
+            path.unlink()
+
+    def test_finished_directory_cannot_claim_new_identity(self):
+        path = self.note(promotion_intent={})
+        self.event()
+        self.event('candidate-close')
+        path.write_text(json.dumps(dict(candidate_id='new-intent', baseline_id='',
+                                        promotion_intent={})))
+        self.blocked()
+
+    def test_unregistered_intent_with_unresolvable_scope_blocks(self):
+        path = self.note(promotion_intent={})
+        path.write_text(json.dumps(dict(candidate_id='old-note',
+                                        baseline_id='missing-baseline',
+                                        promotion_intent={})))
+        with patch.object(gate, 'candidate_scope', return_value=None):
+            self.blocked()
+
     def test_assigned_scope_keeps_existing_behavior(self):
         path = self.note()
         path.write_text(json.dumps(dict(candidate_id='old-note', baseline_id='scope-a')))
