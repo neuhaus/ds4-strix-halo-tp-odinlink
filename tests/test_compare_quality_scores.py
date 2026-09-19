@@ -98,12 +98,27 @@ def main() -> int:
         for key in ("model_size", "model_sample_sha256", "quality_input_sha256"):
             write_scores(candidate, [0.49, 0.59, 0.69])
             manifest = candidate.with_suffix(".manifest")
-            manifest.write_text(manifest.read_text() + f"{key}=mismatch\n")
+            manifest.write_text("\n".join(
+                f"{key}=mismatch" if line.startswith(key + "=") else line
+                for line in manifest.read_text().splitlines()) + "\n")
             mismatch = subprocess.run(
                 [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
                 text=True, capture_output=True, check=False)
             assert mismatch.returncode != 0
-            assert key in mismatch.stderr
+            assert f"reference and candidate {key} differ or are missing" in mismatch.stderr
+
+        # Duplicate keys are a separate invalid artifact, including a trailing
+        # empty schema that would otherwise erase a required completion claim.
+        for extra in ("model_size=mismatch\n",
+                      "completion_schema=quality-terminal-v1\ncompletion_schema=\n"):
+            write_scores(candidate, [0.49, 0.59, 0.69])
+            manifest = candidate.with_suffix(".manifest")
+            manifest.write_text(manifest.read_text() + extra)
+            duplicate = subprocess.run(
+                [str(TOOL), str(reference), str(candidate), "--thresholds", str(thresholds)],
+                text=True, capture_output=True, check=False)
+            assert duplicate.returncode != 0
+            assert "duplicate quality manifest keys" in duplicate.stderr
 
         write_scores(reference, [0.5, 0.6, 0.7], api_count=0)
         write_scores(candidate, [0.49, 0.59, 0.69], api_count=0)
