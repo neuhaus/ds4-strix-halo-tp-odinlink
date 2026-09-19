@@ -231,8 +231,17 @@ See `research/mla-attn-handoff-plan-cc04c40.md` in the candidate dossier.
 The dedicated `ds4_rocm_glm5_mla_output_q8_small_m` leaf tests exact output
 weight reuse for M2/M4/M6, source K16384, local K8192 and N4096. It reuses
 the existing shared-Q8 kernel with the original full packed row stride and
-float activation rows, adds no weight allocation, and is not selected by
-the executor yet. Real-weight tests cover all trunk MLA output tensors,
+float activation rows and adds no weight allocation. Real-weight tests cover all trunk MLA output tensors,
 both rank slices, panel/token isolation, canaries and refused shapes/modes.
 See `research/mla-output-leaf-plan-f9146c7.md`; a component result does not
 establish full-model performance or permission to enable this leaf.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH=1` selects this leaf only within native
+MLA attention handoff. It defaults off, requires the existing negotiated
+handoff, preflights resident weights/modes/buffers before private replay and
+keeps mandatory completion agreement on launch failure. There is no scalar
+retry after failed batch launch. Both effective rank settings must match;
+the wire schedule is unchanged. Cleanup reports successful M2/M4/M6 launches.
+Prefill, drafting and ordinary scalar tails keep their existing dispatch.
+See `research/mla-output-integration-plan-3fd2018.md` for real-rank fixtures
+and prospective same-binary4K/8K model comparisons before any promotion.

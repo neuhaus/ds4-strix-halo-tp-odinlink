@@ -567,11 +567,11 @@ extern "C" int ds4_rocm_glm5_shared_q8_small_m(
  * unchanged: this tensor has a full K16384 source row and a packed K8192
  * activation row. The caller establishes Q8_0 type and rank/slice ownership.
  * Reuse the exact same kernel instantiation and scalar accumulation order. */
-extern "C" int ds4_rocm_glm5_mla_output_q8_small_m(
+static int glm5_mla_output_q8_small_m_impl(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
         uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
-        const ds4_gpu_tensor *x, uint32_t tokens) {
+        const ds4_gpu_tensor *x, uint32_t tokens, bool launch) {
     if (!out || !x || !model_map ||
         (tokens != 2u && tokens != 4u && tokens != 6u) ||
         full_in_dim != 16384u || in_dim != 8192u || out_dim != 4096u ||
@@ -593,9 +593,13 @@ extern "C" int ds4_rocm_glm5_mla_output_q8_small_m(
     const uintptr_t op = (uintptr_t)out->ptr, xp = (uintptr_t)x->ptr;
     if (!op || !xp || op % 4u || xp % 4u ||
         (op <= xp ? out_bytes > xp - op : x_bytes > op - xp)) return 0;
+    /* Refuse lazy registration/copies: integration must bind a resident
+     * original tensor before private verification or timed work begins. */
+    if (!cuda_model_range_is_cached(model_map, offset, weight_bytes)) return 0;
     const auto *w = (const unsigned char *)cuda_model_range_ptr(
         model_map, offset, weight_bytes, "mla_output_q8_small_m");
     if (!w) return 0;
+    if (!launch) return 1;
     w += (uint64_t)(k_first / 32u) * 34u;
 #define DS4_MLA_OUTPUT_Q8_LAUNCH(M) \
     glm5_shared_q8_small_m_kernel<M, false><<<out_dim / 8u, 256u>>>( \
@@ -605,5 +609,25 @@ extern "C" int ds4_rocm_glm5_mla_output_q8_small_m(
     else if (tokens == 4u) DS4_MLA_OUTPUT_Q8_LAUNCH(4u);
     else DS4_MLA_OUTPUT_Q8_LAUNCH(6u);
 #undef DS4_MLA_OUTPUT_Q8_LAUNCH
-    return cuda_ok(cudaGetLastError(), "GLM5 MLA output Q8 small-M exact launch");
+    const int ok = cuda_ok(cudaGetLastError(), "GLM5 MLA output Q8 small-M exact launch");
+    if (ok) ++g_glm5_mla_output_calls[tokens / 2u - 1u];
+    return ok;
+}
+
+extern "C" int ds4_rocm_glm5_mla_output_q8_small_m_supported(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    return glm5_mla_output_q8_small_m_impl(out, model_map, model_size, offset,
+        full_in_dim, k_first, in_dim, out_dim, row_bytes, x, tokens, false);
+}
+
+extern "C" int ds4_rocm_glm5_mla_output_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    return glm5_mla_output_q8_small_m_impl(out, model_map, model_size, offset,
+        full_in_dim, k_first, in_dim, out_dim, row_bytes, x, tokens, true);
 }

@@ -797,6 +797,7 @@ __global__ static void cuda_copy_bytes_kernel(
 }
 
 static void cuda_shared_gate_up_async_cleanup(void);
+static uint64_t g_glm5_mla_output_calls[3];
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -8201,6 +8202,13 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_glm5_mla_output_calls[0] || g_glm5_mla_output_calls[1] || g_glm5_mla_output_calls[2]) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MLA output batch launches m2=%llu m4=%llu m6=%llu weight_cache_bytes=0\n",
+            (unsigned long long)g_glm5_mla_output_calls[0],
+            (unsigned long long)g_glm5_mla_output_calls[1],
+            (unsigned long long)g_glm5_mla_output_calls[2]);
+        memset(g_glm5_mla_output_calls, 0, sizeof(g_glm5_mla_output_calls));
+    }
     if (g_token_span_start) {
         (void)cudaEventDestroy(g_token_span_start);
         g_token_span_start = NULL;

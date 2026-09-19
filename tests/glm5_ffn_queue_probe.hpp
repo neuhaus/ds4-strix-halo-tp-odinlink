@@ -77,6 +77,21 @@ int __wrap_ds4_gpu_synchronize() {
     return completed;
 }
 decltype(ds4_gpu_matmul_q8_0_kslice_tensor) __real_ds4_gpu_matmul_q8_0_kslice_tensor;
+decltype(ds4_rocm_glm5_mla_output_q8_small_m) __real_ds4_rocm_glm5_mla_output_q8_small_m;
+int __wrap_ds4_rocm_glm5_mla_output_q8_small_m(ds4_gpu_tensor *out,
+        const void *map, uint64_t size, uint64_t offset, uint32_t full,
+        uint32_t first, uint32_t k, uint32_t n, uint64_t stride,
+        const ds4_gpu_tensor *x, uint32_t rows) {
+    const int ok=__real_ds4_rocm_glm5_mla_output_q8_small_m(
+        out,map,size,offset,full,first,k,n,stride,x,rows);
+    if (queue_test_peer && queue_test_peer->observe_attn &&
+        ++queue_test_peer->attn_outputs==queue_test_peer->fail_attn_output) {
+        REQUIRE(ok);
+        queue_test_peer->fail_attn_output=0;
+        return 0; // Inject after the real batched launch, requiring a drain.
+    }
+    return ok;
+}
 int __wrap_ds4_gpu_matmul_q8_0_kslice_tensor(ds4_gpu_tensor *out,
         const void *map, uint64_t size, uint64_t offset, uint64_t in_dim,
         uint64_t start, uint64_t count, uint64_t out_dim,

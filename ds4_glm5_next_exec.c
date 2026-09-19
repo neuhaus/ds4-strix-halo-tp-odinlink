@@ -97,6 +97,20 @@ int ds4_rocm_glm5_mla_output_q8_small_m(
     return 0;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_mla_output_q8_small_m_supported(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out; (void)model_map; (void)model_size; (void)offset;
+    (void)full_in_dim; (void)k_first; (void)in_dim; (void)out_dim;
+    (void)row_bytes; (void)x; (void)tokens;
+    return 0;
+}
+
 static void glm5_phase_trace(const ds4_glm5_next_exec_ctx *ctx,
                              const char *phase, uint32_t layer,
                              uint32_t n_tokens) {
@@ -2635,7 +2649,7 @@ static int verify_mla_attention_handoff(const ds4_glm5_next_exec_ctx *ctx,
         uint32_t il, ds4_glm5_next_mla_state *mla,
         ds4_glm5_next_workspace *batch, ds4_glm5_next_workspace *scalar,
         const ds4_gpu_tensor *hc_in, uint32_t frontier, uint32_t rows,
-        bool row_sync, int ok, glm5_mla_profile *profile) {
+        bool row_sync, bool batch_output, int ok, glm5_mla_profile *profile) {
     const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
     const uint64_t head_elements = (uint64_t)(GLM5_HEADS / 2u) * GLM5_HEAD_DIM;
@@ -2668,7 +2682,14 @@ static int verify_mla_attention_handoff(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_tensor_free(w.hc_split);
     }
     if (profile) profile->last = glm5_exec_now_sec();
-    for (uint32_t t = 0u; ok && t < rows; ++t) {
+    if (ok && batch_output) {
+        ok = ds4_rocm_glm5_mla_output_q8_small_m(ctx->tp_big_out,
+            ctx->model_map, ctx->model_size, layer->mla.output,
+            GLM5_HEADS * GLM5_HEAD_DIM, ctx->tp_rank * head_elements,
+            head_elements, GLM5_WIDTH, (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM / 32u * 34u,
+            batch->mla_heads, rows);
+    }
+    for (uint32_t t = 0u; ok && !batch_output && t < rows; ++t) {
         ds4_gpu_tensor *heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(ctx->tp_big_out, t * out_row, out_row);
         ok = heads && out && ds4_gpu_matmul_q8_0_kslice_tensor(out,
@@ -4866,6 +4887,24 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         return 0;
     }
     const bool batch_attn = batch_mla && attn_requested;
+    const char *output_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH");
+    const bool output_requested = output_option && !strcmp(output_option, "1");
+    if ((output_option && strcmp(output_option, "0") && strcmp(output_option, "1")) ||
+        (output_requested && !attn_requested)) {
+        fprintf(stderr, "ds4: native MLA output batch requires attention handoff and a valid selector\n");
+        return 0;
+    }
+    const bool batch_output = batch_attn && output_requested;
+    /* Model binding already requires each MLA output to be Q8_0 K16384/N4096.
+     * Check modes, resident range and scratch before starting private replay.
+     * The causal loop writes packed owned32 heads, not full64-head rows. */
+    if (batch_output && !ds4_rocm_glm5_mla_output_q8_small_m_supported(
+            ctx->tp_big_out, ctx->model_map, ctx->model_size, layer->mla.output,
+            16384u, ctx->tp_rank * 8192u, 8192u, GLM5_WIDTH, 17408u,
+            batch_w->mla_heads, n_tokens)) {
+        fprintf(stderr, "ds4: native MLA output batch unsupported resident layout/settings\n");
+        return 0;
+    }
     if (batch_shared) {
         const char *pair = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
         if (!layer->is_trunk || scalar_w->draft_only ||
@@ -4893,16 +4932,16 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
     if (batch_attn) {
         ok = verify_mla_attention_handoff(&bulk, il, mla, batch_w, scalar_w,
-            hc_in, (uint32_t)frontier, n_tokens, row_sync, ok, mla_profile);
+            hc_in, (uint32_t)frontier, n_tokens, row_sync, batch_output, ok, mla_profile);
         if (!ok) {
             ds4_glm5_next_state_invalidate(state);
             return 0;
         }
-        static int reported[2];
-        if (!reported[ctx->tp_rank]) {
-            fprintf(stderr, "ds4: native MLA attention handoff active rank=%u owned_heads=32 output=M1 row_sync=%u cache_bytes=0\n",
-                ctx->tp_rank, row_sync);
-            reported[ctx->tp_rank] = 1;
+        static int reported[2][2];
+        if (!reported[ctx->tp_rank][batch_output]) {
+            fprintf(stderr, "ds4: native MLA attention handoff active rank=%u owned_heads=32 output=%s row_sync=%u cache_bytes=0\n",
+                ctx->tp_rank, batch_output ? "batch" : "M1", row_sync);
+            reported[ctx->tp_rank][batch_output] = 1;
         }
     }
     /* Each layer input is already available for every verification row. Its

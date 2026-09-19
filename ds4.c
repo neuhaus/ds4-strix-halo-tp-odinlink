@@ -51717,6 +51717,12 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const char *ffn_queue = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
+    const char *mla_output = getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH");
+    if ((mla_output && strcmp(mla_output, "0") && strcmp(mla_output, "1")) ||
+        (mla_output && !strcmp(mla_output, "1") && !use_mla_attn)) {
+        fprintf(stderr, "ds4: native MLA output batch requires attention handoff and selector0/1\n");
+        return 0;
+    }
     const bool use_ffn_queue = ffn_queue && strcmp(ffn_queue, "1") == 0;
     if ((ffn_queue && strcmp(ffn_queue, "0") && strcmp(ffn_queue, "1")) ||
         use_ffn_queue != ((ds4_tp_prefill_config(e->tp.ctx) &

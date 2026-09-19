@@ -37,12 +37,19 @@ int ds4_rocm_glm5_shared_q8_small_m(
         uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
         uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens);
 
-/* Unselected research MLA output leaf: original Q8_0, M=2/4/6 only.
+/* Research MLA output leaf: resident original Q8_0, M=2/4/6 only.
  * Full K16384 row_bytes17408, local K8192/N4096, k_first0/8192.
  * x must contain packed contiguous local rows, not full 64-head rows.
  * Caller proves Q8_0 tensor type and k_first == rank*8192. Requires the
  * exact mode1 recipe above; no allocation, retry or M8 dispatch. */
 int ds4_rocm_glm5_mla_output_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens);
+/* Same admission without a kernel launch or lazy weight registration/copy.
+ * Call before private-state mutation; a later launch failure is terminal. */
+int ds4_rocm_glm5_mla_output_q8_small_m_supported(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
         uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
