@@ -235,12 +235,24 @@ static void equal_layer(State &a,State &b,unsigned il) {
     }
 }
 
+static void seed_position_values(ds4_gpu_tensor *tensor,uint64_t count,uint32_t salt) {
+    std::vector<float> values(count);
+    for(uint64_t i=0;i<count;++i) {
+        uint32_t h=(uint32_t)i+salt;
+        h^=h>>16; h*=UINT32_C(0x7feb352d);
+        h^=h>>15; h*=UINT32_C(0x846ca68b); h^=h>>16;
+        values[i]=float(int(h & 65535u)-32768)/262144.0f;
+    }
+    REQUIRE(ds4_gpu_tensor_write(tensor,0,values.data(),count*sizeof(float)));
+}
+
 static void seed_mla(State &state,unsigned il,unsigned prefix) {
     auto &s=state.s.mla[il];
-    REQUIRE(ds4_gpu_tensor_fill_f32(s.compact_kv,0.03125f,(uint64_t)context*512));
-    REQUIRE(ds4_gpu_tensor_fill_f32(s.index_pool,0.0625f,s.capacity_pools*128));
-    REQUIRE(ds4_gpu_tensor_fill_f32(s.index_tail,0.09375f,4*128));
-    REQUIRE(ds4_gpu_tensor_fill_f32(s.pool_gate_tail,0.015625f,4*128));
+    // Distinct rows make a wrong selection or stale speculative pool observable.
+    seed_position_values(s.compact_kv,(uint64_t)context*512,101u+il);
+    seed_position_values(s.index_pool,s.capacity_pools*128,211u+il);
+    seed_position_values(s.index_tail,4*128,307u+il);
+    seed_position_values(s.pool_gate_tail,4*128,401u+il);
     REQUIRE(ds4_gpu_tensor_fill_f32(s.index_pool_valid,1.0f,s.capacity_pools));
     std::vector<int32_t> ids(s.capacity_pools*4);
     for (unsigned i=0;i<ids.size();++i) ids[i]=(int32_t)i;
