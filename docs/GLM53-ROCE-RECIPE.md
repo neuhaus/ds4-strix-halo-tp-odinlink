@@ -54,6 +54,8 @@ Exact invocations, model/prompt hashes, effective settings, runtime captures
 and quality results are retained in
 `$DS4_RESEARCH_ROOT/candidates/glm53-mtp-20260919/`. The user waived repeated
 timing for this SDK migration; these rates remain individual observations.
-Numerical/quality acceptance and final deployment checks are still pending.
+The pinned binaries, live SDK mappings, 4K/8K screens and deployment preflight
+are checked. Numerical/quality acceptance remains pending: paired likelihood
+tests show small, inconclusive shifts across SDKs.
 Older ROCm 7.14 aggregate evidence remains in
 `$DS4_RESEARCH_ROOT/candidates/glm53-flash-roce-v2-successor-71e6a24/`.

@@ -22,17 +22,18 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, ordered prefill | **278.43 t/s** | **19.59 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality validation pending |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, ordered prefill | **278.43 t/s** | **19.59 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality acceptance pending |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048 prompt + 300 decode; one regression run | **270.10 t/s** | **19.89 t/s** | retained ROCm 7.14 result, `71e6a24`, 2026-09-15 |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, synchronous gates | **323.47 t/s** | **20.99 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality validation pending |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, synchronous gates | **323.47 t/s** | **20.99 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality acceptance pending |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 These are individual observations, not repeated-run estimates. All RDMA rows
 used unchanged model bytes, zero payload fallback and no expanded-weight cache.
 The Q2 ordered-prefill result requires `DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1`.
 Huihui and Antirez use different model files, so their rates are not a
-controlled engine comparison. ROCm 10 numerical/quality validation remains
-pending; the OdinLink measurement has not been repeated on the new SDK.
+controlled engine comparison. ROCm 10 quality tests show small, inconclusive
+likelihood shifts; release acceptance is pending. OdinLink has not been
+remeasured on the new SDK.
 
 ### Q4_K throughput through 10K context
 
@@ -62,13 +63,12 @@ DeepSeek's graph executor.
 |---|---|---:|---:|---|
 | **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; one run | **103.42 t/s** | **10.14 t/s** | ROCm 10, `074a7ba`, 2026-09-19; unchanged 300-token output |
 | **GLM-5.3 Flash Q4_K over OdinLink** | 4,096 prompt + 300 decode, batch 256; one diagnostic run | **97.89 t/s** | **9.77 t/s** | retained ROCm 7.14 result, `71e6a24`, 2026-09-15 |
-| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256; one run | **39.75 t/s** | **10.52 t/s** | ROCm 10, `897db2e`, 2026-09-19; mixed IQ2_XXS/Q2_K; quality validation pending |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256; one run | **39.75 t/s** | **10.52 t/s** | ROCm 10, `897db2e`, 2026-09-19; mixed IQ2_XXS/Q2_K; quality acceptance pending |
 
 These ordinary-decode runs use the original Antirez GGUFs, zero payload
 fallback and no expanded-weight cache. Q4 at 8,192+300 measured
 **103.43 prefill / 10.27 decode t/s**, also with unchanged generated tokens.
-The migration uses the retained single-run figures by user direction;
-repeated timing is waived, and quality/deployment checks remain pending.
+These remain single-run measurements. ROCm 10 quality acceptance is pending.
 The 300 prefill / 20 decode t/s GLM target remains unmet. See the
 [measured recipe](docs/GLM53-ROCE-RECIPE.md).
 
