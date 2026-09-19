@@ -103,6 +103,7 @@ test-quality-gates:
 	python3 tests/test_ds4_gate_controls.py
 	python3 tests/test_gate_candidate_classification.py
 	python3 tests/test_promotion_proof.py
+	python3 tests/test_sdk_migration_proof.py
 	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
 	./tests/run-clean-gate-python.sh tests/test_baseline_control_journal.py

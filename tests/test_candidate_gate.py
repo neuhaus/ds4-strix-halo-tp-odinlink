@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_baseline_genesis as genesis_fixture  # noqa: E402
 import test_promotion_proof as proof_fixture  # noqa: E402
+import test_sdk_migration_proof as sdk_fixture  # noqa: E402
 
 
 GATE = REPO / "scripts" / "candidate-gate.py"
@@ -487,6 +488,22 @@ def main() -> int:
         initialized = run(root, "init", selection_id, "A",
                           "--switch", "DS4_SELECTION=0,1")
         assert initialized.returncode == 0, initialized.stderr
+        configure_candidate(root, selection_id, baseline_id, baseline, None)
+        # Even a successfully recomputed SDK diagnostic cannot enter the
+        # ordinary candidate's promotion path or create a successor head.
+        # This hits the initialized-policy check before stage/merge_eligible.
+        sdk_root = root / "sdk-diagnostic"
+        sdk_root.mkdir()
+        sdk_spec, _ = sdk_fixture.migration_spec(sdk_root)
+        sdk_result, sdk_proof = proof_fixture.create(sdk_root, sdk_spec)
+        assert sdk_result.returncode == 0, sdk_result.stderr
+        candidate_path = configure_candidate(
+            root, selection_id, baseline_id, baseline, sdk_proof)
+        for command in ("check", "promote"):
+            rejected_sdk = run(root, command, selection_id)
+            assert rejected_sdk.returncode != 0
+            assert "differs from initialized performance policy" in rejected_sdk.stderr, rejected_sdk.stderr
+        assert not (candidate_path.parent / "PROMOTED.json").exists()
         configure_candidate(root, selection_id, baseline_id, baseline, None)
         first = run(root, "begin-pair", selection_id)
         assert first.returncode == 0, first.stderr
