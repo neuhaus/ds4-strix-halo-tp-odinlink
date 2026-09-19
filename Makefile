@@ -98,6 +98,7 @@ test-quality-gates:
 	python3 tests/test_ds4_gate_stats.py
 	python3 tests/test_promotion_boundary_calibration.py
 	python3 tests/test_ds4_gate_controls.py
+	python3 tests/test_gate_candidate_classification.py
 	python3 tests/test_promotion_proof.py
 	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
