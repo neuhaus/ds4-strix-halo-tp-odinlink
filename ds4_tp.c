@@ -411,6 +411,11 @@ static int tp_hello_validate_prefill_config(uint64_t local, uint64_t peer,
         tp_set_err(err, errlen, "tp hello: MLA attention handoff requires native2/4/6 and MLA/FFN handoff");
         return 0;
     }
+    if (!ds4_tp_glm5_expert_pairs_config_valid(local) ||
+        !ds4_tp_glm5_expert_pairs_config_valid(peer)) {
+        tp_set_err(err, errlen, "tp hello: expert pairs require mode0/1/2, native6 and MLA/FFN handoff");
+        return 0;
+    }
     if (local == peer) return 1;
     tp_set_err(err, errlen,
                "tp hello: prefill config mismatch (local=0x%016llx peer=0x%016llx)",

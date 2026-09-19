@@ -10,6 +10,7 @@
 #include "ds4_gpu.h"
 #include "ds4_tp.h"
 #include "ds4_glm5_route_profile.h"
+#include "ds4_glm5_expert_pairs.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_gpu_mgpu.h"
 #endif
@@ -51,6 +52,25 @@ static double glm5_exec_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_admit(ds4_glm5_expert_six_plan *p,
+        const ds4_glm5_expert_six_args *a) { (void)p; (void)a; return 0; }
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_begin(const ds4_glm5_expert_six_plan *p,
+        const ds4_glm5_expert_groups *g, const int32_t *ids, const float *weights) {
+    (void)p; (void)g; (void)ids; (void)weights; return 0;
+}
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_down_row(const ds4_glm5_expert_six_plan *p, uint32_t row) {
+    (void)p; (void)row; return 0;
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -311,6 +331,8 @@ _Static_assert(GLM5_EXPERTS_USED * GLM5_WIDTH ==
 
 struct ds4_glm5_next_workspace {
     uint32_t capacity_tokens;
+    uint64_t expert_six_calls[2], expert_tail_calls[2], expert_pair_reads[2];
+    uint32_t expert_pair_rank, expert_pair_mode;
     uint32_t sparse_pool_capacity;
     ds4_gpu_tensor *hc_mean_weights;
     ds4_gpu_tensor *output_hidden;
@@ -430,6 +452,12 @@ static int route_failure_stats(const char *name,
 
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     if (!w) return;
+    if (w->expert_pair_mode) fprintf(stderr,
+        "VERIFY_EXPERT_PAIRS rank=%u mode=%u workspace=%u kda_six=%llu mla_six=%llu kda_tail=%llu mla_tail=%llu kda_pairs=%llu mla_pairs=%llu\n",
+        w->expert_pair_rank, w->expert_pair_mode, w->capacity_tokens,
+        (unsigned long long)w->expert_six_calls[0], (unsigned long long)w->expert_six_calls[1],
+        (unsigned long long)w->expert_tail_calls[0], (unsigned long long)w->expert_tail_calls[1],
+        (unsigned long long)w->expert_pair_reads[0], (unsigned long long)w->expert_pair_reads[1]);
     if (w->q4_window_scratch) {
         ds4_gpu_q4k_window_cache_destroy(w->q4_window_scratch);
         w->q4_window_scratch = NULL;
@@ -4677,6 +4705,37 @@ static int verify_shared_ffn_prepare(const ds4_glm5_next_exec_ctx *ctx,
 /* All attention/prefix/shared rows have already been prepared. Retain the M1
  * router and packed expert dispatch: only their route and output handoffs are
  * batched. No prefill GEMM, alternate activation codec or route reordering. */
+static int expert_six_admit(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        const ds4_glm5_next_workspace *batch, ds4_glm5_expert_six_plan *plan) {
+    if (!batch || !batch->decode_phase || batch->draft_only || batch->capacity_tokens != 6u ||
+        !ctx->model->layer[il].is_trunk || local_q4k_half_residency(ctx, &ctx->model->layer[il]) != 1)
+        return 0;
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    const ds4_glm5_expert_six_args a = {
+        .out = batch->routed_out, .mid = batch->routed_mid,
+        .input_q8 = batch->routed_experts, .mid_q8 = batch->routed_gate,
+        .descriptors = batch->routed_up, .input = batch->ffn_hidden,
+        .selected = batch->router_selected, .weights = batch->router_weights,
+        .model_map = ctx->model_map, .model_size = ctx->model_size,
+        .gate_offset = f->gate_exps, .up_offset = f->up_exps, .down_offset = f->down_exps,
+        .rank = ctx->tp_rank, .rows = 6u
+    };
+    return ds4_rocm_glm5_expert_six_admit(plan, &a);
+}
+
+int ds4_glm5_next_expert_pairs_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *batch) {
+    if (!context_valid(ctx) || !batch || ctx->tp_rank > 1u) return 0;
+    unsigned count = 0;
+    for (uint32_t il = 0; il < ctx->model->trunk_count; ++il) {
+        if (ctx->model->layer[il].ffn != DS4_GLM5_NEXT_FFN_ROUTED) continue;
+        ds4_glm5_expert_six_plan plan;
+        if (!expert_six_admit(ctx, il, batch, &plan)) return 0;
+        ++count;
+    }
+    return count == 42u;
+}
+
 static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
                              ds4_glm5_next_workspace *batch,
                              ds4_glm5_next_workspace *scalar,
@@ -4693,6 +4752,10 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
     const uint64_t sequence = *ctx->tp_sequence;
     const bool queue_experts = (ds4_tp_prefill_config(ctx->tp) &
         DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u;
+    const uint32_t pair_mode = ds4_tp_glm5_expert_pairs_mode(ds4_tp_prefill_config(ctx->tp));
+    const bool six = pair_mode && rows == 6u;
+    ds4_glm5_expert_six_plan plan = {0};
+    ds4_glm5_expert_groups groups = {0};
     const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
     const char *routes_env = getenv("DS4_GLM5_VERIFY_ROUTE_PROFILE");
     const bool route_profile = routes_env && strcmp(routes_env, "1") == 0;
@@ -4731,14 +4794,32 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
         hash = fnv64_continue(hash, ids, rows * route_row);
         hash = fnv64_continue(hash, weights, rows * route_row);
     }
+    if (ok && six) ok = expert_six_admit(ctx, il, batch, &plan) &&
+        ds4_glm5_expert_groups_build(&groups, ids, weights, pair_mode);
     const double routes_done = profile ? glm5_exec_now_sec() : 0.0;
     if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 0u,
             hash, ok, error, sizeof(error))) goto failed;
     const double route_agree_done = profile ? glm5_exec_now_sec() : 0.0;
 
+    /* The completed router readbacks above also finish earlier stream0 MLA
+     * consumers of routed_experts. It can now hold input Q8_K safely. */
+    if (six) ok = ds4_rocm_glm5_expert_six_begin(&plan, &groups, ids, weights);
     for (uint32_t t = 0; ok && t < rows; ++t) {
         ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
             t * hidden_row, hidden_row);
+        if (six) {
+            ds4_gpu_tensor *routed = ds4_gpu_tensor_view(batch->routed_out,
+                t * hidden_row, hidden_row);
+            ds4_gpu_tensor *shared = ds4_gpu_tensor_view(batch->shared_out,
+                t * hidden_row, hidden_row);
+            ok = local && routed && shared &&
+                ds4_rocm_glm5_expert_six_down_row(&plan, t) &&
+                ds4_gpu_add_tensor(local, routed, shared, GLM5_WIDTH) &&
+                (queue_experts || ds4_gpu_synchronize());
+            ds4_gpu_tensor_free(routed); ds4_gpu_tensor_free(shared);
+            ds4_gpu_tensor_free(local);
+            continue;
+        }
         ok = local && ds4_gpu_tensor_copy(scalar->ffn_hidden, 0,
                 batch->ffn_hidden, t * hidden_row, hidden_row) &&
             ds4_gpu_tensor_copy(scalar->router_selected, 0,
@@ -4760,7 +4841,7 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
             (queue_experts || ds4_gpu_synchronize());
         ds4_gpu_tensor_free(local);
     }
-    if (queue_experts) {
+    if (queue_experts || (six && !ok)) {
         /* All copies, packed kernels and adds use stream0. The row view owns
          * no storage. Drain even on an enqueue failure, and report completion
          * status before phase1 agreement; the later payload fence is too late. */
@@ -4792,6 +4873,14 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
     }
     if (ok) ok = ds4_gpu_synchronize();
     if (!ok) goto failed;
+    if (pair_mode) {
+        const unsigned kind = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_MLA;
+        batch->expert_pair_mode = pair_mode; batch->expert_pair_rank = ctx->tp_rank;
+        if (six) {
+            ++batch->expert_six_calls[kind];
+            batch->expert_pair_reads[kind] += groups.doubles;
+        } else ++batch->expert_tail_calls[kind];
+    }
     const double done = profile ? glm5_exec_now_sec() : 0.0;
     if (profile) fprintf(stderr,
         "VERIFY_FFN rank=%u layer=%u frontier=%u m=%u sequence=%llu queue=%u route_ms=%.6f route_agree_ms=%.6f expert_ms=%.6f compute_agree_ms=%.6f bulk_ms=%.6f tail_ms=%.6f total_ms=%.6f\n",
@@ -4865,6 +4954,15 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     const char *mla_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
     const bool mla_requested = mla_option && strcmp(mla_option, "1") == 0;
     const uint64_t config = ds4_tp_prefill_config(ctx->tp);
+    const uint32_t pair_mode = ds4_tp_glm5_expert_pairs_parse(
+        getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS"));
+    if (pair_mode != ds4_tp_glm5_expert_pairs_mode(config) ||
+        !ds4_tp_glm5_expert_pairs_config_valid(config) ||
+        (pair_mode && (n_tokens > 6u || (n_tokens != 2u && n_tokens != 4u && n_tokens != 6u)))) {
+        ds4_tp_mark_failed(ctx->tp);
+        fprintf(stderr, "ds4: native expert pair selector/hello/width mismatch\n");
+        return 0;
+    }
     const char *queue_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
     const bool queue_requested = queue_option && strcmp(queue_option, "1") == 0;
     if ((queue_option && strcmp(queue_option, "0") && strcmp(queue_option, "1")) ||
@@ -4891,6 +4989,14 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         (handoff_requested && (!shared_option || strcmp(shared_option, "1")))) return 0;
     const bool batch_handoff = handoff_requested && batch_shared;
     if (batch_mla && !batch_handoff) return 0;
+    if (pair_mode && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+        ds4_glm5_expert_six_plan plan;
+        if (!batch_handoff || (n_tokens == 6u && !expert_six_admit(ctx, il, batch_w, &plan))) {
+            ds4_tp_mark_failed(ctx->tp);
+            fprintf(stderr, "ds4: native expert pair admission failed\n");
+            return 0;
+        }
+    }
     const char *attn_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
     const bool attn_requested = attn_option && !strcmp(attn_option, "1");
     const char *row_sync_option = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");

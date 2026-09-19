@@ -362,6 +362,12 @@ tests/test_rocm_glm5_mla_output_small_m.o: tests/test_rocm_glm5_mla_output_small
 tests/test_rocm_glm5_mla_output_small_m: tests/test_rocm_glm5_mla_output_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_rocm_glm5_expert_pairs.o: tests/test_rocm_glm5_expert_pairs.cpp tests/glm5_gguf_test.hpp ds4_glm5_expert_pairs.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(CXX) -O2 -g -std=c++17 -Wall -Wextra -Werror -D__HIP_PLATFORM_AMD__ -DDS4_ROCM_BUILD -I. -I$(ROCM_HOME)/include -c -o $@ $<
+
+tests/test_rocm_glm5_expert_pairs: tests/test_rocm_glm5_expert_pairs.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_small_m_kda.o: tests/test_rocm_glm5_small_m_kda.cu tests/glm5_gguf_test.hpp ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
@@ -760,6 +766,9 @@ tests/test_glm5_next_runtime_offsets: tests/test_glm5_next_runtime_offsets.c ds4
 tests/test_glm5_route_profile: tests/test_glm5_route_profile.c ds4_glm5_route_profile.h
 	$(CC) $(CFLAGS) -I. -o $@ $<
 
+tests/test_glm5_expert_pairs: tests/test_glm5_expert_pairs.c ds4_glm5_expert_pairs.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ $< -lm
+
 tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
 
@@ -1098,7 +1107,7 @@ ds4_glm5_next_runtime.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm
 ds4_glm5_next_state.o: ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_state.c
 
-ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
+ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_exec.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
@@ -1179,7 +1188,7 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_glm5_expert_pairs.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h rocm/ds4_rocm_glm5_kda.cuh

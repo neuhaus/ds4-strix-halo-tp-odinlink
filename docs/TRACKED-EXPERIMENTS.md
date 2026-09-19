@@ -249,3 +249,17 @@ batch-versus-scalar engagement per arm and exercise startup refusal.
 Prefill, drafting and ordinary scalar tails keep their existing dispatch.
 See `research/mla-output-integration-plan-3fd2018.md` for real-rank fixtures
 and prospective same-binary4K/8K model comparisons before any promotion.
+
+`DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS=0/1/2` is a default-off native6 routed
+expert experiment: incumbent, scalar six-row schedule, or paired six-row
+schedule. Hello bits45/46 distinguish the modes and require native6 and both
+KDA/MLA FFN handoffs. Smaller2/4/1tails keep the incumbent path. It groups at
+most two routes per original packed expert; no weights or window capacity
+change. Admission rejects incompatible selectors, missing residency, invalid
+routes, insufficient or aliased scratch. Completed route readbacks end the
+earlier MLA scratch lifetime before reuse. Down/add still run row by row with
+completion fences when queue0; failure drains before agreement, without retry.
+The same-schedule scalar control isolates weight reuse from batching. Reports
+and the four-arm plan are in `research/expert-gateup-integration-plan-e01a353.md`
+and its implementation addendum in the uncensored dossier. This is Lane A
+research, not a promoted model speed claim.

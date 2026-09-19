@@ -201,6 +201,31 @@ static void malformed_cases(void) {
 }
 
 static void config_cases(void) {
+    const char *pair_values[] = {NULL, "0", "1", "2", "", "3", "8", "01", "2 ", "-1", "x"};
+    for (unsigned i = 0; i < sizeof(pair_values)/sizeof(pair_values[0]); ++i) {
+        CHECK(ds4_tp_glm5_expert_pairs_parse(pair_values[i]) ==
+            (i < 4 ? (i ? i-1 : 0u) : UINT32_MAX)); ++cases;
+    }
+    for (unsigned rows = 0; rows <= 8; rows += 2) for (unsigned prereq = 0; prereq < 4; ++prereq)
+        for (unsigned mode = 0; mode <= 3; ++mode) {
+            const uint64_t required = (prereq & 1 ? DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF : 0u) |
+                (prereq & 2 ? DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF : 0u);
+            const uint64_t config = ds4_tp_glm5_native_config(rows) | required |
+                ds4_tp_glm5_expert_pairs_config(mode);
+            char error[128];
+            const int valid = mode == 0 || (mode <= 2 && rows == 6 && prereq == 3);
+            CHECK(ds4_tp_glm5_expert_pairs_mode(config) == mode);
+            CHECK(ds4_tp_glm5_expert_pairs_config_valid(config) == valid);
+            const int all_valid = valid && ds4_tp_glm5_mla_handoff_config_valid(config);
+            CHECK(ds4_tp_test_hello_validate_prefill_config(config, config, error, sizeof(error)) == all_valid);
+            for (unsigned other = 0; other <= 3; ++other) {
+                const uint64_t remote = ds4_tp_glm5_native_config(rows) | required |
+                    ds4_tp_glm5_expert_pairs_config(other);
+                CHECK(ds4_tp_test_hello_validate_prefill_config(config, remote, error, sizeof(error)) ==
+                    (all_valid && mode == other));
+            }
+            ++cases;
+        }
     CHECK(ds4_tp_glm5_handoff_modes_valid(NULL,NULL,NULL,NULL));
     CHECK(ds4_tp_glm5_handoff_modes_valid("0","1",NULL,NULL));
     CHECK(ds4_tp_glm5_handoff_modes_valid("0","0","1","1"));

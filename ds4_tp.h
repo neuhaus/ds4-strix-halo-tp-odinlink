@@ -68,6 +68,9 @@ enum {
     DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE = UINT64_C(1) << 43,
     /* One attention-output exchange for exact native MLA rows, max M6. */
     DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF = UINT64_C(1) << 44,
+    /* 0=incumbent, 1=scalar six-row schedule, 2=paired six-row schedule.
+     * Code3 is invalid even if both peers request it. */
+    DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT = 45,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
@@ -114,6 +117,27 @@ static inline bool ds4_tp_glm5_mla_attn_handoff_config_valid(uint64_t config) {
         ((rows == 2u || rows == 4u || rows == 6u) &&
          (config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) &&
          (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline uint32_t ds4_tp_glm5_expert_pairs_parse(const char *value) {
+    if (!value) return 0u;
+    if (!value[0] || value[1] || value[0] < '0' || value[0] > '2') return UINT32_MAX;
+    return (uint32_t)(value[0] - '0');
+}
+
+static inline uint32_t ds4_tp_glm5_expert_pairs_mode(uint64_t config) {
+    return (uint32_t)(config >> DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT) & 3u;
+}
+
+static inline uint64_t ds4_tp_glm5_expert_pairs_config(uint32_t mode) {
+    return (uint64_t)(mode <= 2u ? mode : 3u) << DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT;
+}
+
+static inline bool ds4_tp_glm5_expert_pairs_config_valid(uint64_t config) {
+    const uint32_t mode = ds4_tp_glm5_expert_pairs_mode(config);
+    return !mode || (mode <= 2u && ds4_tp_glm5_native_rows(config) == 6u &&
+        (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) &&
+        (config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF));
 }
 
 /* Three exact workspaces: 2, optionally 4, and configured maximum (6 or 8).

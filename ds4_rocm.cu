@@ -134,7 +134,11 @@ extern "C" void ds4_gpu_rocm_mark_speculative_decode(void) {
 
 #include "rocm/ds4_rocm_moe.cuh"
 
+#include "rocm/ds4_rocm_glm5_expert_pairs.cuh"
+
 #include "rocm/ds4_rocm_moe_launch.cuh"
+
+#include "rocm/ds4_rocm_glm5_expert_pairs_launch.cuh"
 
 #include "rocm/ds4_rocm_glm.cuh"
 

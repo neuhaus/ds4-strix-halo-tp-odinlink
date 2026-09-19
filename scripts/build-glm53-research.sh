@@ -17,6 +17,9 @@ git rev-parse HEAD > BUILD-SOURCE
 core='ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o'
 args=(-j3 ds4 ds4-bench-tp tests/test_rocm_glm5_indexer_score_one
       tests/test_rocm_glm5_indexer_select
+      tests/test_rocm_glm5_expert_pairs tests/test_glm5_expert_pairs
+      tests/test_tp_native_cycle tests/test_glm5_native_session
+      tests/test_glm5_target_commit tests/test_glm5_shared_route_order
       "HIPCC=$hip/bin/hipcc" "ROCM_HOME=$hip" "CORE_OBJS=$core"
       'CFLAGS=-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1'
       "DS4_LINK=$hip/bin/hipcc -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ --offload-arch=gfx1151 -mno-wavefrontsize64 -DDS4_GFX1151_WAVE32=1"
@@ -25,7 +28,9 @@ printf '%q ' make "${args[@]}" > BUILD-COMMAND
 printf '\n' >> BUILD-COMMAND
 make "${args[@]}" > build.log 2>&1
 sha256sum ds4 ds4-bench-tp *.o tests/test_rocm_glm5_indexer_score_one \
-  tests/test_rocm_glm5_indexer_select tests/*.o rocm/*.cuh \
+  tests/test_rocm_glm5_indexer_select tests/test_rocm_glm5_expert_pairs \
+  tests/test_glm5_expert_pairs tests/test_tp_native_cycle tests/test_glm5_native_session \
+  tests/test_glm5_target_commit tests/test_glm5_shared_route_order tests/*.o rocm/*.cuh \
   run-tp-ds4-bench.sh scripts/tp-worker-supervisor.sh scripts/build-glm53-research.sh \
   scripts/run-glm53-q4-pair-tp.sh \
   > BUILD-SHA256SUMS

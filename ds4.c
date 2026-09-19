@@ -51702,6 +51702,13 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    const uint32_t expert_pairs = ds4_tp_glm5_expert_pairs_parse(
+        getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS"));
+    if (expert_pairs != ds4_tp_glm5_expert_pairs_mode(ds4_tp_prefill_config(e->tp.ctx)) ||
+        !ds4_tp_glm5_expert_pairs_config_valid(ds4_tp_prefill_config(e->tp.ctx))) {
+        fprintf(stderr, "ds4: native expert pairs require mode0/1/2, matching hello, native6 and MLA/FFN handoff\n");
+        return 0;
+    }
     const char *mla_attn = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
     const bool use_mla_attn = mla_attn && strcmp(mla_attn, "1") == 0;
     const char *mla_row_sync = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");
@@ -51836,6 +51843,12 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             s->glm5_native_verify_ws[i] = ds4_glm5_next_workspace_create_capacity_context(rows, capacity);
             if (!s->glm5_native_verify_ws[i]) return 0;
             ds4_glm5_next_workspace_begin_decode(s->glm5_native_verify_ws[i]);
+            if (expert_pairs && rows == 6u &&
+                !ds4_glm5_next_expert_pairs_supported(&s->glm5_next_exec, s->glm5_native_verify_ws[i])) {
+                ds4_tp_mark_failed(e->tp.ctx);
+                fprintf(stderr, "ds4: native expert pair startup admission failed\n");
+                return 0;
+            }
             if (mla_output && !strcmp(mla_output, "1") &&
                 !ds4_glm5_next_mla_output_batch_supported(&s->glm5_next_exec,
                     s->glm5_native_verify_ws[i])) {
@@ -54088,6 +54101,8 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && e->glm5_next) {
         const uint32_t rows = ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"));
         config |= ds4_tp_glm5_native_config(rows);
+        config |= ds4_tp_glm5_expert_pairs_config(ds4_tp_glm5_expert_pairs_parse(
+            getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS")));
         const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
         if (handoff && strcmp(handoff, "1") == 0)
             config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;

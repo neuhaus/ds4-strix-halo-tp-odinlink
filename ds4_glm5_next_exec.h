@@ -117,6 +117,9 @@ void ds4_glm5_next_workspace_begin_decode(
  * Checks every trunk MLA output without enqueue, allocation or state mutation. */
 int ds4_glm5_next_mla_output_batch_supported(const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_workspace *workspace);
+/* Checks every resident routed layer for the exact six-row expert schedule. */
+int ds4_glm5_next_expert_pairs_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *workspace);
 
 /* Explicit native block45 workspace: one scalar activation set and one
  * bounded eight-expert packed window, invalidated before each reuse. */
