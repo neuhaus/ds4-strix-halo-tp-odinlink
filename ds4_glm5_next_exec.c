@@ -9,6 +9,7 @@
 
 #include "ds4_gpu.h"
 #include "ds4_tp.h"
+#include "ds4_glm5_route_profile.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_gpu_mgpu.h"
 #endif
@@ -4455,6 +4456,10 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
     const uint64_t sequence = *ctx->tp_sequence;
     const bool queue_experts = (ds4_tp_prefill_config(ctx->tp) &
         DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u;
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const char *routes_env = getenv("DS4_GLM5_VERIFY_ROUTE_PROFILE");
+    const bool route_profile = routes_env && strcmp(routes_env, "1") == 0;
+    const double begin = profile ? glm5_exec_now_sec() : 0.0;
     int32_t ids[8u * GLM5_EXPERTS_USED] = {0};
     float weights[8u * GLM5_EXPERTS_USED] = {0};
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -4489,8 +4494,10 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
         hash = fnv64_continue(hash, ids, rows * route_row);
         hash = fnv64_continue(hash, weights, rows * route_row);
     }
+    const double routes_done = profile ? glm5_exec_now_sec() : 0.0;
     if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 0u,
             hash, ok, error, sizeof(error))) goto failed;
+    const double route_agree_done = profile ? glm5_exec_now_sec() : 0.0;
 
     for (uint32_t t = 0; ok && t < rows; ++t) {
         ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
@@ -4523,10 +4530,13 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
         const int completed = ds4_gpu_synchronize();
         ok = ok && completed;
     }
+    const double experts_done = profile ? glm5_exec_now_sec() : 0.0;
     /* Failure is always exchanged before either side posts the bulk payload. */
     if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 1u,
             hash, ok, error, sizeof(error))) goto failed;
+    const double compute_agree_done = profile ? glm5_exec_now_sec() : 0.0;
     if (!tp_exchange_rows(ctx, il, DS4_TP_GATE_FFN, rows)) goto failed;
+    const double bulk_done = profile ? glm5_exec_now_sec() : 0.0;
     for (uint32_t t = 0; ok && t < rows; ++t) {
         ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
             t * hidden_row, hidden_row);
@@ -4545,6 +4555,28 @@ static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
     }
     if (ok) ok = ds4_gpu_synchronize();
     if (!ok) goto failed;
+    const double done = profile ? glm5_exec_now_sec() : 0.0;
+    if (profile) fprintf(stderr,
+        "VERIFY_FFN rank=%u layer=%u frontier=%u m=%u sequence=%llu queue=%u route_ms=%.6f route_agree_ms=%.6f expert_ms=%.6f compute_agree_ms=%.6f bulk_ms=%.6f tail_ms=%.6f total_ms=%.6f\n",
+        ctx->tp_rank, il, frontier, rows, (unsigned long long)sequence, queue_experts,
+        (routes_done - begin) * 1000.0, (route_agree_done - routes_done) * 1000.0,
+        (experts_done - route_agree_done) * 1000.0,
+        (compute_agree_done - experts_done) * 1000.0,
+        (bulk_done - compute_agree_done) * 1000.0, (done - bulk_done) * 1000.0,
+        (done - begin) * 1000.0);
+    if (route_profile) {
+        ds4_glm5_route_profile p = {0};
+        const int valid = ds4_glm5_route_profile_count(ids, rows, &p);
+        unsigned zero_weights = 0;
+        for (unsigned i = 0; i < rows * GLM5_EXPERTS_USED; ++i)
+            zero_weights += weights[i] == 0.0f;
+        fprintf(stderr,
+            "VERIFY_ROUTES rank=%u layer=%u frontier=%u m=%u sequence=%llu hash=%016llx valid=%d unique2=%u unique4=%u unique_all=%u h1=%u h2=%u h3=%u h4=%u h5=%u h6=%u h7=%u h8=%u zero_weights=%u\n",
+            ctx->tp_rank, il, frontier, rows, (unsigned long long)sequence,
+            (unsigned long long)hash, valid, p.unique2, p.unique4, p.unique_all,
+            p.multiplicity[0], p.multiplicity[1], p.multiplicity[2], p.multiplicity[3],
+            p.multiplicity[4], p.multiplicity[5], p.multiplicity[6], p.multiplicity[7], zero_weights);
+    }
     return 1;
 failed:
     ds4_gpu_synchronize();
@@ -4634,7 +4666,7 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     bulk.force_bulk_gates = true;
     const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
     double phase_start = profile ? glm5_exec_now_sec() : 0.0;
-    double attention_sec = 0.0, ffn_sec = 0.0;
+    double attention_sec = 0.0, ffn_sec = 0.0, shared_sec = 0.0, handoff_sec = 0.0;
     ds4_glm5_next_mla_state *mla = NULL;
     int ok = is_kda ? verify_kda_attention(&bulk, il, state, batch_w, hc_in, n_tokens) :
         ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
@@ -4678,7 +4710,8 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         ok = verify_shared_ffn_prepare(&bulk, il, batch_w, scalar_w, n_tokens);
         if (profile) {
             if (ok) ok = ds4_gpu_synchronize();
-            ffn_sec += glm5_exec_now_sec() - phase_start;
+            shared_sec = glm5_exec_now_sec() - phase_start;
+            ffn_sec += shared_sec;
         }
         if (ok) {
             static int reported[2];
@@ -4693,7 +4726,10 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         if (profile) phase_start = glm5_exec_now_sec();
         ok = verify_ffn_handoff(&bulk, il, batch_w, scalar_w, hc_out,
             (uint32_t)frontier, n_tokens, ok);
-        if (profile) ffn_sec += glm5_exec_now_sec() - phase_start;
+        if (profile) {
+            handoff_sec = glm5_exec_now_sec() - phase_start;
+            ffn_sec += handoff_sec;
+        }
         if (ok) {
             static int reported[2][2];
             if (!reported[ctx->tp_rank][batch_mla]) {
@@ -4742,9 +4778,10 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     }
     if (ok) ok = ds4_gpu_synchronize();
     if (profile) fprintf(stderr,
-        "VERIFY_PROFILE rank=%u layer=%u kind=%s m=%u attention_ms=%.6f ffn_ms=%.6f ok=%d\n",
+        "VERIFY_PROFILE rank=%u layer=%u kind=%s m=%u attention_ms=%.6f ffn_ms=%.6f ok=%d frontier=%llu shared_ms=%.6f handoff_ms=%.6f\n",
         ctx->tp_rank, il, is_kda ? "kda" : "mla", n_tokens,
-        attention_sec * 1000.0, ffn_sec * 1000.0, ok);
+        attention_sec * 1000.0, ffn_sec * 1000.0, ok, (unsigned long long)frontier,
+        shared_sec * 1000.0, handoff_sec * 1000.0);
     if (!ok) ds4_glm5_next_state_invalidate(state);
     return ok;
 }

@@ -751,7 +751,10 @@ tests/test_glm5_kda_binding: tests/test_glm5_kda_binding.c ds4_glm5_kda.c ds4_gl
 tests/test_glm5_next_runtime_offsets: tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm5_kda.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c $(LDLIBS)
 
-tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+tests/test_glm5_route_profile: tests/test_glm5_route_profile.c ds4_glm5_route_profile.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
 
 tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -759,7 +762,7 @@ tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c
 
 # Retain only the production target-commit path; unused GPU executor entry
 # points are discarded so this host failure-injection fixture needs no GPU.
-tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -DDS4_GLM5_TARGET_COMMIT_TEST -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
@@ -1089,7 +1092,7 @@ ds4_glm5_next_runtime.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm
 ds4_glm5_next_state.o: ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_state.c
 
-ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
+ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_exec.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
@@ -1594,7 +1597,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_tp_bulk_ready tests/test_glm5_native_session \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_tp_bulk_ready tests/test_glm5_native_session tests/test_glm5_route_profile \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
@@ -1607,6 +1610,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/te
 	./tests/test_tp_native_cycle
 	./tests/test_tp_bulk_ready
 	./tests/test_glm5_native_session
+	./tests/test_glm5_route_profile
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling

@@ -197,3 +197,13 @@ weight allocation or native draft-window change is involved. Fixture-only
 HIP event wrappers measure packed expert device intervals separately from
 complete loop wall time; they are not linked into model executables. The plan
 is `research/ffn-queue-plan-d65372d.md` in the candidate dossier.
+
+`DS4_GLM5_VERIFY_ROUTE_PROFILE=1` records host-only route overlap from the
+existing validated verifier readback, including rejected proposals. It adds
+no GPU transfer, allocation or weight cache. Existing `DS4_GLM5_VERIFY_PROFILE`
+also separates completed FFN handoff sections and shared preparation. These
+are instrumented diagnostic timings, including host/peer waits; existing
+layer-profile fences remain and neither these spans nor nominal byte rates
+are hardware ceilings. Use real two-rank runs for actual route distributions;
+echo-peer fixture activations are not a model-route oracle. See
+`research/verifier-route-profile-plan-11cbed2.md` in the candidate dossier.
