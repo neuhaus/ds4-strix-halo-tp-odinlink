@@ -2139,26 +2139,6 @@ static int local_q4k_half_residency(
     return loaded == 0 ? 0 : loaded == 3 ? 1 : -1;
 }
 
-static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
-                                  const ds4_glm5_next_layer_offsets *layer) {
-    const uint64_t gate_row_bytes =
-        (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
-    const uint64_t down_half_bytes =
-        (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
-    const uint32_t row_base = ctx->tp_rank * GLM5_RANK_MID;
-    const uint64_t column_base = (uint64_t)ctx->tp_rank * down_half_bytes;
-    return declare_local_q4k_half_only(ctx, layer) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.gate_exps,
-               row_base, GLM5_RANK_MID, 0u, gate_row_bytes) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.up_exps,
-               row_base, GLM5_RANK_MID, 0u, gate_row_bytes) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.down_exps,
-               0u, GLM5_WIDTH, column_base, down_half_bytes);
-}
-
 static int mla_publish_completed_pool(
         const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_mla_offsets *offsets,

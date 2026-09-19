@@ -1170,7 +1170,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
 
     if (hipStreamCreate(&g_tp_stream) != hipSuccess || !g_tp_stream) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: gate stream create failed\n");
-        if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
+        if (g_tp_sig_is_host) (void)hipHostFree(sig); else (void)hipFree(sig);
         g_tp_sig_alloc = NULL;
         return 0;
     }
@@ -1192,7 +1192,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
                 "tp_init: host-synchronous gate event create failed\n");
         (void)hipStreamDestroy(g_tp_stream);
         g_tp_stream = NULL;
-        if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
+        if (g_tp_sig_is_host) (void)hipHostFree(sig); else (void)hipFree(sig);
         g_tp_sig_alloc = NULL;
         return 0;
     }
@@ -1244,7 +1244,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     if (!g_tp_host_sync &&
         pthread_create(&g_tp_thread, NULL, ds4_tp_service_thread, NULL) != 0) {
         g_tp_run = 0;
-        if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
+        if (g_tp_sig_is_host) (void)hipHostFree(sig); else (void)hipFree(sig);
         g_tp_sig_alloc = NULL;
         for (int ch = 0; ch < 2; ch++) {
             if (g_tp_ffn_range_host[ch])
@@ -1293,7 +1293,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     }
     g_tp_run = 0;
     if (g_tp_thread_started) pthread_join(g_tp_thread, NULL); /* drains */
-    hipDeviceSynchronize();                 /* no pending WaitValue on the word */
+    (void)hipDeviceSynchronize();           /* no pending WaitValue on the word */
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     ds4_tp_host_sync_profile_print();
 #endif
@@ -1319,7 +1319,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_split_head = 0u;
     g_tp_split_count = 0u;
     if (g_tp_sig_alloc) {
-        if (g_tp_sig_is_host) hipHostFree(g_tp_sig_alloc); else hipFree(g_tp_sig_alloc);
+        if (g_tp_sig_is_host) (void)hipHostFree(g_tp_sig_alloc); else (void)hipFree(g_tp_sig_alloc);
         g_tp_sig_alloc = NULL;
     }
     for (int ch = 0; ch < 2; ch++) {

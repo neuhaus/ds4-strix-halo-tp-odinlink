@@ -2205,7 +2205,9 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu rows=%u "
                 "prefetch=%u split=%d\n", (unsigned long long)out_dim,
-                rows4 ? 4u : 8u, prefetch, split ? 1 : 0);
+                split && rows2 && (out_dim & 1u) == 0u ? 2u :
+                rows4 && (out_dim & 3u) == 0u ? 4u : 8u,
+                prefetch, split ? 1 : 0);
         reported = 1;
     }
     return cuda_ok(cudaGetLastError(),
