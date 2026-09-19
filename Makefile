@@ -380,11 +380,11 @@ tests/test_rocm_glm5_mla_replay.o: tests/test_rocm_glm5_mla_replay.cu tests/glm5
 tests/test_rocm_glm5_mla_replay: tests/test_rocm_glm5_mla_replay.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
-tests/test_rocm_glm5_layer_verify.o: tests/test_rocm_glm5_layer_verify.cu tests/glm5_ffn_queue_probe.hpp tests/glm5_native_draft_checks.hpp tests/glm5_next_real_offsets.hpp tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+tests/test_rocm_glm5_layer_verify.o: tests/test_rocm_glm5_layer_verify.cu tests/glm5_ffn_queue_probe.hpp tests/glm5_native_draft_checks.hpp tests/glm5_next_real_offsets.hpp tests/glm5_gguf_test.hpp ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_rocm_glm5_layer_verify: tests/test_rocm_glm5_layer_verify.o ds4_glm5_next_exec.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
-	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_synchronize -Wl,--wrap=ds4_gpu_routed_moe_one_packed_q4k_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_kslice_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_tensor -Wl,--wrap=ds4_rocm_glm5_mla_output_q8_small_m -o $@ $^ $(ROCM_LDLIBS)
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_synchronize -Wl,--wrap=ds4_gpu_routed_moe_one_packed_q4k_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_kslice_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_tensor -Wl,--wrap=ds4_rocm_glm5_mla_output_q8_small_m -Wl,--wrap=ds4_rocm_glm5_expert_six_begin -Wl,--wrap=ds4_rocm_glm5_expert_six_down_row -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_rocm_glm5_mhc_layer.o: tests/test_rocm_glm5_mhc_layer.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<

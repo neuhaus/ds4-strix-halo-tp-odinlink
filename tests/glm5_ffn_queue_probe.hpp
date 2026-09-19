@@ -2,6 +2,7 @@
 // expert calls. Event spans include intra-call launch gaps; they are not a
 // hardware-active-time counter. Not linked into either production executable.
 #include <hip/hip_runtime_api.h>
+#include "ds4_glm5_expert_pairs.h"
 
 static ds4_tp *queue_test_peer;
 static bool queue_gpu_profile, queue_timed_sample;
@@ -25,6 +26,8 @@ static bool queue_probe_active() {
 static void queue_probe_begin(ds4_tp *p) {
     p->handoff_fences=0;
     p->packed_calls=0;
+    p->expert_begin=0;
+    p->expert_down=0;
     queue_event_count=0;
     if (queue_probe_active()) queue_loop_start=std::chrono::steady_clock::now();
 }
@@ -56,6 +59,31 @@ static void queue_probe_finish() {
 }
 
 extern "C" {
+decltype(ds4_rocm_glm5_expert_six_begin) __real_ds4_rocm_glm5_expert_six_begin;
+int __wrap_ds4_rocm_glm5_expert_six_begin(const ds4_glm5_expert_six_plan *plan,
+        const ds4_glm5_expert_groups *g,const int32_t *ids,const float *weights) {
+    REQUIRE(queue_test_peer && queue_test_peer->handoff_pending==1 &&
+        queue_test_peer->handoff_rows==6 && queue_test_peer->expert_begin==0);
+    const int ok=__real_ds4_rocm_glm5_expert_six_begin(plan,g,ids,weights);
+    if(ok) ++queue_test_peer->expert_begin;
+    if(queue_test_peer->fail_expert_begin) {
+        REQUIRE(ok); queue_test_peer->fail_expert_begin=false; return 0;
+    }
+    return ok;
+}
+decltype(ds4_rocm_glm5_expert_six_down_row) __real_ds4_rocm_glm5_expert_six_down_row;
+int __wrap_ds4_rocm_glm5_expert_six_down_row(const ds4_glm5_expert_six_plan *plan,uint32_t row) {
+    REQUIRE(queue_test_peer && queue_test_peer->handoff_pending==1 &&
+        queue_test_peer->expert_begin==1 && row==queue_test_peer->expert_down);
+    const bool queue=queue_test_peer->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE;
+    REQUIRE(queue_test_peer->handoff_fences==(queue?0u:row));
+    const int ok=__real_ds4_rocm_glm5_expert_six_down_row(plan,row);
+    if(ok) ++queue_test_peer->expert_down;
+    if(queue_test_peer->fail_expert_row==row+1) {
+        REQUIRE(ok); queue_test_peer->fail_expert_row=0; return 0;
+    }
+    return ok;
+}
 decltype(ds4_gpu_synchronize) __real_ds4_gpu_synchronize;
 int __wrap_ds4_gpu_synchronize() {
     const int completed=__real_ds4_gpu_synchronize();

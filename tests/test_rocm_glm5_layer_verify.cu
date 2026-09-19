@@ -41,6 +41,10 @@ struct ds4_tp {
     unsigned attn_outputs=0, attn_drains=0, fail_attn_output=0;
     unsigned attn_prepares=0, fail_attn_prepare=0;
     unsigned output_batch_calls=0, output_scalar_calls=0;
+    unsigned expert_begin=0, expert_down=0;
+    unsigned expert_total[2]={}, expert_tail[2]={};
+    bool fail_expert_begin=false;
+    unsigned fail_expert_row=0;
     uint64_t attn_sequence=0;
     uint32_t attn_layer=0, attn_rows=0;
 };
@@ -85,6 +89,16 @@ int ds4_tp_verify_layer_agree(ds4_tp *p,uint64_t sequence,uint32_t layer,
     ++p->layer_agrees[phase];
     if (phase && local_ok && !p->failed) {
         REQUIRE(p->handoff_fences==((p->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE)?1u:rows));
+        if (ds4_tp_glm5_expert_pairs_mode(p->prefill_config)) {
+            const unsigned kind=layer%4==3;
+            if(rows==6) {
+                REQUIRE(p->expert_begin==1 && p->expert_down==6 && p->packed_calls==0);
+                ++p->expert_total[kind];
+            } else {
+                REQUIRE(p->expert_begin==0 && p->expert_down==0 && p->packed_calls==rows);
+                ++p->expert_tail[kind];
+            }
+        }
         queue_probe_end(p);
     }
     if (!local_ok || p->failed || p->fail_agree_phase==(int)phase) {
@@ -874,6 +888,42 @@ static void target_profile(ds4_glm5_next_exec_ctx &x) {
 
 #include "glm5_native_draft_checks.hpp"
 
+static void expert_pair_failures(ds4_glm5_next_exec_ctx &x) {
+    const uint64_t config=x.tp->prefill_config;
+    for(unsigned il:{3u,4u}) for(unsigned failure=0;failure<8;++failure) {
+        State state(*x.model); Workspace scalar(1),batch(6);
+        GuardedTensor input(6*hc_row),output(6*hc_row);
+        REQUIRE(ds4_gpu_tensor_fill_f32(input,0.0123f,6*16384u));
+        REQUIRE(ds4_gpu_tensor_fill_f32(output,12345.0f,6*16384u));
+        if(il==3) seed_mla(state,il,8193);
+        REQUIRE(ds4_glm5_next_layer_verify_reserve(&x,il,&state.s,6));
+        const unsigned ffns=x.tp->handoff_bulk_calls, agree0=x.tp->layer_agrees[0],agree1=x.tp->layer_agrees[1];
+        if(failure==0) REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS","invalid",1)==0);
+        if(failure==1) x.tp->prefill_config ^= UINT64_C(1)<<DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT;
+        if(failure==2) x.tp->prefill_config=(config & ~DS4_TP_CONFIG_GLM5_NATIVE_SIX)|ds4_tp_glm5_native_config(8);
+        if(failure==3) REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ","1",1)==0);
+        if(failure==4) x.tp->fail_expert_begin=true;
+        if(failure==5) x.tp->fail_expert_row=3;
+        if(failure==6) x.tp->fail_completion=true;
+        if(failure==7) x.tp->fail_agree_phase=1;
+        REQUIRE(!ds4_glm5_next_layer_verify(&x,il,&state.s,batch,scalar,input,output,6));
+        REQUIRE(x.tp->handoff_bulk_calls==ffns && x.tp->failed);
+        if(failure<4) REQUIRE(state.s.valid && x.tp->layer_agrees[0]==agree0 && x.tp->layer_agrees[1]==agree1);
+        else {
+            REQUIRE(!state.s.valid && x.tp->layer_agrees[0]==agree0+1 && x.tp->layer_agrees[1]==agree1+1);
+            REQUIRE(x.tp->handoff_fences>=1 && !x.tp->fail_expert_begin && !x.tp->fail_expert_row && !x.tp->fail_completion);
+            if(failure==4) REQUIRE(x.tp->expert_begin==1 && x.tp->expert_down==0);
+            if(failure==5) REQUIRE(x.tp->expert_begin==1 && x.tp->expert_down==3);
+        }
+        input.check(); output.check();
+        for(float value:read(output,6*16384u)) REQUIRE(value==12345.0f);
+        REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS","2",1)==0);
+        REQUIRE(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ","0",1)==0);
+        x.tp->prefill_config=config; x.tp->failed=false; x.tp->fail_agree_phase=-1;
+    }
+    std::puts("EXPERT_PAIRS KDA/MLA selector/hello/M8/admission/partial-launch/down/completion/agreement failures PASS");
+}
+
 int main(int argc,char **argv) {
     const bool refresh=argc==3 && !std::strcmp(argv[1],"--native-refresh");
     const bool warm=argc==3 && !std::strcmp(argv[1],"--native-warm");
@@ -882,7 +932,8 @@ int main(int argc,char **argv) {
     const bool shared_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-shared-both");
     const bool queue_profile=argc==3 && !std::strcmp(argv[1],"--target-resident-ffn-queue-profile");
     const bool queue_compare=queue_profile || (argc==3 && !std::strcmp(argv[1],"--target-resident-ffn-queue-both"));
-    const bool output_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-mla-output-both");
+    const bool pairs_compare=argc==3 && !std::strcmp(argv[1],"--target-resident-expert-pairs");
+    const bool output_compare=pairs_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-mla-output-both"));
     const bool attn_compare=output_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-mla-attn-both"));
     const bool mla_compare=attn_compare || queue_compare || (argc==3 && !std::strcmp(argv[1],"--target-resident-mla-handoff-both"));
     const auto verifier_widths=mla_compare?std::vector<unsigned>{2u,4u,6u}:glm5_test_verifier_widths();
@@ -956,6 +1007,11 @@ int main(int argc,char **argv) {
         }
         if (output_compare) REQUIRE(std::getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH") &&
             !std::strcmp(std::getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH"),"1"));
+        if(pairs_compare) {
+            REQUIRE(ds4_tp_glm5_expert_pairs_parse(std::getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS"))==2);
+            peer.prefill_config |= ds4_tp_glm5_expert_pairs_config(2);
+            REQUIRE(!queue_gpu_profile);
+        }
         if (resident) {
             Glm5NextKShardPlan plan;
             REQUIRE(glm5_next_build_kshard_plan(g,model,plan,native));
@@ -1009,7 +1065,26 @@ int main(int argc,char **argv) {
             REQUIRE(!peer.output_batch_calls && !peer.output_scalar_calls && !peer.calls);
             std::puts("MLA_OUTPUT_STARTUP all11 resident ranges and2/4/6 workspaces checked before any launch PASS");
         }
-        if (native) {
+        if(pairs_compare) {
+            peer.rank=x.tp_rank=resident_rank;
+            for(unsigned width:{2u,4u,6u}) {
+                Workspace batch(width);
+                REQUIRE(ds4_glm5_next_expert_pairs_supported(&x,batch)==(width==6));
+            }
+            for(unsigned mode:{1u,2u}) for(unsigned queue:{0u,1u}) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS",mode==1?"1":"2",1)==0);
+                REQUIRE(setenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE",queue?"1":"0",1)==0);
+                peer.prefill_config &= ~((UINT64_C(3)<<DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT)|DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE);
+                peer.prefill_config |= ds4_tp_glm5_expert_pairs_config(mode) | (queue?DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE:0u);
+                for(unsigned width:verifier_widths) for(unsigned accepted=0;accepted<=width;++accepted)
+                    target_case(x,width,width==2?0u:3u,accepted);
+                for(unsigned width:verifier_widths) target_case(x,width,8193,width/2,true);
+                if(mode==2) expert_pair_failures(x);
+            }
+            REQUIRE(peer.expert_total[0] && peer.expert_total[1] && peer.expert_tail[0] && peer.expert_tail[1]);
+            std::printf("EXPERT_PAIRS_ENGAGEMENT rank=%u kda_six=%u mla_six=%u kda_tail=%u mla_tail=%u PASS\n",
+                resident_rank,peer.expert_total[0],peer.expert_total[1],peer.expert_tail[0],peer.expert_tail[1]);
+        } else if (native) {
             peer.rank=x.tp_rank=resident_rank;
             if (refresh) { native_hidden_tile_checks(x); native_refresh_checks(x); }
             if (warm) native_warm_checks(x);
