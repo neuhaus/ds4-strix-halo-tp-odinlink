@@ -43,6 +43,9 @@ enum {
 
 _Static_assert((DS4_GLM5_KDA_CHANNELS % 2u) == 0u,
                "KDA TP output K slices require an even channel count");
+_Static_assert(GLM5_EXPERTS == DS4_GLM5_ROUTE_PROFILE_EXPERTS &&
+               GLM5_EXPERTS_USED == DS4_GLM5_ROUTE_PROFILE_USED,
+               "route diagnostics must match the engine expert layout");
 
 static double glm5_exec_now_sec(void) {
     struct timespec ts;
@@ -2282,9 +2285,38 @@ static int mla_scalar_residual(const ds4_glm5_next_layer_offsets *layer,
         ds4_gpu_add_tensor(w->after_attention, input, w->attention, GLM5_WIDTH);
 }
 
+/* Verifier-only diagnostic. NULL preserves the original asynchronous call
+ * sequence. Completed spans add fences and include host/peer waiting; they
+ * are not active GPU time or a pure network latency measurement. */
+enum {
+    MLA_PROFILE_ENTRY, MLA_PROFILE_PREPARE_QKV, MLA_PROFILE_KV_STORE,
+    MLA_PROFILE_LOWRANK, MLA_PROFILE_INDEX_STATE, MLA_PROFILE_SELECT,
+    MLA_PROFILE_ATTENTION, MLA_PROFILE_OUTPUT, MLA_PROFILE_EXCHANGE,
+    MLA_PROFILE_RESIDUAL, MLA_PROFILE_COUNT
+};
+typedef struct {
+    double last, seconds[MLA_PROFILE_COUNT];
+    uint32_t dense_rows, sparse_rows;
+} glm5_mla_profile;
+
+static int mla_profile_mark(glm5_mla_profile *p, unsigned stage) {
+    if (!p) return 1;
+    if (!ds4_gpu_synchronize()) return 0;
+    const double now = glm5_exec_now_sec();
+    p->seconds[stage] += now - p->last;
+    p->last = now;
+    return 1;
+}
+
+static int mla_profile_begin(glm5_mla_profile *p) {
+    if (!p) return 1;
+    p->last = glm5_exec_now_sec();
+    return mla_profile_mark(p, MLA_PROFILE_ENTRY);
+}
+
 /* The official selector uses the full visible range through top-k. Pooled
  * selection begins only when visible exceeds 2048 and is a separate path. */
-static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
+static int mla_dense_selection_attention_impl(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t il,
                                        ds4_glm5_next_mla_state *mla,
                                        ds4_glm5_next_workspace *w,
@@ -2292,7 +2324,8 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t visible,
                                        uint32_t tail_slot,
                                        uint32_t pool_index,
-                                       bool publish_pool) {
+                                       bool publish_pool,
+                                       glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_next_mla_offsets local_m = layer->mla;
     const ds4_glm5_next_mla_offsets *m = &local_m;
@@ -2303,7 +2336,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
         ((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM) / 2u;
     if (!mla_scalar_head_layout(ctx, true, &local_m,
                                 &heads, &output_input_start)) return 0;
-    return
+    int ok = mla_profile_begin(profile) &&
         mla_scalar_prepare(ctx, layer, w, hc_in) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
@@ -2323,14 +2356,17 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             ctx->model_map, ctx->model_size, m->kv_a_norm,
             1u, GLM5_KV_LORA, GLM5_KV_LORA,
             ctx->model->rms_norm_eps) &&
+        mla_profile_mark(profile, MLA_PROFILE_PREPARE_QKV) &&
         ds4_gpu_glm_store_compact_kv_tensor(
             mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
             pos, 1u, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
+        mla_profile_mark(profile, MLA_PROFILE_KV_STORE) &&
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
             heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+        mla_profile_mark(profile, MLA_PROFILE_LOWRANK) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2355,8 +2391,10 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             w->mla_pool_gate_raw, 0u, 1u) &&
         mla_publish_completed_pool(
             ctx, m, mla, w, pool_index, publish_pool) &&
+        mla_profile_mark(profile, MLA_PROFILE_INDEX_STATE) &&
         ds4_gpu_glm_fill_selected_range_tensor(w->mla_selected_token,
                                                 visible) &&
+        mla_profile_mark(profile, MLA_PROFILE_SELECT) &&
         ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             w->mla_heads, w->mla_query, w->mla_qk_low,
             mla->compact_kv, NULL, ctx->model_map, ctx->model_size,
@@ -2364,23 +2402,40 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+        mla_profile_mark(profile, MLA_PROFILE_ATTENTION) &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
             ctx->tp_big_out, ctx->model_map, ctx->model_size, m->output,
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
             output_input_start) &&
+        mla_profile_mark(profile, MLA_PROFILE_OUTPUT) &&
         tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
                            GLM5_WIDTH) &&
-        mla_scalar_residual(layer, w, hc_in);
+        mla_scalar_residual(layer, w, hc_in) &&
+        mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (ok && profile) ++profile->dense_rows;
+    return ok;
+}
+
+static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
+                                       uint32_t il,
+                                       ds4_glm5_next_mla_state *mla,
+                                       ds4_glm5_next_workspace *w,
+                                       const ds4_gpu_tensor *hc_in,
+                                       uint32_t visible, uint32_t tail_slot,
+                                       uint32_t pool_index, bool publish_pool) {
+    return mla_dense_selection_attention_impl(ctx, il, mla, w, hc_in,
+        visible, tail_slot, pool_index, publish_pool, NULL);
 }
 
 /* Beyond the model's 2048-row index budget, score completed pool-4 keys,
  * retain the best 512 pools, expand them back to raw rows, and append the
  * current incomplete tail.  All selector intermediates remain device-local;
  * only the established attention output slice crosses RDMA. */
-static int mla_sparse_selection_attention(
+static int mla_sparse_selection_attention_impl(
         const ds4_glm5_next_exec_ctx *ctx,
         uint32_t il,
         ds4_glm5_next_mla_state *mla,
@@ -2392,7 +2447,8 @@ static int mla_sparse_selection_attention(
         uint32_t top_k,
         ds4_gpu_tensor *local_output,
         bool project_output,
-        bool finish_attention) {
+        bool finish_attention,
+        glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_next_mla_offsets local_m = layer->mla;
     const ds4_glm5_next_mla_offsets *m = &local_m;
@@ -2425,7 +2481,7 @@ static int mla_sparse_selection_attention(
     }
     if (!mla_scalar_head_layout(ctx, finish_attention, &local_m,
                                 &heads, &output_input_start)) return 0;
-    int ok =
+    int ok = mla_profile_begin(profile) &&
         mla_scalar_prepare(ctx, layer, w, hc_in) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
@@ -2445,14 +2501,17 @@ static int mla_sparse_selection_attention(
             ctx->model_map, ctx->model_size, m->kv_a_norm,
             1u, GLM5_KV_LORA, GLM5_KV_LORA,
             ctx->model->rms_norm_eps) &&
+        mla_profile_mark(profile, MLA_PROFILE_PREPARE_QKV) &&
         ds4_gpu_glm_store_compact_kv_tensor(
             mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
             pos, 1u, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
+        mla_profile_mark(profile, MLA_PROFILE_KV_STORE) &&
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
             heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+        mla_profile_mark(profile, MLA_PROFILE_LOWRANK) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2484,7 +2543,8 @@ static int mla_sparse_selection_attention(
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_weights, ctx->model_map, ctx->model_size,
             m->index_proj, GLM5_WIDTH, GLM5_INDEX_HEADS,
-            w->ffn_hidden, 1u);
+            w->ffn_hidden, 1u) &&
+        mla_profile_mark(profile, MLA_PROFILE_INDEX_STATE);
     ok = ok &&
         ds4_gpu_glm_indexer_score_one_tensor(
             w->mla_pool_scores, w->mla_index_q, w->mla_index_weights,
@@ -2500,7 +2560,8 @@ static int mla_sparse_selection_attention(
             mla->index_pool_ids, mla->index_pool_valid,
             mla->index_valid_keys, n_pools, selected_pools,
             mla->capacity_tokens, mla->first_valid, visible,
-            top_k, GLM5_INDEX_POOL);
+            top_k, GLM5_INDEX_POOL) &&
+        mla_profile_mark(profile, MLA_PROFILE_SELECT);
     ok = ok &&
         ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             w->mla_heads, w->mla_query, w->mla_qk_low,
@@ -2508,7 +2569,8 @@ static int mla_sparse_selection_attention(
             m->v_b, 8u, w->mla_selected_token, selected_tokens,
             mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
-            1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+        mla_profile_mark(profile, MLA_PROFILE_ATTENTION);
     if (!project_output) return ok;
     ok = ok &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
@@ -2516,14 +2578,29 @@ static int mla_sparse_selection_attention(
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
-            output_input_start);
+            output_input_start) &&
+        mla_profile_mark(profile, MLA_PROFILE_OUTPUT);
     if (!finish_attention) return ok;
-    ok = ok && tp_exchange(ctx, il, DS4_TP_GATE_ATTN);
+    ok = ok && tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE);
     ok = ok &&
         ds4_gpu_add_tensor(
             w->attention, ctx->tp_big_out, ctx->tp_big_in, GLM5_WIDTH) &&
-        mla_scalar_residual(layer, w, hc_in);
+        mla_scalar_residual(layer, w, hc_in) &&
+        mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (ok && profile) ++profile->sparse_rows;
     return ok;
+}
+
+static int mla_sparse_selection_attention(
+        const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        ds4_glm5_next_mla_state *mla, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in, uint32_t tail_slot, uint32_t pool_index,
+        bool publish_pool, uint32_t top_k, ds4_gpu_tensor *local_output,
+        bool project_output, bool finish_attention) {
+    return mla_sparse_selection_attention_impl(ctx, il, mla, w, hc_in,
+        tail_slot, pool_index, publish_pool, top_k, local_output,
+        project_output, finish_attention, NULL);
 }
 
 /* Consume one query from a previously batched sparse prelude. The selector
@@ -4604,6 +4681,15 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         return 0;
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const bool is_kda = layer->attention == DS4_GLM5_NEXT_ATTN_KDA;
+    const char *mla_profile_option = getenv("DS4_GLM5_VERIFY_MLA_PROFILE");
+    if (mla_profile_option && strcmp(mla_profile_option, "0") &&
+        strcmp(mla_profile_option, "1")) {
+        fprintf(stderr, "ds4: invalid GLM5 MLA verification profile selector\n");
+        return 0;
+    }
+    glm5_mla_profile mla_timings = {0};
+    glm5_mla_profile *mla_profile = (!is_kda && mla_profile_option &&
+        strcmp(mla_profile_option, "1") == 0) ? &mla_timings : NULL;
     const char *dense_option = getenv("DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
     if (dense_option && strcmp(dense_option, "0") != 0 && strcmp(dense_option, "1") != 0) {
         fprintf(stderr, "ds4: invalid GLM5 dense Q8 verification selector\n");
@@ -4683,11 +4769,11 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         ok = in && ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
         const bool dense = ds4_glm5_next_mla_dense_selection_visible(
             mla->token_count, mla->capacity_tokens, &visible);
-        if (ok) ok = dense ? mla_dense_selection_attention(
-            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish) :
-            mla_sparse_selection_attention(&bulk, il, mla, scalar_w, in,
+        if (ok) ok = dense ? mla_dense_selection_attention_impl(
+            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, mla_profile) :
+            mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
                 slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
-                bulk.tp_big_out, true, true);
+                bulk.tp_big_out, true, true, mla_profile);
         if (ok) ok = ds4_gpu_tensor_copy(batch_w->after_attention, t * row,
                 scalar_w->after_attention, 0u, row) &&
             ds4_glm5_next_mla_append_commit(mla);
@@ -4753,11 +4839,11 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
             ok = in && ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
             const bool dense = ds4_glm5_next_mla_dense_selection_visible(
                 mla->token_count, mla->capacity_tokens, &visible);
-            if (ok) ok = dense ? mla_dense_selection_attention(
-                &bulk, il, mla, scalar_w, in, visible, slot, pool, publish) :
-                mla_sparse_selection_attention(&bulk, il, mla, scalar_w, in,
+            if (ok) ok = dense ? mla_dense_selection_attention_impl(
+                &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, mla_profile) :
+                mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
                     slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
-                    bulk.tp_big_out, true, true);
+                    bulk.tp_big_out, true, true, mla_profile);
         }
         if (profile) {
             if (ok) ok = ds4_gpu_synchronize();
@@ -4777,6 +4863,26 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_tensor_free(out);
     }
     if (ok) ok = ds4_gpu_synchronize();
+    if (mla_profile) {
+        double total = 0.0;
+        for (unsigned i = 0; i < MLA_PROFILE_COUNT; ++i)
+            total += mla_timings.seconds[i];
+        fprintf(stderr,
+            "VERIFY_MLA rank=%u layer=%u frontier=%llu m=%u dense=%u sparse=%u ok=%d entry_ms=%.6f prepare_qkv_ms=%.6f kv_store_ms=%.6f lowrank_ms=%.6f index_state_ms=%.6f select_ms=%.6f attention_ms=%.6f output_ms=%.6f exchange_ms=%.6f residual_ms=%.6f total_ms=%.6f\n",
+            ctx->tp_rank, il, (unsigned long long)frontier, n_tokens,
+            mla_timings.dense_rows, mla_timings.sparse_rows, ok,
+            mla_timings.seconds[MLA_PROFILE_ENTRY] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_PREPARE_QKV] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_KV_STORE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_LOWRANK] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_INDEX_STATE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_SELECT] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_ATTENTION] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_OUTPUT] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_EXCHANGE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_RESIDUAL] * 1000.0,
+            total * 1000.0);
+    }
     if (profile) fprintf(stderr,
         "VERIFY_PROFILE rank=%u layer=%u kind=%s m=%u attention_ms=%.6f ffn_ms=%.6f ok=%d frontier=%llu shared_ms=%.6f handoff_ms=%.6f\n",
         ctx->tp_rank, il, is_kda ? "kda" : "mla", n_tokens,

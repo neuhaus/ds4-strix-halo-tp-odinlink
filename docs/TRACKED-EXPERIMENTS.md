@@ -207,3 +207,12 @@ layer-profile fences remain and neither these spans nor nominal byte rates
 are hardware ceilings. Use real two-rank runs for actual route distributions;
 echo-peer fixture activations are not a model-route oracle. See
 `research/verifier-route-profile-plan-11cbed2.md` in the candidate dossier.
+
+`DS4_GLM5_VERIFY_MLA_PROFILE=1` adds completed subphase timings only inside
+target verification's scalar MLA rows. Ordinary decode, drafting and prefill
+pass no profile. It preserves operation order and adds diagnostic fences;
+the index/state bucket deliberately includes interleaved index projections.
+Exchange time includes peer waiting, not pure network latency. It uses no
+persistent storage and does not alter widths or the communication schedule.
+Compare same-build profile-off/on runs and keep instrumented timings separate.
+The plan is `research/mla-subphase-plan-ea6d855.md` in the candidate dossier.
