@@ -662,7 +662,7 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
        ${COORD_FEATURES/startup rank=0 /startup rank=1 } == "$WORKER_FEATURES" ]] || {
       echo "error: DeepSeek rank negotiation differs" >&2; exit 1;
     }
-    for field in kshard kda_tp kda_output_kslice quality kill_switch; do
+    for field in kda_tp kda_output_kslice quality kill_switch; do
       [[ " $COORD_FEATURES " == *" $field=0 "* ]] || {
         echo "error: invalid DeepSeek startup $field" >&2; exit 1;
       }
@@ -672,6 +672,20 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
     }
     COORD_NEGOTIATED=${BASH_REMATCH[1]}
     WORKER_NEGOTIATED=$COORD_NEGOTIATED
+    # DeepSeek Q4 uses the existing packed K-shard path; mixed Q2 does not.
+    # Admit either boolean only when it matches negotiated feature bit19.
+    [[ $COORD_FEATURES =~ (^|[[:space:]])kshard=([01])([[:space:]]|$) ]] || {
+      echo "error: invalid DeepSeek startup kshard" >&2; exit 1;
+    }
+    KSHARD=${BASH_REMATCH[2]}
+    (( KSHARD == ((COORD_NEGOTIATED >> 19) & 1) )) || {
+      echo "error: DeepSeek K-shard state disagrees with negotiation" >&2; exit 1;
+    }
+    if (( KSHARD )); then
+      [[ $(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") == Q4_K ]] || {
+        echo "error: DeepSeek K-shard requires Q4_K routed weights" >&2; exit 1;
+      }
+    fi
   else
   COORD_FEATURES=$(grep -E 'GLM5 TP features: kda_tp=[01] kda_output_kslice=[01]' \
     "$COORD_LOG" | tail -1 || true)
