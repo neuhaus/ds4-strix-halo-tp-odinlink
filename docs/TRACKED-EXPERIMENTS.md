@@ -216,3 +216,14 @@ Exchange time includes peer waiting, not pure network latency. It uses no
 persistent storage and does not alter widths or the communication schedule.
 Compare same-build profile-off/on runs and keep instrumented timings separate.
 The plan is `research/mla-subphase-plan-ea6d855.md` in the candidate dossier.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF=1` defers the native verifier's
+attention-output reduction until all causal MLA rows have produced heads.
+It preserves M1 output projections and scalar residuals, retains each row's
+heads and mHC split in existing batch scratch, and exchanges one row block.
+Negotiated bit44 requires native2/4/6, owned32heads and MLA/shared/FFN handoff;
+M8 refuses. A completed phase2 agreement precedes payload, including failure.
+The local `DS4_GLM5_VERIFY_MLA_ROW_SYNC=1` diagnostic retains per-row completion
+fences and requires this handoff. Both selectors default off; prefill and
+drafting retain their original schedule. No model or weight-cache change.
+See `research/mla-attn-handoff-plan-cc04c40.md` in the candidate dossier.

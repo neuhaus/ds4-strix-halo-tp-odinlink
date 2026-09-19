@@ -66,6 +66,8 @@ enum {
     DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF = UINT64_C(1) << 42,
     /* Queue resident verifier expert rows, completing before phase1 agree. */
     DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE = UINT64_C(1) << 43,
+    /* One attention-output exchange for exact native MLA rows, max M6. */
+    DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF = UINT64_C(1) << 44,
 };
 
 static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
@@ -103,6 +105,14 @@ static inline bool ds4_tp_glm5_mla_handoff_config_valid(uint64_t config) {
 static inline bool ds4_tp_glm5_ffn_queue_config_valid(uint64_t config) {
     return !(config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) ||
         (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline bool ds4_tp_glm5_mla_attn_handoff_config_valid(uint64_t config) {
+    const uint32_t rows = ds4_tp_glm5_native_rows(config);
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) ||
+        ((rows == 2u || rows == 4u || rows == 6u) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) &&
          (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
 }
 
@@ -697,6 +707,7 @@ int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
                          char *err, size_t errlen);
 /* Native verifier only. Phase0 agrees on an ordered route-table hash; phase1
  * agrees that local expert computation completed before a bulk FFN exchange.
+ * Negotiated phase2 agrees on completed MLA output rows before attention bulk.
  * The monotonic transport sequence binds this to the enclosing transaction.
  * Always send local failure; one deadline covers send and receive. */
 int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
@@ -706,6 +717,7 @@ int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
 #ifdef DS4_TP_TEST_HOOKS
 /* Socket-only control fixture: no RDMA payload capability is manufactured. */
 ds4_tp *ds4_tp_test_control_create(int fd, int rank);
+void ds4_tp_test_control_set_config(ds4_tp *tp, uint64_t config);
 ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd);
 ds4_tp *ds4_tp_test_handoff_gate_create(int control_fd, int data_fd);
 void ds4_tp_test_control_destroy(ds4_tp *tp);

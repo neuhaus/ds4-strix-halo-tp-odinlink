@@ -406,6 +406,11 @@ static int tp_hello_validate_prefill_config(uint64_t local, uint64_t peer,
         tp_set_err(err, errlen, "tp hello: FFN queue requires native width and FFN handoff");
         return 0;
     }
+    if (!ds4_tp_glm5_mla_attn_handoff_config_valid(local) ||
+        !ds4_tp_glm5_mla_attn_handoff_config_valid(peer)) {
+        tp_set_err(err, errlen, "tp hello: MLA attention handoff requires native2/4/6 and MLA/FFN handoff");
+        return 0;
+    }
     if (local == peer) return 1;
     tp_set_err(err, errlen,
                "tp hello: prefill config mismatch (local=0x%016llx peer=0x%016llx)",
@@ -3874,7 +3879,11 @@ int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
         uint64_t sequence, route_hash;
         uint32_t layer, frontier, rows, phase, failed, reserved;
     } mine = {0}, theirs = {0};
-    if (!tp || layer >= 45u || phase > 1u ||
+    if (!tp || layer >= 45u || phase > 2u ||
+        (phase == 2u && (!(tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) ||
+                        !ds4_tp_glm5_mla_attn_handoff_config_valid(tp->prefill_config) ||
+                        layer % 4u != 3u || rows > 6u ||
+                        rows > ds4_tp_glm5_native_rows(tp->prefill_config))) ||
         !ds4_tp_glm5_native_width_valid(rows) ||
         frontier > UINT32_MAX - rows) return tp_native_fail(tp, err, errlen);
     mine.sequence = sequence; mine.route_hash = route_hash;
@@ -3898,6 +3907,9 @@ ds4_tp *ds4_tp_test_control_create(int fd, int rank) {
     ds4_tp *tp = calloc(1, sizeof(*tp));
     if (tp) { tp->control_fd = fd; tp->data_fd = -1; tp->rank = rank; atomic_init(&tp->failed, false); }
     return tp;
+}
+void ds4_tp_test_control_set_config(ds4_tp *tp, uint64_t config) {
+    if (tp) tp->prefill_config = config;
 }
 ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd) {
     ds4_tp *tp = ds4_tp_test_control_create(control_fd, 0);

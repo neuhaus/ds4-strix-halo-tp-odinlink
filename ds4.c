@@ -51702,6 +51702,20 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    const char *mla_attn = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+    const bool use_mla_attn = mla_attn && strcmp(mla_attn, "1") == 0;
+    const char *mla_row_sync = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");
+    const char *mla_owned = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if ((mla_attn && strcmp(mla_attn, "0") && strcmp(mla_attn, "1")) ||
+        use_mla_attn != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_attn_handoff_config_valid(ds4_tp_prefill_config(e->tp.ctx)) ||
+        (use_mla_attn && (!mla_owned || strcmp(mla_owned, "1"))) ||
+        (mla_row_sync && strcmp(mla_row_sync, "0") && strcmp(mla_row_sync, "1")) ||
+        (mla_row_sync && !strcmp(mla_row_sync, "1") && !use_mla_attn)) {
+        fprintf(stderr, "ds4: native MLA attention handoff requires matching hello, native2/4/6, owned heads, MLA/FFN handoff and valid row-sync\n");
+        return 0;
+    }
     const char *ffn_queue = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
     const bool use_ffn_queue = ffn_queue && strcmp(ffn_queue, "1") == 0;
     if ((ffn_queue && strcmp(ffn_queue, "0") && strcmp(ffn_queue, "1")) ||
@@ -54068,6 +54082,9 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
         const char *ffn_queue = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
         if (ffn_queue && strcmp(ffn_queue, "1") == 0)
             config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE;
+        const char *mla_attn = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+        if (mla_attn && strcmp(mla_attn, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF;
     }
 #endif
     return config;

@@ -2217,8 +2217,8 @@ static int mla_sparse_prelude_rows(
 }
 
 /* Scalar MLA owns the same contiguous heads as its existing output K slice.
- * Keep batched/deferred consumers on the full-head layout. Only native Q8
- * pointer offsets change; the indexer, compact KV and collectives are shared.
+ * Prefill consumers retain full heads; the verifier's deferred tail explicitly
+ * keeps this scalar layout. Only native Q8 pointer offsets change here.
  */
 static int mla_scalar_head_layout(const ds4_glm5_next_exec_ctx *ctx,
                                   bool scalar_consumer,
@@ -2325,6 +2325,7 @@ static int mla_dense_selection_attention_impl(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t tail_slot,
                                        uint32_t pool_index,
                                        bool publish_pool,
+                                       bool defer_tail,
                                        glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_next_mla_offsets local_m = layer->mla;
@@ -2402,7 +2403,12 @@ static int mla_dense_selection_attention_impl(const ds4_glm5_next_exec_ctx *ctx,
             mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
-        mla_profile_mark(profile, MLA_PROFILE_ATTENTION) &&
+        mla_profile_mark(profile, MLA_PROFILE_ATTENTION);
+    if (defer_tail) {
+        if (ok && profile) ++profile->dense_rows;
+        return ok;
+    }
+    ok = ok &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
             ctx->tp_big_out, ctx->model_map, ctx->model_size, m->output,
             GLM5_HEADS * GLM5_HEAD_DIM,
@@ -2428,7 +2434,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t visible, uint32_t tail_slot,
                                        uint32_t pool_index, bool publish_pool) {
     return mla_dense_selection_attention_impl(ctx, il, mla, w, hc_in,
-        visible, tail_slot, pool_index, publish_pool, NULL);
+        visible, tail_slot, pool_index, publish_pool, false, NULL);
 }
 
 /* Beyond the model's 2048-row index budget, score completed pool-4 keys,
@@ -2448,6 +2454,7 @@ static int mla_sparse_selection_attention_impl(
         ds4_gpu_tensor *local_output,
         bool project_output,
         bool finish_attention,
+        bool defer_tail,
         glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_next_mla_offsets local_m = layer->mla;
@@ -2571,6 +2578,10 @@ static int mla_sparse_selection_attention_impl(
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
         mla_profile_mark(profile, MLA_PROFILE_ATTENTION);
+    if (defer_tail) {
+        if (ok && profile) ++profile->sparse_rows;
+        return ok;
+    }
     if (!project_output) return ok;
     ok = ok &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
@@ -2600,7 +2611,101 @@ static int mla_sparse_selection_attention(
         bool project_output, bool finish_attention) {
     return mla_sparse_selection_attention_impl(ctx, il, mla, w, hc_in,
         tail_slot, pool_index, publish_pool, top_k, local_output,
-        project_output, finish_attention, NULL);
+        project_output, finish_attention, false, NULL);
+}
+
+/* Keep causal attention and the M1 projection/residual arithmetic unchanged.
+ * Only the output reduction is deferred. Heads and mHC coefficients live in
+ * existing batch scratch; do not reuse the scalar row's overwritten split. */
+static int verify_mla_attention_handoff(const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il, ds4_glm5_next_mla_state *mla,
+        ds4_glm5_next_workspace *batch, ds4_glm5_next_workspace *scalar,
+        const ds4_gpu_tensor *hc_in, uint32_t frontier, uint32_t rows,
+        bool row_sync, int ok, glm5_mla_profile *profile) {
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const uint64_t head_elements = (uint64_t)(GLM5_HEADS / 2u) * GLM5_HEAD_DIM;
+    const uint64_t head_row = head_elements * sizeof(float);
+    const uint64_t out_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    char error[128] = {0};
+    for (uint32_t t = 0u; ok && t < rows; ++t) {
+        ds4_glm5_next_workspace w = *scalar;
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * hc_row, hc_row);
+        w.mla_heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
+        w.hc_split = ds4_gpu_tensor_view(batch->hc_split, t * split_row, split_row);
+        uint32_t slot = 0u, pool = 0u, visible = 0u;
+        bool publish = false;
+        ok = in && w.mla_heads && w.hc_split &&
+            ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
+        const bool dense = ok && ds4_glm5_next_mla_dense_selection_visible(
+            mla->token_count, mla->capacity_tokens, &visible);
+        /* finish_attention stays true: it selects the scalar owned32 layout.
+         * defer_tail is an independent stop point after the attention kernel. */
+        if (ok) ok = dense ? mla_dense_selection_attention_impl(ctx, il, mla,
+            &w, in, visible, slot, pool, publish, true, profile) :
+            mla_sparse_selection_attention_impl(ctx, il, mla, &w, in, slot,
+                pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K, ctx->tp_big_out,
+                true, true, true, profile);
+        if (ok && row_sync) ok = ds4_gpu_synchronize();
+        if (ok) ok = ds4_glm5_next_mla_append_commit(mla);
+        ds4_gpu_tensor_free(in);
+        ds4_gpu_tensor_free(w.mla_heads);
+        ds4_gpu_tensor_free(w.hc_split);
+    }
+    if (profile) profile->last = glm5_exec_now_sec();
+    for (uint32_t t = 0u; ok && t < rows; ++t) {
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(ctx->tp_big_out, t * out_row, out_row);
+        ok = heads && out && ds4_gpu_matmul_q8_0_kslice_tensor(out,
+            ctx->model_map, ctx->model_size, layer->mla.output,
+            GLM5_HEADS * GLM5_HEAD_DIM, ctx->tp_rank * head_elements,
+            head_elements, GLM5_WIDTH, heads, 0u);
+        ds4_gpu_tensor_free(heads);
+        ds4_gpu_tensor_free(out);
+    }
+    /* Drain even after partial enqueue failure, then agree before posting
+     * payload. Phase2 is distinct from the subsequent FFN phases0/1. */
+    const int completed = ds4_gpu_synchronize();
+    ok = completed && ok;
+    if (profile) {
+        const double now = glm5_exec_now_sec();
+        profile->seconds[MLA_PROFILE_OUTPUT] += now - profile->last;
+        profile->last = now;
+    }
+    if (!ds4_tp_verify_layer_agree(ctx->tp, *ctx->tp_sequence, il, frontier,
+            rows, 2u, 0u, ok, error, sizeof(error))) {
+        ds4_tp_mark_failed(ctx->tp);
+        fprintf(stderr, "ds4: native MLA attention agreement failed rank=%u layer=%u: %s\n",
+            ctx->tp_rank, il, error);
+        return 0;
+    }
+    ok = ok && tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, rows) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE);
+    for (uint32_t t = 0u; ok && t < rows; ++t) {
+        ds4_glm5_next_workspace w = *scalar;
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * hc_row, hc_row);
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out, t * out_row, out_row);
+        ds4_gpu_tensor *peer = ds4_gpu_tensor_view(ctx->tp_big_in, t * out_row, out_row);
+        w.hc_split = ds4_gpu_tensor_view(batch->hc_split, t * split_row, split_row);
+        w.attention = ds4_gpu_tensor_view(batch->attention, t * out_row, out_row);
+        w.after_attention = ds4_gpu_tensor_view(batch->after_attention, t * hc_row, hc_row);
+        ok = in && local && peer && w.hc_split && w.attention && w.after_attention &&
+            ds4_gpu_add_tensor(w.attention, local, peer, GLM5_WIDTH) &&
+            mla_scalar_residual(layer, &w, in);
+        ds4_gpu_tensor_free(in);
+        ds4_gpu_tensor_free(local);
+        ds4_gpu_tensor_free(peer);
+        ds4_gpu_tensor_free(w.hc_split);
+        ds4_gpu_tensor_free(w.attention);
+        ds4_gpu_tensor_free(w.after_attention);
+    }
+    ok = ok && mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (!ok) {
+        ds4_gpu_synchronize();
+        ds4_tp_mark_failed(ctx->tp);
+    }
+    return ok;
 }
 
 /* Consume one query from a previously batched sparse prelude. The selector
@@ -4731,6 +4836,22 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         (handoff_requested && (!shared_option || strcmp(shared_option, "1")))) return 0;
     const bool batch_handoff = handoff_requested && batch_shared;
     if (batch_mla && !batch_handoff) return 0;
+    const char *attn_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+    const bool attn_requested = attn_option && !strcmp(attn_option, "1");
+    const char *row_sync_option = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");
+    const bool row_sync = row_sync_option && !strcmp(row_sync_option, "1");
+    const char *owned = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if ((attn_option && strcmp(attn_option, "0") && strcmp(attn_option, "1")) ||
+        attn_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_attn_handoff_config_valid(config) ||
+        (attn_requested && (!owned || strcmp(owned, "1") || n_tokens > 6u ||
+            n_tokens > ds4_tp_glm5_native_rows(config) || (!is_kda && !batch_handoff))) ||
+        (row_sync_option && strcmp(row_sync_option, "0") && strcmp(row_sync_option, "1")) ||
+        (row_sync && !attn_requested)) {
+        fprintf(stderr, "ds4: native MLA attention handoff selector/hello/layout mismatch\n");
+        return 0;
+    }
+    const bool batch_attn = batch_mla && attn_requested;
     if (batch_shared) {
         const char *pair = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
         if (!layer->is_trunk || scalar_w->draft_only ||
@@ -4756,13 +4877,27 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     ds4_glm5_next_mla_state *mla = NULL;
     int ok = is_kda ? verify_kda_attention(&bulk, il, state, batch_w, hc_in, n_tokens) :
         ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
+    if (batch_attn) {
+        ok = verify_mla_attention_handoff(&bulk, il, mla, batch_w, scalar_w,
+            hc_in, (uint32_t)frontier, n_tokens, row_sync, ok, mla_profile);
+        if (!ok) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+        static int reported[2];
+        if (!reported[ctx->tp_rank]) {
+            fprintf(stderr, "ds4: native MLA attention handoff active rank=%u owned_heads=32 output=M1 row_sync=%u cache_bytes=0\n",
+                ctx->tp_rank, row_sync);
+            reported[ctx->tp_rank] = 1;
+        }
+    }
     /* Each layer input is already available for every verification row. Its
      * FFN does not feed the same layer's next attention row. Keep MLA append,
      * pool selection and attention arithmetic serial, then save the complete
      * residual before scalar scratch is reused by the next attention/FFN.
      * These are private replay appends; accepted-prefix publication is still
      * performed by target_verify_finish, after every layer succeeds. */
-    for (uint32_t t = 0u; ok && batch_mla && t < n_tokens; ++t) {
+    for (uint32_t t = 0u; ok && batch_mla && !batch_attn && t < n_tokens; ++t) {
         ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * row, row);
         uint32_t slot = 0u, pool = 0u, visible = 0u;
         bool publish = false;
@@ -4770,10 +4905,10 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
         const bool dense = ds4_glm5_next_mla_dense_selection_visible(
             mla->token_count, mla->capacity_tokens, &visible);
         if (ok) ok = dense ? mla_dense_selection_attention_impl(
-            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, mla_profile) :
+            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, false, mla_profile) :
             mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
                 slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
-                bulk.tp_big_out, true, true, mla_profile);
+                bulk.tp_big_out, true, true, false, mla_profile);
         if (ok) ok = ds4_gpu_tensor_copy(batch_w->after_attention, t * row,
                 scalar_w->after_attention, 0u, row) &&
             ds4_glm5_next_mla_append_commit(mla);
@@ -4840,10 +4975,10 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
             const bool dense = ds4_glm5_next_mla_dense_selection_visible(
                 mla->token_count, mla->capacity_tokens, &visible);
             if (ok) ok = dense ? mla_dense_selection_attention_impl(
-                &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, mla_profile) :
+                &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, false, mla_profile) :
                 mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
                     slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
-                    bulk.tp_big_out, true, true, mla_profile);
+                    bulk.tp_big_out, true, true, false, mla_profile);
         }
         if (profile) {
             if (ok) ok = ds4_gpu_synchronize();

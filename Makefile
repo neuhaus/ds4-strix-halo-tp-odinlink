@@ -372,7 +372,7 @@ tests/test_rocm_glm5_layer_verify.o: tests/test_rocm_glm5_layer_verify.cu tests/
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_rocm_glm5_layer_verify: tests/test_rocm_glm5_layer_verify.o ds4_glm5_next_exec.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
-	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_synchronize -Wl,--wrap=ds4_gpu_routed_moe_one_packed_q4k_tensor -o $@ $^ $(ROCM_LDLIBS)
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_synchronize -Wl,--wrap=ds4_gpu_routed_moe_one_packed_q4k_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_kslice_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_tensor -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_rocm_glm5_mhc_layer.o: tests/test_rocm_glm5_mhc_layer.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<

@@ -59,6 +59,14 @@ extern "C" {
 decltype(ds4_gpu_synchronize) __real_ds4_gpu_synchronize;
 int __wrap_ds4_gpu_synchronize() {
     const int completed=__real_ds4_gpu_synchronize();
+    if (queue_test_peer && queue_test_peer->observe_attn &&
+        (queue_test_peer->attn_outputs || queue_test_peer->attn_prepares)) {
+        ++queue_test_peer->attn_drains;
+        if (queue_test_peer->fail_attn_completion) {
+            queue_test_peer->fail_attn_completion=false;
+            return 0;
+        }
+    }
     if (queue_test_peer && queue_test_peer->handoff_pending==1) {
         queue_test_peer->handoff_fences++;
         if (queue_test_peer->fail_completion) {
@@ -67,6 +75,34 @@ int __wrap_ds4_gpu_synchronize() {
         }
     }
     return completed;
+}
+decltype(ds4_gpu_matmul_q8_0_kslice_tensor) __real_ds4_gpu_matmul_q8_0_kslice_tensor;
+int __wrap_ds4_gpu_matmul_q8_0_kslice_tensor(ds4_gpu_tensor *out,
+        const void *map, uint64_t size, uint64_t offset, uint64_t in_dim,
+        uint64_t start, uint64_t count, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t input_start) {
+    const int ok=__real_ds4_gpu_matmul_q8_0_kslice_tensor(out,map,size,offset,
+        in_dim,start,count,out_dim,x,input_start);
+    if (queue_test_peer && queue_test_peer->observe_attn &&
+        ++queue_test_peer->attn_outputs==queue_test_peer->fail_attn_output) {
+        REQUIRE(ok);
+        queue_test_peer->fail_attn_output=0;
+        return 0; // Real GPU submission happened; the caller must drain it.
+    }
+    return ok;
+}
+decltype(ds4_gpu_matmul_q8_0_tensor) __real_ds4_gpu_matmul_q8_0_tensor;
+int __wrap_ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *map,
+        uint64_t size, uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t rows) {
+    const int ok=__real_ds4_gpu_matmul_q8_0_tensor(out,map,size,offset,in_dim,out_dim,x,rows);
+    if (queue_test_peer && queue_test_peer->observe_attn && in_dim==4096 && out_dim==1536 && rows==1 &&
+        ++queue_test_peer->attn_prepares==queue_test_peer->fail_attn_prepare) {
+        REQUIRE(ok);
+        queue_test_peer->fail_attn_prepare=0;
+        return 0;
+    }
+    return ok;
 }
 decltype(ds4_gpu_routed_moe_one_packed_q4k_tensor) __real_ds4_gpu_routed_moe_one_packed_q4k_tensor;
 int __wrap_ds4_gpu_routed_moe_one_packed_q4k_tensor(

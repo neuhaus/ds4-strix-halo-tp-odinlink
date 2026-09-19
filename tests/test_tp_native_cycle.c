@@ -18,7 +18,7 @@ typedef struct {
     ds4_tp_native_cycle cycle;
     uint32_t phase, accepted, tokens[8];
     uint32_t layer_mode, layer;
-    uint64_t route_hash;
+    uint64_t route_hash, config;
     int ok, result;
     char error[128];
 } arm;
@@ -38,6 +38,8 @@ static void pair(arm *a, arm *b, int want) {
     a->tp = ds4_tp_test_control_create(sockets[0], 0);
     b->tp = ds4_tp_test_control_create(sockets[1], 1);
     CHECK(a->tp && b->tp);
+    ds4_tp_test_control_set_config(a->tp, a->config);
+    ds4_tp_test_control_set_config(b->tp, b->config);
     pthread_t peer; CHECK(pthread_create(&peer, NULL, agree, b) == 0);
     agree(a); CHECK(pthread_join(peer, NULL) == 0);
     CHECK(a->result == want && b->result == want);
@@ -108,6 +110,35 @@ static void layer_cases(void) {
         case 11: b.layer_mode=0; break;
         }
         pair(&a, &b, 0);
+    }
+    const uint64_t attn = DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF |
+        DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF | DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+    for (uint32_t rows = 2; rows <= 6; rows += 2) for (uint32_t maximum=rows; maximum<=6; maximum+=2) {
+        arm a = {.cycle=base, .phase=2, .ok=1, .layer_mode=1, .layer=3,
+            .config=ds4_tp_glm5_native_config(maximum) | attn};
+        a.cycle.rows=rows;
+        arm b=a; pair(&a,&b,1);
+    }
+    for (unsigned fault=0; fault<12; ++fault) {
+        arm a = {.cycle=base, .phase=2, .ok=1, .layer_mode=1, .layer=3,
+            .config=ds4_tp_glm5_native_config(6) | attn};
+        a.cycle.rows=6;
+        arm b=a;
+        switch (fault) {
+        case 0: a.ok=0; break;
+        case 1: b.ok=0; break;
+        case 2: b.phase=0; break;
+        case 3: b.cycle.rows=4; break;
+        case 4: ++b.cycle.prefix; break;
+        case 5: b.config &= ~DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF; break;
+        case 6: b.config=ds4_tp_glm5_native_config(2)|attn; break;
+        case 7: b.layer=4; break;
+        case 8: b.cycle.rows=8; break;
+        case 9: b.phase=3; break;
+        case 10: b.config &= ~DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF; break;
+        case 11: b.config &= ~DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF; break;
+        }
+        pair(&a,&b,0);
     }
 }
 
@@ -238,6 +269,18 @@ static void config_cases(void) {
             (width != 0 && handoff != 0));
         CHECK(!ds4_tp_test_hello_validate_prefill_config(base_config, queued, error, sizeof(error)));
         CHECK(!ds4_tp_test_hello_validate_prefill_config(queued, base_config, error, sizeof(error)));
+        ++cases;
+    }
+    for (unsigned width=0; width<=8; width+=2) for (unsigned prerequisites=0; prerequisites<4; ++prerequisites) {
+        uint64_t config=ds4_tp_glm5_native_config(width) |
+            DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF;
+        if (prerequisites&1) config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+        if (prerequisites&2) config |= DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
+        char error[128];
+        CHECK(ds4_tp_test_hello_validate_prefill_config(config,config,error,sizeof(error)) ==
+            (width>=2 && width<=6 && prerequisites==3));
+        CHECK(!ds4_tp_test_hello_validate_prefill_config(config,
+            config & ~DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF,error,sizeof(error)));
         ++cases;
     }
     for (unsigned i = 0; i < 9; ++i) {
