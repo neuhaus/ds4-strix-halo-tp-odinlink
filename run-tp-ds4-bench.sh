@@ -1508,6 +1508,23 @@ if [[ $GLM5_BF16_WMMA_HILO == 1 ||
       $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
       $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
   if [[ $MODEL_ARCH == glm5-next ]]; then
+    native_rows=0
+    native_exact=0
+    for env_kv in "${COORD_ENV[@]}"; do
+      case $env_kv in
+        DS4_GLM5_NATIVE_DRAFT=*) native_rows=${env_kv#*=} ;;
+        DS4_ROCM_GLM5_BF16_SMALL_M_EXACT=*) native_exact=${env_kv#*=} ;;
+      esac
+    done
+    native_rows_re=
+    native_workspaces=
+    case $native_rows in
+      2) native_rows_re=2; native_workspaces=2/0/0 ;;
+      4) native_rows_re='(2|4)'; native_workspaces=2/4/0 ;;
+      6) native_rows_re='(2|4|6)'; native_workspaces=2/4/6 ;;
+      8) native_rows_re='(2|4|8)'; native_workspaces=2/4/8 ;;
+    esac
+    wmma_native_proof=0
     if [[ $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 1 ||
           $GLM5_BF16_KDA_SIX_MULTIPTR == 1 ||
           $GLM5_BF16_KDA_SIX_PREFILL == 1 ]]; then
@@ -1539,13 +1556,30 @@ if [[ $GLM5_BF16_WMMA_HILO == 1 ||
         exit 1
       }
       if [[ -n $wmma_decode_re ]]; then
-        grep -Eq "$wmma_decode_re" "$wmma_log" || {
+        if ! grep -Eq "$wmma_decode_re" "$wmma_log"; then
+          # Native target verification can consume every output without an
+          # M1 tail. Prove its exact batch dispatch instead of requiring M1.
+          native_rank=0
+          [[ $wmma_log == "$WORKER_LOG" ]] && native_rank=1
+          if [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 &&
+                $GLM5_BF16_KDA_SIX_DECODE_MULTIPTR == 0 &&
+                $GLM5_BF16_KDA_SIX_MULTIPTR == 0 &&
+                $GLM5_BF16_KDA_SIX_PREFILL == 0 &&
+                $GLM5_BF16_QKV_SHARED_A_PREFILL == 0 &&
+                $native_exact == 1 && -n $native_rows_re ]] &&
+             grep -Eq "^ds4: native GLM5 config proposals=$((native_rows - 1)) hello=0x[0-9a-f]+ verifier_workspaces=$native_workspaces$" "$wmma_log" &&
+             grep -Eq "^ds4: GLM5 native KDA verifier batch engaged rank=$native_rank rows=$native_rows_re qkv=bf16-small-m-exact$" "$wmma_log"; then
+            wmma_native_proof=1
+            continue
+          fi
           echo "error: GLM5 BF16 decode QKV multiptr engagement proof failed in $wmma_log" >&2
           exit 1
-        }
+        fi
       fi
     done
-    if [[ -n $wmma_decode_re ]]; then
+    if (( wmma_native_proof == 1 )); then
+      echo "validated_glm5_bf16_wmma_hilo=both-ranks,scalar-or-native-exact-engaged,hard-failure:0"
+    elif [[ -n $wmma_decode_re ]]; then
       echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-decode-multiptr-engaged,hard-failure:0"
     else
       echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"

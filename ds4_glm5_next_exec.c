@@ -4614,8 +4614,15 @@ static int verify_kda_attention(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
             !ds4_gpu_tensor_copy(w->attention, base + (1u - ctx->tp_rank) * half_row,
                 ctx->tp_big_in, t * half_row, half_row)) return 0;
     }
-    return ds4_gpu_hc_expand_split_tensor(w->after_attention, w->attention,
+    const int ok = ds4_gpu_hc_expand_split_tensor(w->after_attention, w->attention,
         hc_in, w->hc_split, GLM5_WIDTH, GLM5_HC);
+    static uint32_t reported_rows[2];
+    if (ok && !(reported_rows[ctx->tp_rank] & (1u << n_tokens))) {
+        reported_rows[ctx->tp_rank] |= 1u << n_tokens;
+        fprintf(stderr, "ds4: GLM5 native KDA verifier batch engaged rank=%u rows=%u qkv=bf16-small-m-exact\n",
+            ctx->tp_rank, n_tokens);
+    }
+    return ok;
 }
 
 static int verify_dense_ffn(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,

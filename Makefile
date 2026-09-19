@@ -105,6 +105,7 @@ test-quality-gates:
 	./tests/run-clean-gate-python.sh tests/test_baseline_control_journal.py
 	python3 tests/test_control_anchor_env.py
 	./tests/test_glm5_prefill_proof.sh
+	python3 tests/test_glm5_decode_engagement.py
 	./tests/test_bench_producer_identity.sh
 	./tests/test_tp_worker_supervisor.sh
 
