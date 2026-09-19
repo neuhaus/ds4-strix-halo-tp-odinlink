@@ -91,12 +91,12 @@ sampling-mode correction is documented at
 optimization record is at
 `$DS4_RESEARCH_ROOT/glm5-next-tp2/staged-optimization-plan-20260901.md`.
 
-The ordinary benchmark and deployment launchers enable the validated ordered
-ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
-projection, cooperative HC decode stage, exact long-context indexer top-k, and
-RoCE prefill wavefront automatically. The wavefront provider-gates itself off
-on OdinLink. DSpark stays opt-in and does not inherit that target-only
-schedule.
+The ordinary benchmark and deployment launchers use synchronous ROCm TP gates
+with the pinned SDK. DeepSeek also enables the temporal-compressor schedule,
+shape-gated M256/K128 Q8 projection, cooperative HC decode stage, exact
+long-context indexer top-k, and RoCE prefill wavefront. The wavefront
+provider-gates itself off on OdinLink. DSpark stays opt-in and does not inherit
+that target-only schedule.
 
 The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory
