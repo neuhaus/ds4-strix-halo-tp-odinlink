@@ -79,8 +79,8 @@ use the Antirez reference model listed below. The Antirez Q4_K model does not
 fit one 128 GB node; TP=2 keeps one expert shard on each node. Q2_K
 and Q4_K run without a persistent expanded-weight cache.
 
-The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
-release results.
+These release measurements use ROCm 7.14. The build now pins ROCm Core SDK
+10.0.0; its performance measurements are pending validation.
 
 GLM-5.3 Flash support uses a staged TP=2 path that keeps the model's KDA state
 sharded by attention head and does not change the validated DeepSeek production
@@ -121,26 +121,26 @@ Both nodes need ROCm support for `gfx1151`, passwordless SSH from the
 coordinator to the worker, and their own local copy of the same repository
 commit and GGUF at the same absolute paths. Their filesystems are not shared.
 
-Follow [DS4 on Strix Halo](STRIXHALO.md) for the Ubuntu 26.04 ROCm 7.14
+Follow [DS4 on Strix Halo](STRIXHALO.md) for the Ubuntu 26.04 ROCm 10.0.0
 tarball, rocWMMA header isolation, memory-layout decision, Secure Boot check,
 and coordinator-to-worker SSH setup. Ubuntu 26.04 apt currently supplies ROCm
-7.1; it is not a substitute for the validated 7.14 bundle.
+7.1; it is not a substitute for the pinned 10.0.0 bundle.
 
 Build on both nodes:
 
 ```sh
 git clone https://github.com/wkljohn/ds4-strix-halo-tp-odinlink.git
 cd ds4-strix-halo-tp-odinlink
-HIP_PATH=/absolute/path/to/rocm-7.14.0 \
-CPATH=/absolute/path/to/rocm-7.14.0/include \
-CPLUS_INCLUDE_PATH=/absolute/path/to/rocm-7.14.0/include \
-DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
+HIP_PATH=/absolute/path/to/rocm-10.0.0 \
+CPATH=/absolute/path/to/rocm-10.0.0/include \
+CPLUS_INCLUDE_PATH=/absolute/path/to/rocm-10.0.0/include \
+DS4_ROCM_HOME=/absolute/path/to/rocm-10.0.0 \
   make -j"$(nproc)" strix-halo
 ```
 
-`DS4_ROCM_HOME` must name the ROCm 7.14 installation root containing
-`bin/hipcc`; setting it explicitly prevents an older `/opt/rocm` installation
-from being selected accidentally.
+`DS4_ROCM_HOME` must name the ROCm 10.0.0 installation root containing
+`bin/hipcc`. The build verifies the SDK, compiler and core library checksums
+against [the toolchain pin](scripts/rocm-toolchain.lock.json).
 
 Create the benchmark configuration on node 1:
 

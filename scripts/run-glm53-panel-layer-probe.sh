@@ -22,8 +22,12 @@ git -C "$repo" archive HEAD tests/test_rocm_glm5_activation_panel.cu \
 cd "$artifact"
 git -C "$repo" rev-parse HEAD > TEST-SOURCE
 cp "$engine/BUILD-SOURCE" ENGINE-SOURCE
-hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-7.14.0-gfx1151/install}
+hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-10.0.0-gfx1151/install}
 "$hip/bin/hipcc" --version > compiler.txt
+if ! cmp -s compiler.txt "$engine/compiler.txt"; then
+    echo "error: probe toolchain differs from frozen engine; set DS4_ROCM_HOME to its compiler" >&2
+    exit 1
+fi
 compile=(-O3 -fno-fast-math -ffp-contract=off --offload-arch=gfx1151
          -mno-wavefrontsize64 -I. -c tests/test_rocm_glm5_activation_panel.cu -o test.o)
 objects=("$engine/ds4_rocm.o" "$engine/ds4_rocm_compat.o"

@@ -6,20 +6,36 @@ ROCm and build setup on both tensor-parallel nodes.
 
 ## 1. Install one ROCm toolchain
 
-Ubuntu 26.04's ROCm packages provide ROCm 7.1, not the ROCm 7.14 toolchain
-validated by this branch. Install the gfx1151 TheRock bundle separately. The
-bundle used for the current deployment is:
+Ubuntu 26.04's ROCm packages provide ROCm 7.1. This branch pins the complete
+gfx1151 ROCm Core SDK 10.0.0 bundle separately:
 
 ```text
-https://rocm.prereleases.amd.com/tarball-multi-arch/therock-dist-linux-gfx1151-7.14.0rc3.tar.gz
+https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.0.0.tar.gz
 ```
 
-Extract it as `/opt/rocm-7.14.0` and verify the resulting root before building:
+Download and verify the exact archive before extracting it to a new directory.
+Keep the previous installation available for matched comparisons:
 
 ```sh
-test -x /opt/rocm-7.14.0/bin/hipcc
-/opt/rocm-7.14.0/bin/hipcc --version
+source scripts/ds4-research-root.sh
+ds4_resolve_research_roots "$PWD"
+mkdir -p "$DS4_RESEARCH_ROOT/downloads"
+archive="$DS4_RESEARCH_ROOT/downloads/therock-dist-linux-gfx1151-10.0.0.tar.gz"
+curl --fail --location --output "$archive" \
+  https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.0.0.tar.gz
+printf '4feabd9f2da72352df37f6d714a54847d3fe913c0341fbe2a6542c1164024baf  %s\n' "$archive" | sha256sum -c -
+sudo mkdir /opt/rocm-10.0.0
+sudo tar -xzf "$archive" --no-same-owner -C /opt/rocm-10.0.0
+DS4_ROCM_HOME=/opt/rocm-10.0.0 make check-rocm-strix
 ```
+
+Preserve the full directory, including `.kpack`. This SDK's `.info/version`
+is `10.0.0`, while `hipcc --version` reports HIP `7.15.26333-0000000` and LLVM
+23. Those are the actual components shipped in the pinned SDK; their versions
+are independent. The build checks the source-versioned
+[release pin](scripts/rocm-toolchain.lock.json), including the component hashes.
+`DS4_ALLOW_ROCM_MISMATCH=1` permits explicitly labeled diagnostic comparisons;
+it does not qualify a different toolchain as the release pin.
 
 Install the host-side build dependencies, but do **not** install Ubuntu's
 `librocwmma-dev` alongside the bundle:
@@ -37,16 +53,17 @@ the build then fails at `internal/accessors.hpp`. Do not combine Ubuntu's
 rocWMMA headers, a manually copied `/usr/local/include/rocwmma`, and TheRock.
 Removing the foreign header packages/copies is the preferred repair. If a
 managed machine cannot remove them, its build wrapper must put
-`-isystem /opt/rocm-7.14.0/include` before all system include paths.
+`-isystem /opt/rocm-10.0.0/include` before all system include paths. The Makefile
+already places the selected SDK's include directory first.
 
 Do not create `/opt/rocm` symlinks to `/usr`. Select the complete installation
 explicitly:
 
 ```sh
-HIP_PATH=/opt/rocm-7.14.0 \
-CPATH=/opt/rocm-7.14.0/include \
-CPLUS_INCLUDE_PATH=/opt/rocm-7.14.0/include \
-DS4_ROCM_HOME=/opt/rocm-7.14.0 \
+HIP_PATH=/opt/rocm-10.0.0 \
+CPATH=/opt/rocm-10.0.0/include \
+CPLUS_INCLUDE_PATH=/opt/rocm-10.0.0/include \
+DS4_ROCM_HOME=/opt/rocm-10.0.0 \
   make -j"$(nproc)" strix-halo
 ```
 
@@ -66,7 +83,7 @@ sudo usermod -aG render,video "$USER"
 Log out and back in, or reboot. Verify:
 
 ```sh
-/opt/rocm-7.14.0/bin/rocminfo | grep -A80 'Name:                    gfx1151'
+/opt/rocm-10.0.0/bin/rocminfo | grep -A80 'Name:                    gfx1151'
 ```
 
 If DS4 says `no ROCm-capable device is detected`, check that `rocminfo` can

@@ -13,7 +13,7 @@ git -C "$repo" diff --quiet
 git -C "$repo" diff --cached --quiet
 artifact=$DS4_RESEARCH_ROOT/builds/glm53-activation-panel-${revision:0:7}-r$repeat
 if [[ $math == production ]]; then artifact+=-production; fi
-hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-7.14.0-gfx1151/install}
+hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-10.0.0-gfx1151/install}
 [[ ! -e $artifact && -x $hip/bin/hipcc ]]
 mkdir -p "$artifact"
 git -C "$repo" archive "$revision" \

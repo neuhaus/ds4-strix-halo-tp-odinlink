@@ -6,7 +6,8 @@ source "$repo/scripts/ds4-research-root.sh"
 ds4_resolve_research_roots "$repo"
 revision=$(git -C "$repo" rev-parse HEAD)
 artifact=$DS4_RESEARCH_ROOT/builds/glm53-full-${revision:0:7}
-hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-7.14.0-gfx1151/install}
+hip=${DS4_ROCM_HOME:-/home/wkljohn/Desktop/cc/toolchains/rocm-10.0.0-gfx1151/install}
+python3 "$repo/scripts/check-rocm-toolchain.py" --home "$hip" --hipcc "$hip/bin/hipcc"
 git -C "$repo" diff --quiet
 git -C "$repo" diff --cached --quiet
 [[ ! -e $artifact && -x $hip/bin/hipcc ]]

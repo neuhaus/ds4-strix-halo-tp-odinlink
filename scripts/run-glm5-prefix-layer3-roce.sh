@@ -1074,9 +1074,9 @@ if [[ -n $TEXT_PROMPT ]]; then
 fi
 local_command=("$BINARY")
 if [[ $ROCPROF_RANK == leader ]]; then
-  ROCPROF=$REPO/../toolchains/rocm-7.14.0-gfx1151/install/bin/rocprofv3
+  ROCPROF=$REPO/../toolchains/rocm-10.0.0-gfx1151/install/bin/rocprofv3
   [[ -x $ROCPROF ]] || {
-    echo "error: missing source-pinned ROCm 7.14 rocprofv3: $ROCPROF" >&2
+    echo "error: missing source-pinned ROCm 10.0.0 rocprofv3: $ROCPROF" >&2
     exit 1
   }
   mkdir "$OUT/rocprof-leader"

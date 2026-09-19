@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "sdk_version": "10.0.0",
+  "architecture": "gfx1151",
+  "url": "https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.0.0.tar.gz",
+  "archive_bytes": 1794376103,
+  "archive_sha256": "4feabd9f2da72352df37f6d714a54847d3fe913c0341fbe2a6542c1164024baf",
+  "hip_version": "7.15.26333-0000000",
+  "component_sha256": {
+    "share/therock/therock_manifest.json": "c18fc0569ab1c7317b787392de7e844d688c39e30ac065c16039173cdd4ceadb",
+    "include/rocwmma/rocwmma.hpp": "9e677443ebd05b941a18f27f9b7ebe919d20fa8b9266de17fcd3923ee5bddb32",
+    "bin/hipcc": "d92839ed940e685fd15b8c60744d9f30efa65102e49e0babd655045219be371d",
+    "lib/llvm/bin/clang": "b552c9fa9e9158688cd4944a4aa899dfedc7426b700097ef9338f4476dc6f6f6",
+    "lib/libamdhip64.so": "4ac6ac420d354e279b68c18bc426ab336ccf6d72834d2ea4e915d93cf269c646",
+    "lib/libhipblas.so": "3c681b75fb68ae17b55f816e0fc60a92e37a8c463ad5b6deb0b1e93883731013",
+    "lib/libhipblaslt.so": "4f418b996f01273b4e3a22ea9e7d97f9cf9b47e4a21ca6ad0c5253ce8aa1112b",
+    "lib/librocblas.so": "cbdb217646a3f1acc99780482c4c8841322df21d82576b5df2a71c448f2573a8",
+    "lib/libhsa-runtime64.so": "d38e16355591048c387b10ffca9b643947e9e6f878941305a057401c41ade626"
+  }
+}

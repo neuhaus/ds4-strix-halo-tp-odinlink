@@ -53,13 +53,13 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda_schedule.o ds4_glm5_next_runtime.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 # Resolve the ROCm toolchain once.  A gfx1151 build must not silently pick an
-# older `hipcc` from PATH when the validated 7.14 toolchain is available.
+# older `hipcc` from PATH when the pinned SDK 10.0.0 toolchain is available.
 # DS4_ROCM_HOME is the explicit override; ROCM_HOME remains accepted for
 # compatibility with existing build scripts.
 DS4_ROCM_HOME_REQUESTED := $(strip $(or $(DS4_ROCM_HOME),$(ROCM_HOME)))
 DS4_ROCM_HOME_AUTO := $(firstword $(foreach p,\
-    $(abspath $(CURDIR)/../toolchains/rocm-7.14.0-gfx1151/install) \
-    /opt/rocm-7.14.0 /opt/rocm,\
+    $(abspath $(CURDIR)/../toolchains/rocm-10.0.0-gfx1151/install) \
+    /opt/rocm-10.0.0 /opt/rocm,\
     $(if $(wildcard $(p)/bin/hipcc),$(p))))
 ifneq ($(DS4_ROCM_HOME_REQUESTED),)
 ROCM_HOME ?= $(DS4_ROCM_HOME_REQUESTED)
@@ -79,6 +79,8 @@ ifeq ($(ROCM_ARCH),gfx1151)
 ROCM_CFLAGS += -mno-wavefrontsize64 -DDS4_GFX1151_WAVE32=1
 endif
 ROCM_CFLAGS += $(DS4_PROFILE_CFLAGS)
+# Keep SDK headers ahead of unrelated distro rocWMMA installations.
+ROCM_CFLAGS += -isystem $(ROCM_HOME)/include
 ROCM_PRECISE_CFLAGS = $(filter-out -ffast-math,$(ROCM_CFLAGS)) -fno-fast-math -ffp-contract=off
 ROCM_LDLIBS ?= -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
@@ -89,6 +91,7 @@ endif
 .PHONY: all help clean test test-quality-gates test-successor-quality-test test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
+	python3 tests/test_rocm_toolchain.py
 	bash tests/test_quality_env.sh
 	python3 tests/test_glm5_tp_layout.py
 	./tests/test_baseline_genesis.sh
@@ -1023,23 +1026,7 @@ check-rocm-strix:
 		echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH)"; \
 		exit 0; \
 	fi; \
-	if [ ! -x "$(HIPCC)" ]; then \
-		echo "error: gfx1151 requires executable hipcc at $(HIPCC)" >&2; \
-		echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 (or HIPCC=...)" >&2; \
-		exit 2; \
-	fi; \
-	version=$$("$(HIPCC)" --version 2>/dev/null | sed -n -e 's/^HIP version: \([0-9][0-9.]*\).*/\1/p' -e 's/.*release version \([0-9][0-9.]*\).*/\1/p' | head -n 1); \
-	[ -n "$$version" ] || version=unknown; \
-	echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH) version=$$version"; \
-	if [ "$$version" = unknown ] || [ "$$(printf '%s\n' 7.14.0 "$$version" | sort -V | head -n 1)" != 7.14.0 ]; then \
-		if [ "$${DS4_ALLOW_ROCM_MISMATCH:-0}" = 1 ]; then \
-			echo "warning: gfx1151 build is using ROCm $$version; expected >= 7.14.0 (override acknowledged)" >&2; \
-		else \
-			echo "error: gfx1151 requires ROCm >= 7.14.0, detected $$version" >&2; \
-			echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 or DS4_ALLOW_ROCM_MISMATCH=1 for diagnostics" >&2; \
-			exit 2; \
-		fi; \
-	fi
+	python3 scripts/check-rocm-toolchain.py --home "$(ROCM_HOME)" --hipcc "$(HIPCC_PATH)"
 
 strix-halo: check-rocm-strix
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent \
