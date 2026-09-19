@@ -7,7 +7,7 @@ and exposes DS4 only on
 public hostname.
 
 ```sh
-DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
+DS4_ROCM_HOME=/absolute/path/to/rocm-10.0.0 \
   make -j"$(nproc)" strix-halo
 cp deploy/config.env.example deploy/config.env.local
 sed -i "s/^DS4_SERVER_SHA256=.*/DS4_SERVER_SHA256=$(sha256sum ./ds4-server | awk '{print $1}')/" \
@@ -17,10 +17,19 @@ deploy/ds4-tp-caddy.sh start
 deploy/ds4-tp-caddy.sh status
 ```
 
-`DS4_ROCM_HOME` must name the ROCm 7.14 installation root containing
-`bin/hipcc`. The `sed` command pins the final `ds4-server` build in
+`DS4_ROCM_HOME` must name the pinned ROCm Core SDK 10.0.0 installation root
+containing `bin/hipcc`. The build verifies it against
+`scripts/rocm-toolchain.lock.json`; use the same frozen binaries and SDK on
+both nodes. The retained ROCm 7.14 container recipe below does not provide
+this SDK 10 deployment. The `sed` command pins the final `ds4-server` build in
 `config.env.local`. Startup fails closed if that pin does not match, so a stale
 coordinator cannot use a different TP gate schedule from the worker.
+
+For an existing installation, retain its local config instead of copying the
+example over it. Keep Caddy's hostname, TLS and authentication configuration,
+the client API key, and the `127.0.0.1:8090` upstream. Updating the backend's
+binary paths and hash pin requires no DNS, firewall, or client endpoint change.
+An alternative config can be selected with `DS4_DEPLOY_CONFIG=/absolute/path/to/config.env`.
 
 Run the launcher on the coordinator. It opens an SSH session from the
 coordinator to `PEER_MGMT`; install that coordinator user's public key on the
@@ -40,11 +49,16 @@ inspects routed-expert quantization and selects the same safe Q4_K or Q2
 prefill defaults enforced by the pre-main benchmark gate. Set
 `DSPARK=1` only for experimental testing; the launcher warns because the
 current TP verifier does not match the target-only token fingerprint.
-Ordinary Q4_K/Q2_K launches also select the validated ordered ROCm TP callback
-and temporal-compressor schedule, the RoCE prefill wavefront, and the
+Ordinary DeepSeek Q4_K/Q2_K launches select synchronous ROCm TP gates
+(`DS4_TP_HOST_CALLBACK=0`), the temporal compressor, the RoCE prefill wavefront, and the
 shape-gated M256/K128 Q8 projection, exact cooperative HC decode stage, and
 the exact long-context indexer radix tree. The wavefront provider-gates itself
 off for OdinLink, and the radix tree engages only after 8,192 compressed rows.
+GLM ordinary mode also uses synchronous gates, but disables the temporal
+compressor and compact top-two sampling (`DS4_ROCM_TEMPORAL_COMPRESSOR=0`,
+`DS4_TP_GREEDY_TOP2=0`). See the [GLM deployment settings](../README.md#glm-53-deployment)
+for its model-specific context and prefill configuration. The SDK migration's
+quality acceptance remains pending as recorded in the [performance table](../README.md).
 Set `PREFILL_FFN_WAVEFRONT=0`, `Q8_M256_K128=0`,
 `HC_STAGE_EXACT_COOP=0`, or `INDEXER_TOPK_RADIX_TREE=0` in the deployment
 config for a symmetric rollback; no extra shell environment is required.
@@ -106,9 +120,11 @@ podman image inspect --format '{{.Id}} {{.Digest}} {{join .RepoDigests " "}}' \
   localhost/ds4-rocm714-rdma:local
 ```
 
-The supplied Containerfile pins the ROCm 7.14/gfx1151 base-image digest and
+The retained Containerfile pins the ROCm 7.14/gfx1151 base-image digest and
 installs matching, version-pinned Ubuntu `libibverbs` providers and inspection
-utilities. Do not bind-mount provider libraries from the host: a host/container
+utilities. It is a legacy deployment option, not the validated SDK 10 runtime;
+do not run the SDK 10 binaries in it or cite the SDK 10 measurements for it.
+Do not bind-mount provider libraries from the host: a host/container
 ABI mismatch makes verbs discovery fail and may not be caught until after the
 large model has loaded.
 
