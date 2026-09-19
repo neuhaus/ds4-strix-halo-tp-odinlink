@@ -120,12 +120,14 @@ os.execv('/usr/bin/grep', ['grep', *sys.argv[1:]])
 rank = 0 if 'score_official' in sys.argv[0] else 1
 if os.environ.get('DS4_TEST_NEGOTIATION') != 'missing':
     kshard = os.environ.get('DS4_TEST_KSHARD', '0')
-    mask = '0x000f80c9' if kshard == '1' else '0x000780c9'
+    mask = '0x000f8089' if kshard == '1' else '0x000780c9'
     if os.environ.get('DS4_TEST_NEGOTIATION') == 'wrong-kshard-bit':
         mask = '0x000780c9'
     if rank == 1 and os.environ.get('DS4_TEST_NEGOTIATION') == 'mismatch':
         mask = '0x000780c8'
-    print(f'ds4: ROCm Q4_K WMMA startup rank={rank} negotiated={mask} gate=1 up=1 down=1 kshard={kshard} kda_tp=0 kda_output_kslice=0 quality=0 kill_switch=0', flush=True)
+    details = 'sorted_min_tokens=32 gate_up_threshold=6 down_threshold=1 fused_active=1 iq2_i8=0 ' if kshard == '1' else ''
+    pair = 'pair_active=1 ' if kshard == '1' else ''
+    print(f'ds4: ROCm Q4_K WMMA startup rank={rank} negotiated={mask} gate=1 up=1 down=1 kshard={kshard} kda_tp=0 kda_output_kslice=0 {details}quality=0 {pair}kill_switch=0', flush=True)
 if os.environ.get('DS4_TEST_TRANSPORT') != 'no-gid':
     print('rdma GID index 3 (RoCE v2)', flush=True)
 cache = 1 if os.environ.get('DS4_TEST_TRANSPORT') == 'cache' else 0
@@ -191,14 +193,15 @@ raise SystemExit(int(os.environ.get('DS4_TEST_COORD_RC', '0')))
         self.assertEqual(result.returncode, 0, result.stderr)
         meta = dict(line.split('=', 1) for line in (directory / 'manifest').read_text().splitlines())
         self.assertIn('kshard=1', meta['coordinator_features'])
-        self.assertIn('negotiated=0x000f80c9', meta['worker_features'])
+        self.assertIn('negotiated=0x000f8089', meta['worker_features'])
         terminal_proof(self.out / 'fixture.tsv', meta, required=True)
 
     def test_deepseek_teacher_refuses_invalid_kshard(self):
-        cases = (('HYBRID_Q2', ('DS4_TEST_KSHARD=1',)),
-                 ('Q4_K', ('DS4_TEST_KSHARD=2',)),
-                 ('Q4_K', ('DS4_TEST_KSHARD=1', 'DS4_TEST_NEGOTIATION=wrong-kshard-bit')))
-        for family, settings in cases:
+        cases = (('HYBRID_Q2', ('DS4_TEST_KSHARD=1',), 'requires Q4_K routed weights'),
+                 ('Q4_K', ('DS4_TEST_KSHARD=2',), 'invalid DeepSeek startup kshard'),
+                 ('Q4_K', ('DS4_TEST_KSHARD=1', 'DS4_TEST_NEGOTIATION=wrong-kshard-bit'),
+                  'disagrees with negotiation'))
+        for family, settings, reason in cases:
             with self.subTest(family=family, settings=settings):
                 fixture = QualityCompletion(methodName='runTest')
                 fixture.setUp()
@@ -206,9 +209,18 @@ raise SystemExit(int(os.environ.get('DS4_TEST_COORD_RC', '0')))
                     directory = fixture.teacher_fixture(routed_family=family)
                     result = fixture.run_launcher(*settings)
                     self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(reason, result.stderr)
                     self.assertFalse((directory / 'manifest').exists())
                 finally:
                     fixture.doCleanups()
+
+    def test_deepseek_q4_teacher_can_explicitly_disable_ksharding(self):
+        # The engine supports this control. Comparisons still require equal
+        # effective controls and negotiated features between both captures.
+        directory = self.teacher_fixture(routed_family='Q4_K')
+        result = self.run_launcher('DS4_ROCM_DISABLE_Q4K_KSHARD=1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('kshard=0', (directory / 'manifest').read_text())
 
     def test_teacher_scores_the_hashed_fixture_from_foreign_cwd(self):
         directory = self.teacher_fixture()
