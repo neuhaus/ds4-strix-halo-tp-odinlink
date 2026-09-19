@@ -27,6 +27,7 @@ from ds4_gate_controls import (  # noqa: E402
     candidate_scope,
     candidate_values,
     evaluate_calibration,
+    event_sequences,
     governance_mutation,
     journal_entries,
     register_control,
@@ -2552,12 +2553,34 @@ def baseline_authority_sequence(root: Path, baseline_id: str) -> int:
 
 
 def reject_open_scope_candidates(root: Path, scope_sha256: str) -> None:
+    initialized = event_sequences(root, "candidate-init", "candidate_id")
+    finished = (event_sequences(root, "candidate-close", "candidate_id").keys() |
+                event_sequences(root, "candidate-promote", "candidate_id").keys())
+    for identity in initialized.keys() - finished:
+        if (not ID_RE.fullmatch(identity) or
+                not (root / "candidates" / identity / "candidate.json").is_file()):
+            raise GateError(
+                "performance policy amendment cannot audit initialized open "
+                f"candidate {identity!r}: missing dossier or invalid identity")
     for dossier, candidate in candidate_values(root):
-        if not candidate_is_open(dossier):
+        identities = {dossier.name, str(candidate.get("candidate_id", ""))}
+        registered = identities & initialized.keys()
+        if registered and candidate.get("candidate_id") != dossier.name:
+            raise GateError(
+                "performance policy amendment cannot audit conflicting "
+                f"candidate identities in dossier {dossier.name!r}")
+        if ((registered and registered <= finished) or
+                (not registered and not candidate_is_open(dossier))):
             continue
         scope = candidate_scope(root, candidate)
         unassigned = candidate.get("baseline_id") in {None, ""}
-        if scope == scope_sha256 or unassigned:
+        # Pre-policy research notes have neither a frozen intent nor an
+        # initialization event. They cannot observe a formal timing sequence
+        # and must not force unrelated, durable tracks to be closed.
+        if unassigned and "promotion_intent" not in candidate and not registered:
+            continue
+        if (scope == scope_sha256 or unassigned or
+                (scope is None and (registered or "promotion_intent" in candidate))):
             raise GateError(
                 f"performance policy amendment cannot observe open candidate "
                 f"{candidate.get('candidate_id')!r}; close it and initialize a "
@@ -2819,6 +2842,11 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
         if candidate_dump.get("model") != candidate_model["path"]:
             raise GateError("candidate teacher logits came from a different model path")
     candidate_identity = read_manifest(candidate_manifest)
+    for field, producer in (
+            ("quality_launcher_sha256", repo / "run-tp-quality-score.sh"),
+            ("worker_supervisor_sha256", repo / "scripts/tp-worker-supervisor.sh")):
+        if candidate_identity.get(field) != sha256(producer):
+            raise GateError(f"quality candidate {field} differs from the active verifier")
     if (candidate_identity.get("model") != candidate_model["path"] or
             candidate_identity.get("model_size") != str(candidate_model["size"]) or
             candidate_identity.get("model_sample_sha256") != candidate_model["sample_sha256"] or
@@ -2875,6 +2903,7 @@ def verify_quality_evidence(repo: Path, root: Path, summary_path: Path,
         recomputed = rerun_json_tool([
             sys.executable, str(repo / "scripts" / "compare-quality-scores.py"),
             str(reference), str(candidate), "--thresholds", str(threshold),
+            "--require-candidate-status",
         ], "quality score")
     ignored = {"thresholds_sha256"}
     if {key: value for key, value in recorded.items() if key not in ignored} != {

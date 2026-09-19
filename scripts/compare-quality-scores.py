@@ -8,6 +8,8 @@ import csv
 import hashlib
 import json
 import math
+import re
+import shlex
 import statistics
 import sys
 from pathlib import Path
@@ -44,11 +46,58 @@ def manifest_for(path: Path) -> Path:
     return path.with_suffix(".manifest")
 
 
-def validate_pair(reference: Path, candidate: Path) -> None:
+def terminal_proof(path: Path, metadata: dict[str, str], required: bool = False) -> None:
+    """Reopen process evidence; old immutable references have no such claim."""
+    if not metadata.get("completion_schema") and not required:
+        return
+    if metadata.get("completion_schema") != "quality-terminal-v1":
+        raise ValueError(f"{path}: quality terminal proof is missing or unsupported")
+    tag = metadata.get("tag", "")
+    run_id = metadata.get("run_id", "")
+    if tag != path.stem or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+        raise ValueError(f"{path}: invalid quality completion tag")
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", run_id):
+        raise ValueError(f"{path}: invalid quality completion run ID")
+    for field in ("worker_supervisor_sha256", "quality_launcher_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", metadata.get(field, "")):
+            raise ValueError(f"{path}: missing completion producer identity {field}")
+    for name, expected in {
+        "scores": path,
+        **{f"{rank}_{kind}": path.parent / f"{rank}-{tag}.{suffix}"
+           for rank in ("coordinator", "worker")
+           for kind, suffix in (("status", "status"), ("log", "log"))},
+    }.items():
+        recorded = Path(metadata.get(name + "_path", ""))
+        if (not recorded.is_absolute() or recorded.resolve() != expected.resolve() or
+                expected.is_symlink() or not expected.is_file() or
+                sha256(expected) != metadata.get(name + "_sha256")):
+            raise ValueError(f"{path}: quality completion artifact mismatch: {name}")
+        if name.endswith("_status") and expected.read_bytes() != b"exit_code=0\nsignal=0\n":
+            raise ValueError(f"{path}: unsuccessful quality terminal status: {name}")
+        if name.endswith("_log"):
+            identities = [line for line in expected.read_bytes().split(b"\n")
+                          if line.startswith(b"ds4-tp: benchmark run_id=")]
+            if identities != [f"ds4-tp: benchmark run_id={run_id}".encode()]:
+                raise ValueError(f"{path}: missing or mixed quality run identity: {name}")
+    for rank in ("coordinator", "worker"):
+        assignments = shlex.split(metadata.get(rank + "_env", ""))
+        if [item for item in assignments if item.startswith("DS4_BENCH_RUN_ID=")] != [
+                "DS4_BENCH_RUN_ID=" + run_id]:
+            raise ValueError(f"{path}: quality run ID differs from {rank} environment")
+
+
+def validate_pair(reference: Path, candidate: Path,
+                  require_candidate_status: bool = False) -> None:
     manifests = []
     for path in (reference, candidate):
-        metadata = dict(line.split("=", 1) for line in
-                        manifest_for(path).read_text().splitlines() if "=" in line)
+        fields = [line.split("=", 1) for line in
+                  manifest_for(path).read_text().splitlines() if "=" in line]
+        metadata = dict(fields)
+        if len(metadata) != len(fields):
+            keys = [key for key, _ in fields]
+            duplicates = sorted(key for key in metadata if keys.count(key) > 1)
+            raise ValueError(f"{path}: duplicate quality manifest keys: {', '.join(duplicates)}")
+        terminal_proof(path, metadata, required=require_candidate_status and path == candidate)
         manifests.append(metadata)
     for key in ("model_size", "model_sample_sha256", "quality_input_sha256"):
         if not manifests[0].get(key) or manifests[0][key] != manifests[1].get(key):
@@ -153,12 +202,14 @@ def main() -> int:
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--thresholds", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--require-candidate-status", action="store_true",
+                        help="require both clean rank exits for new promotion evidence")
     args = parser.parse_args()
     try:
         thresholds = load_thresholds(args.thresholds)
         reference = load_rows(args.reference)
         candidate = load_rows(args.candidate)
-        validate_pair(args.reference, args.candidate)
+        validate_pair(args.reference, args.candidate, args.require_candidate_status)
         if [row["id"] for row in reference] != [row["id"] for row in candidate]:
             raise ValueError("reference and candidate case ids/order differ")
         if len({row["id"] for row in reference}) != len(reference):

@@ -52,7 +52,120 @@ enum {
     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
     /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
     DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
+    /* 0=disabled, 1/2/3 encode native GLM5 target widths 2/4/8; see bit41 for 6. */
+    DS4_TP_CONFIG_GLM5_NATIVE_SHIFT = 37,
+    /* Explicit receive-ready rendezvous for the mlx5 bulk RC channel. */
+    DS4_TP_CONFIG_BULK_RECV_READY = UINT64_C(1) << 39,
+    /* Exact native KDA routed verification with one FFN handoff per layer. */
+    DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF = UINT64_C(1) << 40,
+    /* Width six has its own canonical encoding: legacy width bits must be
+     * zero. Bits39/40 already select independent transport behavior. */
+    DS4_TP_CONFIG_GLM5_NATIVE_SIX = UINT64_C(1) << 41,
+    /* Extend exact shared-Q8/FFN handoff batching to native MLA verification.
+     * Attention remains causal M1; this changes the order of TP gates. */
+    DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF = UINT64_C(1) << 42,
+    /* Queue resident verifier expert rows, completing before phase1 agree. */
+    DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE = UINT64_C(1) << 43,
+    /* One attention-output exchange for exact native MLA rows, max M6. */
+    DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF = UINT64_C(1) << 44,
+    /* 0=incumbent, 1=scalar six-row schedule, 2=paired six-row schedule.
+     * Code3 is invalid even if both peers request it. */
+    DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT = 45,
 };
+
+static inline uint32_t ds4_tp_glm5_native_rows_parse(const char *value) {
+    if (!value || !value[0] || (value[0] == '0' && !value[1])) return 0u;
+    if (value[1]) return UINT32_MAX;
+    return value[0] == '2' ? 2u : value[0] == '4' ? 4u :
+           value[0] == '6' ? 6u : value[0] == '8' ? 8u : UINT32_MAX;
+}
+
+static inline bool ds4_tp_glm5_native_width_valid(uint32_t rows) {
+    return rows == 2u || rows == 4u || rows == 6u || rows == 8u;
+}
+
+static inline uint64_t ds4_tp_glm5_native_config(uint32_t rows) {
+    if (rows == 6u) return DS4_TP_CONFIG_GLM5_NATIVE_SIX;
+    const uint64_t code = rows == 2u ? 1u : rows == 4u ? 2u : rows == 8u ? 3u : 0u;
+    /* An invalid request must fail hello even when both peers request it. */
+    if (rows && !code) return DS4_TP_CONFIG_GLM5_NATIVE_SIX |
+        (UINT64_C(1) << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT);
+    return code << DS4_TP_CONFIG_GLM5_NATIVE_SHIFT;
+}
+
+static inline uint32_t ds4_tp_glm5_native_rows(uint64_t config) {
+    const uint32_t code = (uint32_t)(config >> DS4_TP_CONFIG_GLM5_NATIVE_SHIFT) & 3u;
+    if (config & DS4_TP_CONFIG_GLM5_NATIVE_SIX) return code ? UINT32_MAX : 6u;
+    return code ? 1u << code : 0u;
+}
+
+static inline bool ds4_tp_glm5_mla_handoff_config_valid(uint64_t config) {
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) ||
+        (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline bool ds4_tp_glm5_ffn_queue_config_valid(uint64_t config) {
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) ||
+        (ds4_tp_glm5_native_width_valid(ds4_tp_glm5_native_rows(config)) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline bool ds4_tp_glm5_mla_attn_handoff_config_valid(uint64_t config) {
+    const uint32_t rows = ds4_tp_glm5_native_rows(config);
+    return !(config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) ||
+        ((rows == 2u || rows == 4u || rows == 6u) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) &&
+         (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF));
+}
+
+static inline uint32_t ds4_tp_glm5_expert_pairs_parse(const char *value) {
+    if (!value) return 0u;
+    if (!value[0] || value[1] || value[0] < '0' || value[0] > '2') return UINT32_MAX;
+    return (uint32_t)(value[0] - '0');
+}
+
+static inline uint32_t ds4_tp_glm5_expert_pairs_mode(uint64_t config) {
+    return (uint32_t)(config >> DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT) & 3u;
+}
+
+static inline uint64_t ds4_tp_glm5_expert_pairs_config(uint32_t mode) {
+    return (uint64_t)(mode <= 2u ? mode : 3u) << DS4_TP_CONFIG_GLM5_EXPERT_PAIRS_SHIFT;
+}
+
+static inline bool ds4_tp_glm5_expert_pairs_config_valid(uint64_t config) {
+    const uint32_t mode = ds4_tp_glm5_expert_pairs_mode(config);
+    return !mode || (mode <= 2u && ds4_tp_glm5_native_rows(config) == 6u &&
+        (config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) &&
+        (config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF));
+}
+
+/* Three exact workspaces: 2, optionally 4, and configured maximum (6 or 8).
+ * Existing width-eight sessions retain their original 8/4/2 tail schedule. */
+static inline uint32_t ds4_tp_glm5_native_workspace_rows(uint32_t maximum, uint32_t slot) {
+    if (!ds4_tp_glm5_native_width_valid(maximum)) return 0u;
+    if (slot == 0u) return 2u;
+    if (slot == 1u) return maximum >= 4u ? 4u : 0u;
+    return slot == 2u && maximum >= 6u ? maximum : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_native_cycle_rows(uint32_t maximum, uint32_t limit) {
+    if (!ds4_tp_glm5_native_width_valid(maximum) || !limit) return 0u;
+    if (limit >= maximum) return maximum;
+    if (limit >= 4u && maximum >= 4u) return 4u;
+    return limit >= 2u ? 2u : 1u;
+}
+
+/* Validate handoff's supported arithmetic/scheduling modes before any layer
+ * exchanges. This does not enable handoff or replace native-width/hello checks. */
+static inline bool ds4_tp_glm5_handoff_modes_valid(const char *paired,
+        const char *overlap, const char *window_overlap, const char *window_scratch) {
+    if (paired && (paired[0] != '0' || paired[1])) return false;
+    if (overlap && ((overlap[0] != '0' && overlap[0] != '1') || overlap[1])) return false;
+    return !(overlap && overlap[0] == '1' &&
+        window_overlap && window_overlap[0] == '1' && !window_overlap[1] &&
+        window_scratch && window_scratch[0] == '1' && !window_scratch[1]);
+}
 
 static inline uint64_t ds4_tp_prefill_config_encode(
         uint32_t min_attn,
@@ -500,6 +613,11 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
 int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
                                          uint32_t gate, uint64_t seq,
                                          const void *payload);
+/* Native GLM5 sessions interleave draft/bulk and ordinary token traffic.
+ * Advance the latency channel's own ordinal, independently of bulk headers.
+ * RDMA-only, negotiated native sessions only; NULL payload uses the gate slab. */
+int ds4_tp_native_gate_exchange_next(ds4_tp *tp, uint32_t layer,
+                                      uint32_t gate, const void *payload);
 /* Exchange the dependent KDA output-row half paired with the preceding
  * logical attention gate.  It does not consume or advance a gate sequence. */
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
@@ -573,7 +691,16 @@ typedef enum {
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_LOGITS_TOP2 = 18,
+    DS4_TP_FRAME_GLM5_NATIVE = 19,
+    DS4_TP_FRAME_GLM5_NATIVE_AGREE = 20,
+    DS4_TP_FRAME_GLM5_VERIFY_LAYER = 21,
 } ds4_tp_frame_type;
+
+typedef struct {
+    uint64_t session_id, cycle;
+    uint32_t prefix, rows;
+    int32_t root, eos;
+} ds4_tp_native_cycle;
 
 typedef struct {
     int32_t id[2];
@@ -589,7 +716,39 @@ typedef struct {
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    ds4_tp_native_cycle native;
 } ds4_tp_command;
+
+/* Native control carries IDs/status only; all tensor payloads stay on RDMA.
+ * Phases 0=ready, 1..7=proposal, 8=verified prefix, 9=committed/refreshed.
+ * Both ranks submit matching cycle/phase/count/token arrays and local success.
+ * Any disagreement/failure closes the control direction and poisons the link.
+ * Successful agreement alone never commits or publishes session state. */
+int ds4_tp_send_native_cycle(ds4_tp *tp, const ds4_tp_native_cycle *cycle);
+int ds4_tp_native_agree(ds4_tp *tp, const ds4_tp_native_cycle *cycle,
+                         uint32_t phase, uint32_t accepted,
+                         const uint32_t tokens[8], int local_ok,
+                         char *err, size_t errlen);
+/* Native verifier only. Phase0 agrees on an ordered route-table hash; phase1
+ * agrees that local expert computation completed before a bulk FFN exchange.
+ * Negotiated phase2 agrees on completed MLA output rows before attention bulk.
+ * The monotonic transport sequence binds this to the enclosing transaction.
+ * Always send local failure; one deadline covers send and receive. */
+int ds4_tp_verify_layer_agree(ds4_tp *tp, uint64_t sequence, uint32_t layer,
+                            uint32_t frontier, uint32_t rows, uint32_t phase,
+                            uint64_t route_hash, int local_ok,
+                            char *err, size_t errlen);
+#ifdef DS4_TP_TEST_HOOKS
+/* Socket-only control fixture: no RDMA payload capability is manufactured. */
+ds4_tp *ds4_tp_test_control_create(int fd, int rank);
+void ds4_tp_test_control_set_config(ds4_tp *tp, uint64_t config);
+ds4_tp *ds4_tp_test_bulk_ready_create(int control_fd, int data_fd);
+ds4_tp *ds4_tp_test_handoff_gate_create(int control_fd, int data_fd);
+void ds4_tp_test_control_destroy(ds4_tp *tp);
+int ds4_tp_test_bulk_ready(ds4_tp *tp, uint32_t chunks, uint64_t bytes,
+                            uint64_t offset, uint64_t round_bytes,
+                            unsigned timeout_ms);
+#endif
 
 int ds4_tp_recv_command(
         ds4_tp *tp,

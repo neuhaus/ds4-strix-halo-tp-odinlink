@@ -1658,14 +1658,46 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int glm5_bf16_wmma_coalesced_weights_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
+static int glm5_bf16_wmma_wide_tile_requested(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int matmul_bf16_f32_wmma_hilo_m256_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
-    matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
+    if (glm5_bf16_wmma_wide_tile_requested() == 1) {
+        matmul_bf16_f32_wmma_hilo_m128n64k32_kernel<<<
+                dim3((out_dim + 63u) / 64u, (n_tok + 127u) / 128u),
+                8u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    } else if (glm5_bf16_wmma_coalesced_weights_requested() == 1) {
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u, false, true><<<
+                dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+                16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    } else {
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
+                dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+                16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 WMMA hi/lo M256 launch");
+}
+
+static int matmul_bf16_f32_wmma_native_m256_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    matmul_bf16_f32_wmma_hilo_m256_kernel<2u, true><<<
             dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
             16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(),
-                   "matmul_bf16 WMMA hi/lo M256 launch");
+                   "matmul_bf16 native WMMA M256 launch");
 }
 
 static int matmul_bf16_f32_wmma_hilo_qkv_shared_a_launch(
@@ -1684,6 +1716,61 @@ static int matmul_bf16_f32_wmma_hilo_qkv_shared_a_launch(
                    "matmul_bf16 WMMA hi/lo QKV shared-A launch");
 }
 
+static int glm5_bf16_exact_prepare(const float *x, uint32_t k, uint32_t m) {
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess || device != 0) return 0;
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop,device) != hipSuccess ||
+        strncmp(prop.gcnArchName,"gfx1151",7) != 0) return 0;
+    const uint64_t count = uint64_t(k)*m;
+    if (count > glm5_bf16_exact_scratch_bytes/sizeof(uint32_t)) return 0;
+    if (!g_glm5_bf16_exact_activations && !cuda_ok(
+            cudaMalloc(&g_glm5_bf16_exact_activations,glm5_bf16_exact_scratch_bytes),
+            "GLM BF16 exact activation allocation")) return 0;
+    ds4_bf16_hilo_prepare_kernel<<<(count+255u)/256u,256>>>(
+        g_glm5_bf16_exact_activations,x,count);
+    return cuda_ok(cudaGetLastError(),"GLM BF16 exact activation preparation");
+}
+
+static int glm5_bf16_exact_m96_launch(float *out, const uint16_t *weight,
+        const float *x, uint32_t k, uint32_t n, uint32_t m) {
+    if (!glm5_bf16_exact_prepare(x,k,m)) return 0;
+    matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true><<<
+        dim3(n/32u,(m+95u)/96u),128>>>(out,weight,x,k,n,m,g_glm5_bf16_exact_activations);
+    if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact M96 launch")) return 0;
+    static int reported;
+    if (!reported) {
+        fprintf(stderr,"ds4: ROCm GLM5 BF16 exact M96 engaged weights=original activation_scratch_bytes=%zu weight_cache_bytes=0 arithmetic=K16-high-residual\n",
+                glm5_bf16_exact_scratch_bytes);
+        reported = 1;
+    }
+    return 1;
+}
+
+static int glm5_bf16_lt_launch(float *out, const uint16_t *weight,
+        const float *x, uint32_t k, uint32_t m) {
+    auto *plan = glm5_bf16_lt_get_plan(k,m);
+    if (!plan) return 0;
+    const uint64_t count = uint64_t(k)*m;
+    uint16_t *hi = g_glm5_bf16_lt_activations, *lo = hi + count;
+    ds4_bf16_hilo_prepare_planar_kernel<<<(count+255u)/256u,256>>>(hi,lo,x,count);
+    if (!cuda_ok(cudaGetLastError(),"GLM BF16 Lt activation preparation")) return 0;
+    const float alpha = 1.0f;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        const float beta = float(pass);
+        if (!hipblaslt_ok(hipblasLtMatmul(g_hipblaslt,plan->desc,&alpha,
+                weight,plan->a,pass ? lo : hi,plan->b,&beta,out,plan->c,
+                out,plan->c,&plan->algo[pass],nullptr,0,nullptr),"GLM BF16 Lt high/residual")) return 0;
+    }
+    static int reported;
+    if (!reported) {
+        fprintf(stderr,"ds4: ROCm GLM5 BF16 Lt hilo engaged weights=original activation_scratch_bytes=%zu weight_cache_bytes=0 lane=B\n",
+                glm5_bf16_lt_scratch_bytes);
+        reported = 1;
+    }
+    return 1;
+}
+
 /* GLM-KDA-only optional dispatch.  Return -1 when the guarded candidate is
  * not applicable, 0 on a hard validation/launch failure, and 1 on launch. */
 extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
@@ -1692,6 +1779,24 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         const ds4_gpu_tensor *x, uint64_t n_tok) {
     static const int batch_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    const char *native_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE");
+    const bool native = native_selector && strcmp(native_selector, "1") == 0;
+    const int coalesced = glm5_bf16_wmma_coalesced_weights_requested();
+    const int wide_tile = glm5_bf16_wmma_wide_tile_requested();
+    const char *lt_selector = getenv("DS4_ROCM_GLM5_BF16_LT_HILO");
+    const bool lt = lt_selector && strcmp(lt_selector,"1") == 0;
+    const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_WMMA_EXACT_M96");
+    const bool exact = exact_selector && strcmp(exact_selector,"1") == 0;
+    if (exact_selector && !exact && strcmp(exact_selector,"0") != 0) return 0;
+    if (exact && (lt || native || coalesced || wide_tile)) return 0;
+    if (lt_selector && !lt && strcmp(lt_selector,"0") != 0) return 0;
+    if (lt && (native || coalesced || wide_tile)) return 0;
+    if (coalesced < 0 || wide_tile < 0 || (coalesced && native) ||
+        (wide_tile && (native || coalesced))) return 0;
+    if (native_selector && !native && strcmp(native_selector, "0") != 0)
+        return 0;
+    if (native && (g_quality_mode || cuda_runtime_config()->graph_dump))
+        return -1;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
         !ds4_bf16_wmma_hilo_dispatch_allowed(
             true, batch_toktile_disabled, (uint32_t)in_dim,
@@ -1706,6 +1811,7 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
     const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
     const uint64_t x_elems = n_tok * in_dim;
     const uint64_t out_elems = n_tok * out_dim;
+    const bool exact_shape = exact && n_tok == 1024u;
     if (x_elems > UINT64_MAX / sizeof(float) ||
         out_elems > UINT64_MAX / sizeof(float) ||
         weight_offset > model_size ||
@@ -1715,12 +1821,66 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         cuda_u64_ranges_overlap(
             (uint64_t)(uintptr_t)out->ptr, out_elems * sizeof(float),
             (uint64_t)(uintptr_t)x->ptr, x_elems * sizeof(float))) return 0;
+    // A copied range may be aligned even when its original GGUF offset is
+    // not. Reject before lookup/copy as well as checking the device pointer.
+    if (lt && out_dim == 4096u && (n_tok == 256u || n_tok == 1024u) &&
+        (weight_offset & 15u)) return 0;
+    if (exact_shape && ((weight_offset & 15u) || out->device_id != 0 ||
+        x->device_id != 0 || ((uintptr_t)x->ptr & 3u) ||
+        ((uintptr_t)out->ptr & 15u))) return 0;
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
     if (!wptr) return 0;
-    return matmul_bf16_f32_wmma_hilo_m256_launch(
-        (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    if (exact_shape) {
+        if (((uintptr_t)wptr & 15u) || cuda_u64_ranges_overlap(
+                (uint64_t)(uintptr_t)out->ptr,out_elems*sizeof(float),
+                (uint64_t)(uintptr_t)wptr,weight_bytes)) return 0;
+        return glm5_bf16_exact_m96_launch((float *)out->ptr,(const uint16_t *)wptr,
+            (const float *)x->ptr,(uint32_t)in_dim,(uint32_t)out_dim,(uint32_t)n_tok);
+    }
+    if ((wide_tile && (uintptr_t)wptr % alignof(uint16_t) != 0u) ||
+        (coalesced && ((uintptr_t)wptr & 3u) != 0u)) return 0;
+    if (lt && out_dim == 4096u && (n_tok == 256u || n_tok == 1024u)) {
+        if (out->device_id != 0 || x->device_id != 0 ||
+            ((uintptr_t)wptr & 15u) || ((uintptr_t)x->ptr & 3u) ||
+            ((uintptr_t)out->ptr & 15u)) return 0;
+        return glm5_bf16_lt_launch((float *)out->ptr,(const uint16_t *)wptr,
+                                  (const float *)x->ptr,(uint32_t)in_dim,(uint32_t)n_tok);
+    }
+    const int result = native
+        ? matmul_bf16_f32_wmma_native_m256_launch(
+              (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+              (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok)
+        : matmul_bf16_f32_wmma_hilo_m256_launch(
+              (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+              (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    if (result > 0 && wide_tile) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 WMMA wide tile engaged M128 N64 K32 "
+                    "arithmetic=hilo weights=original scratch=unchanged\n");
+            reported = 1;
+        }
+    }
+    if (result > 0 && coalesced) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 WMMA coalesced weight loads engaged M256 "
+                    "arithmetic=hilo weights=original scratch=unchanged\n");
+            reported = 1;
+        }
+    }
+    if (result > 0 && native) {
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, "ds4: GLM5 native-BF16 activation WMMA engaged "
+                            "M256 (weights remain BF16; lane-B)\n");
+            reported = 1;
+        }
+    }
+    return result;
 }
 
 static int cuda_glm5_bf16_qkv_with_panel(
@@ -1977,18 +2137,77 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
                                           "glm5_bf16_qkv_decode_multiptr");
         if (!weights[i]) return 0;
     }
-    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<64u><<<
-        (unsigned)((out_dim + 7u) / 8u), 24u * 32u,
-        (size_t)in_dim * sizeof(float)>>>(
-        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
-        (const uint16_t *)weights[0], (const uint16_t *)weights[1],
-        (const uint16_t *)weights[2], (const float *)x->ptr,
-        (uint32_t)in_dim, (uint32_t)out_dim);
+    const char *rows_selector = getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_ROWS");
+    const bool rows2 = rows_selector && strcmp(rows_selector, "2") == 0;
+    const bool rows4 = rows_selector && strcmp(rows_selector, "4") == 0;
+    const char *split_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_QKV_DECODE_SPLIT");
+    const bool split = split_selector && strcmp(split_selector, "1") == 0;
+    if (split_selector && !split && strcmp(split_selector, "0") != 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "invalid GLM5 BF16 QKV decode split selector\n");
+        return 0;
+    }
+    const char *prefetch_selector =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_PREFETCH");
+    const uint32_t prefetch =
+        prefetch_selector == NULL || strcmp(prefetch_selector, "64") == 0 ? 64u :
+        strcmp(prefetch_selector, "32") == 0 ? 32u :
+        strcmp(prefetch_selector, "16") == 0 ? 16u : 0u;
+    if (prefetch == 0u) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "invalid GLM5 BF16 QKV decode prefetch selector\n");
+        return 0;
+    }
+#define DS4_LAUNCH_QKV_MULTIPTR(P, R)                                      \
+    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<P, R><<<             \
+        (unsigned)((out_dim + (R) - 1u) / (R)), (3u * (R)) * 32u,           \
+        (size_t)in_dim * sizeof(float)>>>(                                  \
+        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,     \
+        (const uint16_t *)weights[0], (const uint16_t *)weights[1],         \
+        (const uint16_t *)weights[2], (const float *)x->ptr,               \
+        (uint32_t)in_dim, (uint32_t)out_dim)
+    if (split) {
+#define DS4_LAUNCH_QKV_SPLIT(P, R)                                        \
+        matmul_bf16_f32_sharedx_qkv_split_decode_kernel<P, R><<<           \
+            dim3((unsigned)((out_dim + (R) - 1u) / (R)), 3u),             \
+            (R) * 32u, (size_t)in_dim * sizeof(float)>>>(                  \
+        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,     \
+        (const uint16_t *)weights[0], (const uint16_t *)weights[1],       \
+        (const uint16_t *)weights[2], (const float *)x->ptr,               \
+        (uint32_t)in_dim, (uint32_t)out_dim)
+        if (rows2 && (out_dim & 1u) == 0u) {
+            if (prefetch == 16u) DS4_LAUNCH_QKV_SPLIT(16u, 2u);
+            else if (prefetch == 32u) DS4_LAUNCH_QKV_SPLIT(32u, 2u);
+            else DS4_LAUNCH_QKV_SPLIT(64u, 2u);
+        } else if (rows4 && (out_dim & 3u) == 0u) {
+            if (prefetch == 16u) DS4_LAUNCH_QKV_SPLIT(16u, 4u);
+            else if (prefetch == 32u) DS4_LAUNCH_QKV_SPLIT(32u, 4u);
+            else DS4_LAUNCH_QKV_SPLIT(64u, 4u);
+        } else {
+            if (prefetch == 16u) DS4_LAUNCH_QKV_SPLIT(16u, 8u);
+            else if (prefetch == 32u) DS4_LAUNCH_QKV_SPLIT(32u, 8u);
+            else DS4_LAUNCH_QKV_SPLIT(64u, 8u);
+        }
+#undef DS4_LAUNCH_QKV_SPLIT
+    } else if (rows4 && (out_dim & 3u) == 0u) {
+        if (prefetch == 16u) DS4_LAUNCH_QKV_MULTIPTR(16u, 4u);
+        else if (prefetch == 32u) DS4_LAUNCH_QKV_MULTIPTR(32u, 4u);
+        else DS4_LAUNCH_QKV_MULTIPTR(64u, 4u);
+    } else {
+        if (prefetch == 16u) DS4_LAUNCH_QKV_MULTIPTR(16u, 8u);
+        else if (prefetch == 32u) DS4_LAUNCH_QKV_MULTIPTR(32u, 8u);
+        else DS4_LAUNCH_QKV_MULTIPTR(64u, 8u);
+    }
+#undef DS4_LAUNCH_QKV_MULTIPTR
     static int reported = 0;
     if (!reported) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu\n",
-                (unsigned long long)out_dim);
+                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu rows=%u "
+                "prefetch=%u split=%d\n", (unsigned long long)out_dim,
+                split && rows2 && (out_dim & 1u) == 0u ? 2u :
+                rows4 && (out_dim & 3u) == 0u ? 4u : 8u,
+                prefetch, split ? 1 : 0);
         reported = 1;
     }
     return cuda_ok(cudaGetLastError(),
@@ -2005,14 +2224,60 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         uint64_t weight_g_offset, uint64_t weight_beta_offset,
         uint64_t in_dim, uint64_t q_out_dim, uint64_t low_out_dim,
         uint64_t beta_out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    const char *selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Legacy alias retained for already-recorded diagnostic recipes. */
+    if (!decode_selector)
+        decode_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill_selector =
         getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
-    const int decode_enabled = selector && strcmp(selector, "1") == 0;
+    const int decode_enabled = decode_selector &&
+        strcmp(decode_selector, "1") == 0;
     const int prefill_enabled =
         prefill_selector && strcmp(prefill_selector, "1") == 0;
+    const char *shared_a_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A");
+    const int shared_a = shared_a_selector &&
+        strcmp(shared_a_selector, "1") == 0;
+    if (shared_a_selector && !shared_a &&
+        strcmp(shared_a_selector, "0") != 0) return 0;
+    const char *fused_shared_a_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A");
+    const int fused_shared_a = fused_shared_a_selector &&
+        strcmp(fused_shared_a_selector, "1") == 0;
+    if (fused_shared_a_selector && !fused_shared_a &&
+        strcmp(fused_shared_a_selector, "0") != 0) return 0;
+    const char *native_qkv_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV");
+    const int native_qkv = !native_qkv_selector ||
+        strcmp(native_qkv_selector, "0") == 0 ? 0 :
+        strcmp(native_qkv_selector, "1") == 0 ? 1 : -1;
+    if (native_qkv < 0) return 0;
+    /* Native QKV omits the residual MMA and is a Lane-B experiment. Keep it
+     * confined to the fused prefill launch and out of quality/graph paths. */
+    if (native_qkv && (!fused_shared_a || g_quality_mode ||
+                       cuda_runtime_config()->graph_dump)) return 0;
+    if (fused_shared_a && shared_a) return 0;
+    const char *exact_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96");
+    const bool exact = exact_selector && strcmp(exact_selector,"1") == 0;
+    if (n_tok != 1u && exact_selector && !exact && strcmp(exact_selector,"0") != 0)
+        return 0;
     if ((n_tok == 1u && !decode_enabled) ||
         (n_tok != 1u && !prefill_enabled)) return -1;
+    const int coalesced = n_tok == 1u ? 0 :
+        glm5_bf16_wmma_coalesced_weights_requested();
+    if (coalesced < 0) return 0;
+    if (exact && n_tok != 1u) {
+        if (coalesced) return 0;
+        if (shared_a) return 0;
+        if (native_qkv) return 0;
+        for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_NATIVE",
+                                "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE",
+                                "DS4_ROCM_GLM5_BF16_LT_HILO"}) {
+            const char *value = getenv(name);
+            if (value && strcmp(value,"0") != 0) return 0;
+        }
+    }
     /* M=1 uses the shared-x wave matvec.  Batched prefill uses the existing
      * 256-row hi/lo WMMA tile, extended to all six independent pointers. */
     if (!out_q || !out_k || !out_v || !out_f || !out_g || !out_beta ||
@@ -2034,8 +2299,18 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
         if (!ds4_bf16_wmma_hilo_dispatch_allowed(
                 true, batch_toktile_disabled, (uint32_t)in_dim,
-                (uint32_t)q_out_dim, (uint32_t)n_tok, g_quality_mode,
-                cuda_runtime_config()->graph_dump)) return -1;
+            (uint32_t)q_out_dim, (uint32_t)n_tok, g_quality_mode,
+            cuda_runtime_config()->graph_dump)) return -1;
+        /* Shared-A owns the Q/K/V tile and the exact skinny launch owns
+         * f_a/g_a/beta.  Their two launches deliberately share only the
+         * original input pointer; no concatenated weight or persistent
+         * activation panel is introduced. */
+        if (shared_a && coalesced) return 0;
+        if (fused_shared_a && (coalesced || n_tok < 1024u ||
+                               (n_tok % 256u) != 0u ||
+                               in_dim != 4096u || q_out_dim != 4096u ||
+                               low_out_dim != 128u || beta_out_dim != 32u))
+            return 0;
     }
 
     uint64_t input_row_bytes = 0u;
@@ -2091,6 +2366,18 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         q_out_dim, q_out_dim, q_out_dim, low_out_dim, low_out_dim,
         beta_out_dim,
     };
+    const bool exact_shape = exact && n_tok == 1024u &&
+        ((q_out_dim == 4096u && beta_out_dim == 32u) ||
+         (q_out_dim == 8192u && beta_out_dim == 64u));
+    const uint32_t q_blocks = ((uint32_t)q_out_dim + 31u) / 32u;
+    const uint32_t low_blocks = ((uint32_t)low_out_dim + 1u) / 2u;
+    const uint32_t beta_blocks = ((uint32_t)beta_out_dim + 1u) / 2u;
+    if (exact_shape) {
+        if (x->device_id != 0) return 0;
+        for (uint32_t i=0; i<6u; ++i)
+            if (outs[i]->device_id != 0 || (i<3u &&
+                ((offsets[i] & 15u) || ((uintptr_t)outs[i]->ptr & 15u)))) return 0;
+    }
     uint64_t weight_bytes[6] = {};
     for (uint32_t i = 0u; i < 6u; ++i) {
         uint64_t elements = 0u;
@@ -2112,6 +2399,14 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         if (!weights[i] ||
             ((uint64_t)(uintptr_t)weights[i] & (sizeof(uint16_t) - 1u)) != 0u)
             return 0;
+        if (coalesced && i < 3u && ((uintptr_t)weights[i] & 3u) != 0u)
+            return 0;
+        if (exact_shape) {
+            if (i<3u && ((uintptr_t)weights[i] & 15u)) return 0;
+            for (uint32_t j=0; j<6u; ++j)
+                if (cuda_u64_ranges_overlap((uint64_t)(uintptr_t)weights[i],weight_bytes[i],
+                        (uint64_t)(uintptr_t)outs[j]->ptr,out_sizes[j])) return 0;
+        }
         for (uint32_t j = 0u; j < i; ++j)
             if (cuda_u64_ranges_overlap(
                     (uint64_t)(uintptr_t)weights[i], weight_bytes[i],
@@ -2119,7 +2414,32 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
                 return -1;
     }
 
-    if (n_tok == 1u) {
+    if (exact_shape) {
+        if (!glm5_bf16_exact_prepare((const float *)x->ptr,(uint32_t)in_dim,(uint32_t)n_tok)) return 0;
+        matmul_bf16_f32_wmma_hilo_m96n32k32_kernel<true,0u,true,true><<<
+            dim3(3u*(uint32_t)q_out_dim/32u,((uint32_t)n_tok+95u)/96u),128>>>(
+            (float *)out_q->ptr,(const uint16_t *)weights[0],(const float *)x->ptr,
+            (uint32_t)in_dim,(uint32_t)q_out_dim,(uint32_t)n_tok,g_glm5_bf16_exact_activations,
+            (float *)out_k->ptr,(float *)out_v->ptr,
+            (const uint16_t *)weights[1],(const uint16_t *)weights[2]);
+        if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact six QKV launch")) return 0;
+        matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<false,true><<<
+            dim3((uint32_t)low_out_dim+(uint32_t)beta_out_dim/2u,(uint32_t)n_tok/256u),512>>>(
+            (float *)out_q->ptr,(float *)out_k->ptr,(float *)out_v->ptr,
+            (float *)out_f->ptr,(float *)out_g->ptr,(float *)out_beta->ptr,
+            (const uint16_t *)weights[0],(const uint16_t *)weights[1],
+            (const uint16_t *)weights[2],(const uint16_t *)weights[3],
+            (const uint16_t *)weights[4],(const uint16_t *)weights[5],
+            (const float *)x->ptr,(uint32_t)in_dim,(uint32_t)q_out_dim,
+            (uint32_t)low_out_dim,(uint32_t)beta_out_dim,(uint32_t)n_tok);
+        if (!cuda_ok(cudaGetLastError(),"GLM BF16 exact six skinny launch")) return 0;
+        static int reported;
+        if (!reported) {
+            fprintf(stderr,"ds4: ROCm GLM5 BF16 six exact M96 engaged activation_scratch_bytes=%zu weights=original weight_cache_bytes=0 gates=F32-exact\n",
+                    glm5_bf16_exact_scratch_bytes);
+            reported = 1;
+        }
+    } else if (n_tok == 1u) {
         matmul_bf16_f32_sharedx_kda_six_multiptr_decode_kernel<64u, false><<<
             (unsigned)((q_out_dim + 7u) / 8u), 27u * 32u,
             (size_t)in_dim * sizeof(float)>>>(
@@ -2130,14 +2450,20 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             (const uint16_t *)weights[4], (const uint16_t *)weights[5],
             (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
             (uint32_t)low_out_dim, (uint32_t)beta_out_dim);
-    } else {
-        const uint32_t q_blocks = ((uint32_t)q_out_dim + 31u) / 32u;
-        const uint32_t low_blocks = ((uint32_t)low_out_dim + 31u) / 32u;
-        const uint32_t beta_blocks = ((uint32_t)beta_out_dim + 31u) / 32u;
-        const uint32_t total_blocks =
-            3u * q_blocks + 2u * low_blocks + beta_blocks;
-        matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<<<
-            dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
+    } else if (shared_a) {
+        matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_kernel<<<
+            dim3(((uint32_t)q_out_dim + 31u) / 32u,
+                 ((uint32_t)n_tok + 255u) / 256u),
+            16u * 32u>>>(
+            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+            (const uint16_t *)weights[2], (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)q_out_dim, (uint32_t)n_tok);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM BF16 six shared-A QKV launch")) return 0;
+        matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<false, true><<<
+            dim3(2u * low_blocks + beta_blocks,
+                 ((uint32_t)n_tok + 255u) / 256u),
             16u * 32u>>>(
             (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
             (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
@@ -2145,8 +2471,96 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
             (const uint16_t *)weights[2], (const uint16_t *)weights[3],
             (const uint16_t *)weights[4], (const uint16_t *)weights[5],
             (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
-            (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
-            (uint32_t)n_tok);
+            (uint32_t)low_out_dim, (uint32_t)beta_out_dim, (uint32_t)n_tok);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM BF16 six shared-A skinny launch")) return 0;
+        static int shared_a_reported;
+        if (!shared_a_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 KDA six shared-A prefill engaged "
+                    "QKV=shared activation, skinny=F32 exact "
+                    "weights=original cache_bytes=0\n");
+            shared_a_reported = 1;
+        }
+    } else if (fused_shared_a) {
+        if (native_qkv) {
+            matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel<true><<<
+                dim3(q_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim, (uint32_t)n_tok);
+        } else {
+            matmul_bf16_f32_wmma_hilo_kda_six_fused_shared_a_m256_kernel<<<
+                dim3(q_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim, (uint32_t)n_tok);
+        }
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM BF16 six fused shared-A launch")) return 0;
+        static int fused_shared_a_reported;
+        if (!fused_shared_a_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 KDA six fused shared-A prefill engaged "
+                    "QKV=shared activation skinny=exact pointers=independent "
+                    "cache_bytes=0\n");
+            fused_shared_a_reported = 1;
+        }
+        if (native_qkv) {
+            static int native_qkv_reported;
+            if (!native_qkv_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 KDA six fused native-QKV prefill engaged "
+                        "QKV=high-only skinny=F32 exact weights=original "
+                        "cache_bytes=0 lane=B\n");
+                native_qkv_reported = 1;
+            }
+        }
+    } else {
+        const uint32_t total_blocks =
+            3u * q_blocks + 2u * low_blocks + beta_blocks;
+        if (coalesced) {
+            matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<true><<<
+                dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
+                (uint32_t)n_tok);
+            static int reported;
+            if (!reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 six-pointer coalesced weight loads engaged "
+                        "arithmetic=hilo/exact-gates weights=original scratch=unchanged\n");
+                reported = 1;
+            }
+        } else {
+            matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<><<<
+                dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
+                16u * 32u>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim,
+                (uint32_t)n_tok);
+        }
     }
     static int reported = 0;
     if (!reported) {
@@ -2295,6 +2709,46 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
+    const bool small_m_shape = (n_tok == 2u || n_tok == 4u || n_tok == 6u || n_tok == 8u) &&
+        ((in_dim == 4096u &&
+          (out_dim == 4096u || out_dim == 128u || out_dim == 32u ||
+           out_dim == 154880u)) ||
+         (in_dim == 128u && out_dim == 4096u) ||
+         (in_dim == 8192u && out_dim == 2048u));
+    if (small_m_shape) {
+        const char *small_m = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT");
+        if (small_m && strcmp(small_m, "0") != 0 && strcmp(small_m, "1") != 0)
+            return 0;
+        if (small_m && strcmp(small_m, "1") == 0) {
+            const char *split = getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
+            const char *legacy = getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
+            if (getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") ||
+                (split && strcmp(split, "0") != 0) ||
+                (legacy && strcmp(legacy, "0") != 0)) return 0;
+            // The skinny and low-rank prefill tiles preserve the generic
+            // 256-lane batch order, not the one-wave M1 order. Include these
+            // KDA gate shapes here so verification also preserves recurrence.
+            // The vocabulary head shares this M1 order and original BF16
+            // pointer; only its output width is larger (still divisible by 8).
+#define DS4_SMALL_M_EXACT(T, K) \
+            matmul_bf16_f32_small_m_exact_kernel<T, K><<<out_dim / 8u, 256u>>>( \
+                (float *)out->ptr, (const uint16_t *)wptr, \
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim)
+            if (in_dim == 128u) {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 128u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 128u);
+                else DS4_SMALL_M_EXACT(8u, 128u);
+            } else {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 1024u);
+                else DS4_SMALL_M_EXACT(8u, 1024u);
+            }
+#undef DS4_SMALL_M_EXACT
+            return cuda_ok(cudaGetLastError(), "BF16 small-M exact launch");
+        }
+    }
     if (n_tok == 1u && in_dim <= 8192u &&
         in_dim * sizeof(float) <= 65536u &&
         getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {

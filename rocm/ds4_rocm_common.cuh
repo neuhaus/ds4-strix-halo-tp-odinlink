@@ -303,7 +303,7 @@ __global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
  * independent projection (24 wave32 rows total), stages the shared activation
  * vector once, and then applies the incumbent lane-major BF16->F32 reduction
  * to each output.  The GGUF matrices are never concatenated. */
-template <uint32_t PREFETCH>
+template <uint32_t PREFETCH, uint32_t ROWS_PER_PROJECTION = 8u>
 __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
         float *out_q, float *out_k, float *out_v,
         const uint16_t *weight_q, const uint16_t *weight_k,
@@ -313,7 +313,9 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
-    constexpr uint32_t rows_per_projection = 8u;
+    static_assert(ROWS_PER_PROJECTION == 4u || ROWS_PER_PROJECTION == 8u,
+                  "unsupported QKV decode row geometry");
+    constexpr uint32_t rows_per_projection = ROWS_PER_PROJECTION;
     constexpr uint32_t projections = 3u;
     const uint32_t projection = wave / rows_per_projection;
     const uint32_t row_in_block = wave % rows_per_projection;
@@ -346,6 +348,61 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
     }
     for (; i < in_dim; i += 32u)
         acc += __uint_as_float((uint32_t)__builtin_nontemporal_load(&wr[i]) << 16u) * shx[i];
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+/* Projection-split decode experiment.  The incumbent above puts Q, K and V
+ * in one 24-wave block.  This form keeps the same independent pointers and
+ * lane-major reduction, but gives each projection its own 4/8-row block.  A
+ * y-grid of three lets the gfx1151 scheduler interleave the projections and
+ * avoids making one 768-thread block the occupancy unit. */
+template <uint32_t PREFETCH, uint32_t ROWS_PER_PROJECTION = 8u>
+__global__ static void matmul_bf16_f32_sharedx_qkv_split_decode_kernel(
+        float *out_q, float *out_k, float *out_v,
+        const uint16_t *weight_q, const uint16_t *weight_k,
+        const uint16_t *weight_v, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    static_assert(ROWS_PER_PROJECTION == 2u ||
+                  ROWS_PER_PROJECTION == 4u ||
+                  ROWS_PER_PROJECTION == 8u,
+                  "unsupported split QKV decode row geometry");
+    const uint32_t projection = blockIdx.y;
+    if (projection >= 3u) return;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * ROWS_PER_PROJECTION + wave;
+    if (row >= out_dim) return;
+    const uint16_t *weight = projection == 0u ? weight_q :
+                             projection == 1u ? weight_k : weight_v;
+    float *out = projection == 0u ? out_q :
+                 projection == 1u ? out_k : out_v;
+    const uint16_t *wr = weight + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    uint32_t i = lane;
+    for (; i + (PREFETCH - 1u) * 32u < in_dim;
+         i += PREFETCH * 32u) {
+        uint16_t packed_w[PREFETCH];
+        float packed_x[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = __builtin_nontemporal_load(&wr[index]);
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u)
+            acc += __uint_as_float((uint32_t)packed_w[u] << 16u) *
+                   packed_x[u];
+    }
+    for (; i < in_dim; i += 32u)
+        acc += __uint_as_float(
+                   (uint32_t)__builtin_nontemporal_load(&wr[i]) << 16u) *
+               shx[i];
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
 }
@@ -468,6 +525,44 @@ __global__ static void matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kern
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
+}
+
+/* Small target-verification batches reuse unchanged BF16 weights across
+ * independent token accumulators. Keep the M1 lane/K traversal and reduction;
+ * activation panels bound LDS at 32 KiB even for eight tokens. */
+template <uint32_t Tokens, uint32_t PanelK = 1024u>
+__global__ static void matmul_bf16_f32_small_m_exact_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u || Tokens == 8u,
+                  "supported small verification batches");
+    static_assert(PanelK == 1024u || PanelK == 128u,
+                  "wide projection or KDA low-rank expansion");
+    constexpr uint32_t Rows = 8u;
+    __shared__ float panel[Tokens][PanelK];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = blockIdx.x * Rows + (tid >> 5u);
+    float sum[Tokens] = {};
+    for (uint32_t first = 0u; first < in_dim; first += PanelK) {
+        for (uint32_t i = tid; i < Tokens * PanelK; i += Rows * 32u)
+            panel[i / PanelK][i % PanelK] =
+                x[(uint64_t)(i / PanelK) * in_dim + first + i % PanelK];
+        __syncthreads();
+        const uint16_t *wr = weight + (uint64_t)row * in_dim + first;
+        for (uint32_t k = lane; k < PanelK; k += 32u) {
+            const float w = __uint_as_float((uint32_t)wr[k] << 16u);
+#pragma unroll
+            for (uint32_t t = 0u; t < Tokens; ++t)
+                sum[t] += w * panel[t][k];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t t = 0u; t < Tokens; ++t) {
+        const float value = warp_sum_f32(sum[t]);
+        if (lane == 0u) out[(uint64_t)t * out_dim + row] = value;
+    }
 }
 
 /* Decode-only GLM KDA projection candidate.  The six matrices retain their

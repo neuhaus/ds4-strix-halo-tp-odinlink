@@ -52,8 +52,12 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.cuh"
+#include "ds4_rocm_glm5_bf16_lt.cuh"
 #endif
 static int g_quality_mode;
+// Default-stream, device-0 GLM projection scratch. Contains only activations.
+static uint32_t *g_glm5_bf16_exact_activations;
+static constexpr size_t glm5_bf16_exact_scratch_bytes = 32u * 1024u * 1024u;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -793,6 +797,7 @@ __global__ static void cuda_copy_bytes_kernel(
 }
 
 static void cuda_shared_gate_up_async_cleanup(void);
+static uint64_t g_glm5_mla_output_calls[3];
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -8197,6 +8202,13 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_glm5_mla_output_calls[0] || g_glm5_mla_output_calls[1] || g_glm5_mla_output_calls[2]) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MLA output batch submissions m2=%llu m4=%llu m6=%llu weights=resident_original\n",
+            (unsigned long long)g_glm5_mla_output_calls[0],
+            (unsigned long long)g_glm5_mla_output_calls[1],
+            (unsigned long long)g_glm5_mla_output_calls[2]);
+        memset(g_glm5_mla_output_calls, 0, sizeof(g_glm5_mla_output_calls));
+    }
     if (g_token_span_start) {
         (void)cudaEventDestroy(g_token_span_start);
         g_token_span_start = NULL;
@@ -8225,7 +8237,16 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
+    if (g_glm5_bf16_exact_activations) {
+        int saved = -1;
+        (void)cudaGetDevice(&saved);
+        if (cudaSetDevice(0) == cudaSuccess)
+            (void)cudaFree(g_glm5_bf16_exact_activations);
+        g_glm5_bf16_exact_activations = nullptr;
+        if (saved >= 0) (void)cudaSetDevice(saved);
+    }
 #ifdef __HIP_PLATFORM_AMD__
+    glm5_bf16_lt_cleanup();
     hipblaslt_gemm_plan_clear();
 #endif
     if (g_cublas_ready) {

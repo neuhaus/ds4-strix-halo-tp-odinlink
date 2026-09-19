@@ -243,6 +243,56 @@ static int test_zero_kda_schedule_is_valid_and_empty(void) {
     return 1;
 }
 
+static int test_replay_allocation_lifecycle(void) {
+    const ds4_glm5_layer_kind schedule = {0, true};
+    for (int fail = 0; fail <= 7; ++fail) {
+        reset_fakes();
+        ds4_glm5_kda_slot slot = {0};
+        CHECK(ds4_glm5_kda_slot_init(&slot, &schedule, 1, 1, NULL),
+              "replay fixture owns a full layer");
+        ds4_glm5_kda_layer_state *s = &slot.layer[0];
+        CHECK(ds4_glm5_kda_replay_bytes(s) == 0 && alloc_calls == 4,
+              "ordinary state has no replay allocation");
+        CHECK(!ds4_glm5_kda_replay_reserve(s, 3, 0) &&
+              !ds4_glm5_kda_replay_reserve(s, 4, 2) && alloc_calls == 4,
+              "invalid replay capacity/rank allocates nothing");
+        if (fail) fail_alloc_call = alloc_calls + fail;
+        const int ok = ds4_glm5_kda_replay_reserve(s, 4, 1);
+        CHECK(ok == (fail == 0), "each journal allocation failure is handled");
+        if (!fail) {
+            CHECK(ds4_glm5_kda_replay_bytes(s) == 393728u &&
+                  ds4_glm5_kda_replay_reserve(s, 4, 1) && alloc_calls == 11,
+                  "bounded journal reuse does not allocate again");
+            CHECK(ds4_glm5_kda_verify_ready(s, 2, 1) &&
+                  ds4_glm5_kda_verify_ready(s, 4, 1) &&
+                  !ds4_glm5_kda_verify_ready(s, 4, 0) &&
+                  !ds4_glm5_kda_verify_ready(s, 8, 1) &&
+                  !ds4_glm5_kda_verify_ready(s, 3, 1) &&
+                  !ds4_glm5_kda_verify_ready(NULL, 4, 1),
+                  "readiness binds reserved rank and batch capacity");
+            s->pending_tokens = 1;
+            CHECK(!ds4_glm5_kda_verify_ready(s, 4, 1), "pending ordinary work excludes verify");
+            s->pending_tokens = 0;
+            ds4_glm5_kda_layer_state foreign = *s;
+            CHECK(!ds4_glm5_kda_replay_reserve(&foreign, 4, 1) &&
+                  !ds4_glm5_kda_verify_ready(&foreign, 4, 1) &&
+                  !ds4_glm5_kda_verify_finish(&foreign, 0) &&
+                  ds4_glm5_kda_replay_bytes(&foreign) == 0,
+                  "copied layer cannot borrow journal ownership");
+            CHECK(ds4_glm5_kda_slot_reset(&slot) &&
+                  ds4_glm5_kda_replay_bytes(s) == 393728u,
+                  "reset retains only reserved journal allocation");
+        } else {
+            CHECK(ds4_glm5_kda_replay_bytes(s) == 0 && s->valid && slot.valid,
+                  "failed reserve preserves ordinary state");
+        }
+        ds4_glm5_kda_slot_free(&slot);
+        CHECK(free_calls == alloc_calls - (fail ? 1 : 0),
+              "journal and state allocation accounting balance");
+    }
+    return 1;
+}
+
 int main(void) {
     unsetenv("DS4_ROCM_GLM5_BF16_QKV_ACTIVATION_PANEL");
     unsetenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
@@ -254,6 +304,7 @@ int main(void) {
     ok &= test_one_layer_lifecycle();
     ok &= test_partial_allocation_failure_cleans_up();
     ok &= test_zero_kda_schedule_is_valid_and_empty();
+    ok &= test_replay_allocation_lifecycle();
     if (ok) fprintf(stderr, "PASS GLM5 resident KDA state lifecycle\n");
     return ok ? 0 : 1;
 }

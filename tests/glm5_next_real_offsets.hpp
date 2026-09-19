@@ -59,7 +59,11 @@ static bool glm5_next_bind_real_offsets(
         !g.tensor("output.weight", {4096u, 154880u}, 30u, model.output) ||
         !glm5_next_layer_tensor(g, 45u, "nextn.eh_proj.weight",
                                {8192u, 4096u}, 30u,
-                               model.nextn_eh_proj)) return false;
+                               model.nextn_eh_proj) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.enorm.weight", {4096u}, 0u, model.nextn_enorm) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.hnorm.weight", {4096u}, 0u, model.nextn_hnorm) ||
+        !glm5_next_layer_tensor(g, 45u, "nextn.shared_head_norm.weight", {4096u}, 0u,
+                               model.nextn_shared_head_norm)) return false;
     model.token_embd_type = g.tensors.at("token_embd.weight").type;
     model.output_type = g.tensors.at("output.weight").type;
 
@@ -256,12 +260,13 @@ static bool glm5_next_test_routed_tensor(const std::string &name) {
 
 static bool glm5_next_build_kshard_plan(
         const Glm5TestGGUF &g, const ds4_glm5_next_model_offsets &model,
-        Glm5NextKShardPlan &plan) {
+        Glm5NextKShardPlan &plan, bool include_native_dense = false) {
     plan = {};
     struct Span { uint64_t off, end, tensor_bytes; };
     std::vector<Span> spans;
     for (const auto &entry : g.tensors) {
-        if (!glm5_next_test_trunk_tensor(entry.first) ||
+        const bool native = include_native_dense && entry.first.compare(0, 7, "blk.45.") == 0;
+        if ((!glm5_next_test_trunk_tensor(entry.first) && !native) ||
             glm5_next_test_routed_tensor(entry.first)) continue;
         uint64_t bytes = 0u;
         if (!glm5_next_test_tensor_bytes(entry.second, bytes) ||

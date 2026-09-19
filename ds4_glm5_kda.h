@@ -25,6 +25,7 @@ typedef struct {
 } ds4_glm5_layer_kind;
 
 struct ds4_glm5_kda_slot;
+struct ds4_glm5_kda_replay;
 
 typedef struct {
     ds4_gpu_tensor *q_history;
@@ -35,12 +36,15 @@ typedef struct {
     uint32_t pending_tokens;
     bool valid;
     struct ds4_glm5_kda_slot *owner_slot;
+    /* Optional accepted-prefix journal, owned by this persistent layer. */
+    struct ds4_glm5_kda_replay *replay;
 } ds4_glm5_kda_layer_state;
 
 typedef struct ds4_glm5_kda_slot {
     ds4_glm5_kda_layer_state *layer;
     uint32_t layer_count;
     uint32_t kda_count;
+    uint32_t pending_verifications;
     uint64_t bytes;
     bool valid;
 } ds4_glm5_kda_slot;
@@ -66,6 +70,12 @@ typedef struct {
     uint64_t bytes;
 } ds4_glm5_kda_workspace;
 
+/* Internal backend payload; callers use the owned replay interface below. */
+typedef struct {
+    ds4_gpu_tensor *raw_q, *raw_k, *raw_v;
+    ds4_gpu_tensor *k, *v, *gate, *beta;
+} ds4_glm5_kda_replay_buffers;
+
 typedef struct {
     const ds4_glm5_kda_weight_offsets *weights;
     const void *model_map;
@@ -79,6 +89,7 @@ typedef struct {
     uint32_t head_start;
     uint32_t n_heads;
     float norm_eps;
+    const ds4_glm5_kda_replay_buffers *replay;
 } ds4_glm5_kda_device_args;
 
 /* Test-only state comparison payload. Producing it performs device readback;
@@ -112,6 +123,32 @@ int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
                                 uint32_t capacity_tokens);
 int ds4_glm5_kda_workspace_bytes(uint32_t capacity_tokens, uint64_t *bytes);
 void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace);
+/* Research-only accepted-prefix transaction for one TP half of an owned,
+ * full 64-head layer state. Reserve explicitly (capacity 2/4/6/8; rank 0/1).
+ * Verify leaves live histories/recurrent bytes and token_count unchanged,
+ * blocking ordinary begin/finish/commit until verify_finish. The count in
+ * finish is consumed input rows, not predicted draft tokens: zero discards.
+ * Invalid preconditions preserve the transaction; backend failure invalidates
+ * the sequence. Reset discards saved work; slot_free releases the journal.
+ * There is no weight cache, ordinary allocation or automatic speculation. */
+int ds4_glm5_kda_replay_reserve(ds4_glm5_kda_layer_state *state,
+                               uint32_t capacity_tokens, uint32_t rank);
+uint64_t ds4_glm5_kda_replay_bytes(const ds4_glm5_kda_layer_state *state);
+int ds4_glm5_kda_verify_ready(const ds4_glm5_kda_layer_state *state,
+                               uint32_t n_tokens, uint32_t rank);
+/* Nonmutating all-layer commit preflight: require this exact pending pass. */
+int ds4_glm5_kda_verify_pending(const ds4_glm5_kda_layer_state *state,
+                                 uint64_t frontier, uint32_t n_tokens,
+                                 uint32_t rank);
+int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *state,
+                              ds4_glm5_kda_workspace *workspace,
+                              const ds4_glm5_kda_weight_offsets *weights,
+                              const void *model_map, uint64_t model_size,
+                              const ds4_gpu_tensor *input,
+                              ds4_gpu_tensor *gated_output,
+                              uint32_t n_tokens, float norm_eps);
+int ds4_glm5_kda_verify_finish(ds4_glm5_kda_layer_state *state,
+                               uint32_t accepted_inputs);
 int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                ds4_glm5_kda_workspace *workspace,
                                const ds4_glm5_kda_weight_offsets *weights,
@@ -166,6 +203,10 @@ int ds4_glm5_kda_digest_equal(const ds4_glm5_kda_digest *rank0,
  * implementation in ds4_glm5_kda.c. */
 int ds4_rocm_glm5_kda_layer_begin(
         const ds4_glm5_kda_device_args *args);
+int ds4_rocm_glm5_kda_verify_begin(const ds4_glm5_kda_device_args *args);
+int ds4_rocm_glm5_kda_replay_commit(ds4_glm5_kda_layer_state *state,
+                                    const ds4_glm5_kda_replay_buffers *buffers,
+                                    uint32_t accepted_inputs, uint32_t rank);
 int ds4_rocm_glm5_kda_layer_finish(
         const ds4_glm5_kda_device_args *args,
         const ds4_gpu_tensor *full_gated);

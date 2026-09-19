@@ -53,13 +53,13 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda_schedule.o ds4_glm5_next_runtime.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 # Resolve the ROCm toolchain once.  A gfx1151 build must not silently pick an
-# older `hipcc` from PATH when the validated 7.14 toolchain is available.
+# older `hipcc` from PATH when the pinned SDK 10.0.0 toolchain is available.
 # DS4_ROCM_HOME is the explicit override; ROCM_HOME remains accepted for
 # compatibility with existing build scripts.
 DS4_ROCM_HOME_REQUESTED := $(strip $(or $(DS4_ROCM_HOME),$(ROCM_HOME)))
 DS4_ROCM_HOME_AUTO := $(firstword $(foreach p,\
-    $(abspath $(CURDIR)/../toolchains/rocm-7.14.0-gfx1151/install) \
-    /opt/rocm-7.14.0 /opt/rocm,\
+    $(abspath $(CURDIR)/../toolchains/rocm-10.0.0-gfx1151/install) \
+    /opt/rocm-10.0.0 /opt/rocm,\
     $(if $(wildcard $(p)/bin/hipcc),$(p))))
 ifneq ($(DS4_ROCM_HOME_REQUESTED),)
 ROCM_HOME ?= $(DS4_ROCM_HOME_REQUESTED)
@@ -79,6 +79,8 @@ ifeq ($(ROCM_ARCH),gfx1151)
 ROCM_CFLAGS += -mno-wavefrontsize64 -DDS4_GFX1151_WAVE32=1
 endif
 ROCM_CFLAGS += $(DS4_PROFILE_CFLAGS)
+# Keep SDK headers ahead of unrelated distro rocWMMA installations.
+ROCM_CFLAGS += -isystem $(ROCM_HOME)/include
 ROCM_PRECISE_CFLAGS = $(filter-out -ffast-math,$(ROCM_CFLAGS)) -fno-fast-math -ffp-contract=off
 ROCM_LDLIBS ?= -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
@@ -89,7 +91,10 @@ endif
 .PHONY: all help clean test test-quality-gates test-successor-quality-test test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
+	python3 tests/test_rocm_toolchain.py
 	bash tests/test_quality_env.sh
+	python3 tests/test_quality_completion.py
+	python3 tests/test_quality_terminal_proof.py
 	python3 tests/test_glm5_tp_layout.py
 	./tests/test_baseline_genesis.sh
 	python3 tests/test_frontier_logits_gate.py
@@ -98,12 +103,15 @@ test-quality-gates:
 	python3 tests/test_ds4_gate_stats.py
 	python3 tests/test_promotion_boundary_calibration.py
 	python3 tests/test_ds4_gate_controls.py
+	python3 tests/test_gate_candidate_classification.py
 	python3 tests/test_promotion_proof.py
+	python3 tests/test_sdk_migration_proof.py
 	./tests/test_lane_c_oracle_gate.sh
 	./tests/test_candidate_gate.sh
 	./tests/run-clean-gate-python.sh tests/test_baseline_control_journal.py
 	python3 tests/test_control_anchor_env.py
 	./tests/test_glm5_prefill_proof.sh
+	python3 tests/test_glm5_decode_engagement.py
 	./tests/test_bench_producer_identity.sh
 	./tests/test_tp_worker_supervisor.sh
 
@@ -167,6 +175,80 @@ tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o
 test-rocm-glm5-q4k-shard-compose: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
 
+.PHONY: test-rocm-glm5-q4k-batch-partition
+tests/test_rocm_glm5_q4k_batch_partition.o: tests/test_rocm_glm5_q4k_batch_partition.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_q4k_batch_partition: tests/test_rocm_glm5_q4k_batch_partition.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_glm5_next_runtime.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-q4k-batch-partition: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 257 511 512 767 768 1000 1023 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows; \
+	done
+
+.PHONY: test-rocm-glm5-q4k-cold-lds5
+test-rocm-glm5-q4k-cold-lds5: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 256 512 768 1000 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --cold-lds5; \
+	done
+
+.PHONY: test-rocm-glm5-q4k-cold-lds5-padding
+test-rocm-glm5-q4k-cold-lds5-padding: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 256 512 768 1000 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --cold-lds5-pad; \
+	done
+
+.PHONY: test-rocm-glm5-q4k-grouped
+.PHONY: test-rocm-glm5-q4k-grouped-cold
+test-rocm-glm5-q4k-grouped-cold: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 256 512 768 1000 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --grouped-cold; \
+	done
+
+.PHONY: test-rocm-glm5-q4k-decode-rows
+.PHONY: test-rocm-glm5-q4k-decode-dot2
+.PHONY: test-rocm-glm5-q4k-decode-dot4
+test-rocm-glm5-q4k-decode-dot4: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for fixture in 0 1 2; do \
+		DS4_TEST_MOE_INPUT_CASE=$$fixture DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+		./tests/test_rocm_glm5_q4k_batch_partition 1 --decode-dot4; \
+	done
+
+test-rocm-glm5-q4k-decode-dot2: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for fixture in 0 1 2; do \
+		DS4_TEST_MOE_INPUT_CASE=$$fixture DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+		./tests/test_rocm_glm5_q4k_batch_partition 1 --decode-dot2; \
+	done
+
+test-rocm-glm5-q4k-decode-rows: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for fixture in 0 1 2; do for span in 32 64; do \
+		DS4_TEST_MOE_INPUT_CASE=$$fixture DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+		./tests/test_rocm_glm5_q4k_batch_partition 1 --decode$$span; \
+	done; done
+
+test-rocm-glm5-q4k-grouped: tests/test_rocm_glm5_q4k_batch_partition
+	@set -e; for rows in 256 512 768 1000 1024; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_batch_partition $$rows --grouped; \
+	done
+
+.PHONY: test-rocm-glm5-six-prefill-exact
+.PHONY: test-rocm-glm5-bf16-coalesced-weight
+test-rocm-glm5-bf16-coalesced-weight: tests/test_rocm_glm5_six_prefill_exact
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact 0 --coalesced
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact 1 --coalesced
+
+tests/test_rocm_glm5_six_prefill_exact.o: tests/test_rocm_glm5_six_prefill_exact.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_six_prefill_exact: tests/test_rocm_glm5_six_prefill_exact.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_glm5_next_runtime.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-six-prefill-exact: tests/test_rocm_glm5_six_prefill_exact
+	@set -e; for skinny in 0 1; do \
+		DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_six_prefill_exact $$skinny; \
+	done
+
 test-rocm-glm5-router-moe-bridge: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
 
@@ -200,6 +282,19 @@ tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 
 test-rocm-moe-wave-plan: tests/test_rocm_moe_wave_plan
 	./tests/test_rocm_moe_wave_plan
+
+tests/glm5_q4k_integer_block_kernels.o: tests/glm5_q4k_integer_block_kernels.cu tests/glm5_q4k_integer_block_test.hpp rocm/ds4_rocm_q4k_types.cuh rocm/ds4_rocm_q4k_dot.cuh ds4_rocm.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm5_q4k_integer_block.o: tests/test_glm5_q4k_integer_block.cu tests/glm5_q4k_integer_block_test.hpp tests/glm5_gguf_test.hpp rocm/ds4_rocm_q4k_types.cuh
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm5_q4k_integer_block: tests/test_glm5_q4k_integer_block.o tests/glm5_q4k_integer_block_kernels.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^
+
+.PHONY: test-glm5-q4k-integer-block
+test-glm5-q4k-integer-block: tests/test_glm5_q4k_integer_block
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_glm5_q4k_integer_block
 
 tests/test_rocm_glm5_kda_ref.o: tests/test_rocm_glm5_kda_ref.cu ds4_gpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
@@ -251,6 +346,54 @@ test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 		./tests/test_rocm_glm5_kda_layer
 
 .PHONY: test-rocm-glm5-mhc-layer
+tests/test_rocm_glm5_small_m.o: tests/test_rocm_glm5_small_m.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_small_m: tests/test_rocm_glm5_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_dense_q8_small_m.o: tests/test_rocm_glm5_dense_q8_small_m.cu tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_dense_q8_small_m: tests/test_rocm_glm5_dense_q8_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_shared_q8_small_m.o: tests/test_rocm_glm5_shared_q8_small_m.cu tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_shared_q8_small_m: tests/test_rocm_glm5_shared_q8_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_mla_output_small_m.o: tests/test_rocm_glm5_mla_output_small_m.cu tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_output_small_m: tests/test_rocm_glm5_mla_output_small_m.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_expert_pairs.o: tests/test_rocm_glm5_expert_pairs.cpp tests/glm5_gguf_test.hpp ds4_glm5_expert_pairs.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(CXX) -O2 -g -std=c++17 -Wall -Wextra -Werror -D__HIP_PLATFORM_AMD__ -DDS4_ROCM_BUILD -I. -I$(ROCM_HOME)/include -c -o $@ $<
+
+tests/test_rocm_glm5_expert_pairs: tests/test_rocm_glm5_expert_pairs.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_small_m_kda.o: tests/test_rocm_glm5_small_m_kda.cu tests/glm5_gguf_test.hpp ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_small_m_kda: tests/test_rocm_glm5_small_m_kda.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_mla_replay.o: tests/test_rocm_glm5_mla_replay.cu tests/glm5_gguf_test.hpp ds4_glm5_next_runtime.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_replay: tests/test_rocm_glm5_mla_replay.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_glm5_layer_verify.o: tests/test_rocm_glm5_layer_verify.cu tests/glm5_ffn_queue_probe.hpp tests/glm5_native_draft_checks.hpp tests/glm5_next_real_offsets.hpp tests/glm5_gguf_test.hpp ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_layer_verify: tests/test_rocm_glm5_layer_verify.o ds4_glm5_next_exec.o ds4_glm5_next_state.o ds4_glm5_next_runtime.o ds4_glm5_kda.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -Wl,--wrap=ds4_gpu_synchronize -Wl,--wrap=ds4_gpu_routed_moe_one_packed_q4k_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_kslice_tensor -Wl,--wrap=ds4_gpu_matmul_q8_0_tensor -Wl,--wrap=ds4_rocm_glm5_mla_output_q8_small_m -Wl,--wrap=ds4_rocm_glm5_expert_six_begin -Wl,--wrap=ds4_rocm_glm5_expert_six_down_row -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_mhc_layer.o: tests/test_rocm_glm5_mhc_layer.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
@@ -316,7 +459,7 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4.h ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
-tests/ds4_glm5_next_exec_test.o: ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+tests/ds4_glm5_next_exec_test.o: ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -c -o $@ $<
 
 tests/ds4_glm5_text_codec.o: ds4.c ds4.h
@@ -459,6 +602,17 @@ test-rocm-glm5-nope-attention: tests/test_rocm_glm5_nope_attention
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_nope_attention
 
 .PHONY: test-rocm-glm5-mla-qkv
+.PHONY: test-rocm-glm5-mla-owned-heads
+tests/test_rocm_glm5_mla_owned_heads.o: tests/test_rocm_glm5_mla_owned_heads.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_owned_heads: tests/test_rocm_glm5_mla_owned_heads.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-mla-owned-heads: tests/test_rocm_glm5_mla_owned_heads
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_mla_owned_heads
+
 tests/test_rocm_glm5_mla_qkv.o: tests/test_rocm_glm5_mla_qkv.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
@@ -579,7 +733,8 @@ tests/test_glm5_next_real_offset_hash: tests/test_glm5_next_real_offset_hash.cpp
 
 test-glm5-next-real-offset-hash: tests/test_glm5_next_real_offset_hash
 	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 2; }
-	@expected=7cea648ebfd0d89c; actual=$$(./tests/test_glm5_next_real_offset_hash "$(DS4_GLM5_MODEL)"); \
+	@test -n "$(DS4_GLM5_EXPECTED_OFFSET_HASH)" || { echo "DS4_GLM5_EXPECTED_OFFSET_HASH is required (bind it to the selected GGUF)" >&2; exit 2; }
+	@expected="$(DS4_GLM5_EXPECTED_OFFSET_HASH)"; actual=$$(./tests/test_glm5_next_real_offset_hash "$(DS4_GLM5_MODEL)"); \
 	 test "$$actual" = "$$expected" || { echo "FAIL GLM5 offset parity expected=$$expected actual=$$actual" >&2; exit 1; }; \
 	 echo "PASS GLM5 independent offset parity $$actual"
 
@@ -616,8 +771,22 @@ tests/test_glm5_kda_binding: tests/test_glm5_kda_binding.c ds4_glm5_kda.c ds4_gl
 tests/test_glm5_next_runtime_offsets: tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm5_kda.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_runtime_offsets.c ds4_glm5_next_runtime.c $(LDLIBS)
 
+tests/test_glm5_route_profile: tests/test_glm5_route_profile.c ds4_glm5_route_profile.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+tests/test_glm5_expert_pairs: tests/test_glm5_expert_pairs.c ds4_glm5_expert_pairs.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ $< -lm
+
+tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
+
 tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
+
+# Retain only the production target-commit path; unused GPU executor entry
+# points are discarded so this host failure-injection fixture needs no GPU.
+tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+	$(CC) $(CFLAGS) -DDS4_GLM5_TARGET_COMMIT_TEST -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -630,6 +799,23 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o tests/ds4_g
 
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
+
+tests/test_tp_native_cycle: tests/test_tp_native_cycle.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_native_cycle.c tests/ds4_tp_hello_test.o $(LDLIBS)
+
+.PHONY: test-tp-native-cycle
+test-tp-native-cycle: tests/test_tp_native_cycle
+	./tests/test_tp_native_cycle
+
+tests/test_tp_bulk_ready: tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_bulk_ready.c tests/ds4_tp_hello_test.o $(LDLIBS)
+
+.PHONY: test-tp-bulk-ready
+test-tp-bulk-ready: tests/test_tp_bulk_ready
+	./tests/test_tp_bulk_ready
+
+tests/test_glm5_native_session: tests/test_glm5_native_session.c ds4_glm5_native_session.inc tests/ds4_tp_hello_test.o ds4_tp.h ds4.h ds4_glm5_next_exec.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_glm5_native_session.c tests/ds4_tp_hello_test.o $(LDLIBS)
 
 tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 	$(HIPCC) -O2 -o $@ $< -libverbs
@@ -698,6 +884,19 @@ tests/test_tp_big_gate_overlap.o: tests/test_tp_big_gate_overlap.cu ds4_tp.h ds4
 
 tests/test_tp_big_gate_overlap: tests/test_tp_big_gate_overlap.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
+
+tests/test_tp_bulk_small.o: tests/test_tp_bulk_small.cu ds4_tp.h ds4.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_bulk_small: tests/test_tp_bulk_small.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
+
+.PHONY: test-tp-bulk-small
+test-tp-bulk-small: tests/test_tp_bulk_small
+	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
+		echo "error: set TP_ROLE TP_LEADER TP_PORT RDMA_DEVICE RDMA_GID_INDEX" >&2; exit 2; }
+	./tests/test_tp_bulk_small "$(TP_ROLE)" "$(TP_LEADER)" "$(TP_PORT)" \
+		"$(RDMA_DEVICE)" "$(RDMA_GID_INDEX)" "$(if $(TP_BULK_RECV_READY),$(TP_BULK_RECV_READY),1)" $(TP_BULK_TEST_MODE)
 
 test-tp-big-gate-overlap: tests/test_tp_big_gate_overlap
 	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
@@ -830,23 +1029,7 @@ check-rocm-strix:
 		echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH)"; \
 		exit 0; \
 	fi; \
-	if [ ! -x "$(HIPCC)" ]; then \
-		echo "error: gfx1151 requires executable hipcc at $(HIPCC)" >&2; \
-		echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 (or HIPCC=...)" >&2; \
-		exit 2; \
-	fi; \
-	version=$$("$(HIPCC)" --version 2>/dev/null | sed -n -e 's/^HIP version: \([0-9][0-9.]*\).*/\1/p' -e 's/.*release version \([0-9][0-9.]*\).*/\1/p' | head -n 1); \
-	[ -n "$$version" ] || version=unknown; \
-	echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH) version=$$version"; \
-	if [ "$$version" = unknown ] || [ "$$(printf '%s\n' 7.14.0 "$$version" | sort -V | head -n 1)" != 7.14.0 ]; then \
-		if [ "$${DS4_ALLOW_ROCM_MISMATCH:-0}" = 1 ]; then \
-			echo "warning: gfx1151 build is using ROCm $$version; expected >= 7.14.0 (override acknowledged)" >&2; \
-		else \
-			echo "error: gfx1151 requires ROCm >= 7.14.0, detected $$version" >&2; \
-			echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 or DS4_ALLOW_ROCM_MISMATCH=1 for diagnostics" >&2; \
-			exit 2; \
-		fi; \
-	fi
+	python3 scripts/check-rocm-toolchain.py --home "$(ROCM_HOME)" --hipcc "$(HIPCC_PATH)"
 
 strix-halo: check-rocm-strix
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent \
@@ -901,7 +1084,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_glm5_kda.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -916,7 +1099,7 @@ ds4_glm5_next_runtime.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm
 ds4_glm5_next_state.o: ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_state.c
 
-ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
+ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_route_profile.h ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_exec.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
@@ -970,7 +1153,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5_next_runtime.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -997,7 +1180,7 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_glm5_expert_pairs.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h rocm/ds4_rocm_glm5_kda.cuh
@@ -1021,7 +1204,7 @@ tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 tests/test_gpu_args: tests/test_gpu_args.o ds4_gpu_args_cpu.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -c -o $@ ds4.c
 
 tests/ds4_glm5_kda_schedule.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -1361,7 +1544,7 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_glm5_native_session.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
 tests/test_engine_mgpu_refusal.o: tests/test_engine_mgpu_refusal.c ds4.h ds4_gpu_mgpu.h
@@ -1421,7 +1604,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello tests/test_tp_native_cycle tests/test_tp_bulk_ready tests/test_glm5_native_session tests/test_glm5_route_profile \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
@@ -1431,6 +1614,10 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_tp_hello \
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_tp_hello
+	./tests/test_tp_native_cycle
+	./tests/test_tp_bulk_ready
+	./tests/test_glm5_native_session
+	./tests/test_glm5_route_profile
 	./tests/test_gpu_args_cli.sh
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling

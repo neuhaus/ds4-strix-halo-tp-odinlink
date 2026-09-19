@@ -9,6 +9,11 @@
 
 #include "ds4_gpu.h"
 #include "ds4_tp.h"
+#include "ds4_glm5_route_profile.h"
+#include "ds4_glm5_expert_pairs.h"
+#ifdef DS4_ROCM_BUILD
+#include "ds4_gpu_mgpu.h"
+#endif
 
 enum {
     GLM5_WIDTH = 4096,
@@ -39,11 +44,91 @@ enum {
 
 _Static_assert((DS4_GLM5_KDA_CHANNELS % 2u) == 0u,
                "KDA TP output K slices require an even channel count");
+_Static_assert(GLM5_EXPERTS == DS4_GLM5_ROUTE_PROFILE_EXPERTS &&
+               GLM5_EXPERTS_USED == DS4_GLM5_ROUTE_PROFILE_USED,
+               "route diagnostics must match the engine expert layout");
 
 static double glm5_exec_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_admit(ds4_glm5_expert_six_plan *p,
+        const ds4_glm5_expert_six_args *a) { (void)p; (void)a; return 0; }
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_begin(const ds4_glm5_expert_six_plan *p,
+        const ds4_glm5_expert_groups *g, const int32_t *ids, const float *weights) {
+    (void)p; (void)g; (void)ids; (void)weights; return 0;
+}
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_expert_six_down_row(const ds4_glm5_expert_six_plan *p, uint32_t row) {
+    (void)p; (void)row; return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_dense_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)offset0; (void)offset1; (void)in_dim; (void)out_dim;
+    (void)x; (void)tokens;
+    return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_shared_q8_small_m(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t offset0, uint64_t offset1,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)offset0; (void)offset1; (void)in_dim; (void)out_dim;
+    (void)row_bytes; (void)k_first; (void)x; (void)tokens;
+    return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_mla_output_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out; (void)model_map; (void)model_size; (void)offset;
+    (void)full_in_dim; (void)k_first; (void)in_dim; (void)out_dim;
+    (void)row_bytes; (void)x; (void)tokens;
+    return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_mla_output_q8_small_m_supported(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out; (void)model_map; (void)model_size; (void)offset;
+    (void)full_in_dim; (void)k_first; (void)in_dim; (void)out_dim;
+    (void)row_bytes; (void)x; (void)tokens;
+    return 0;
 }
 
 static void glm5_phase_trace(const ds4_glm5_next_exec_ctx *ctx,
@@ -246,6 +331,8 @@ _Static_assert(GLM5_EXPERTS_USED * GLM5_WIDTH ==
 
 struct ds4_glm5_next_workspace {
     uint32_t capacity_tokens;
+    uint64_t expert_six_calls[2], expert_tail_calls[2], expert_pair_reads[2];
+    uint32_t expert_pair_rank, expert_pair_mode;
     uint32_t sparse_pool_capacity;
     ds4_gpu_tensor *hc_mean_weights;
     ds4_gpu_tensor *output_hidden;
@@ -301,6 +388,12 @@ struct ds4_glm5_next_workspace {
      * layer is a diagnostic alternative to re-uploading every token. */
     ds4_gpu_q4k_window_cache *q4_window[DS4_GLM5_NEXT_LAYER_COUNT];
     ds4_gpu_q4k_window_cache *q4_window_scratch;
+    bool draft_only;
+    /* One dedicated workspace stays with one state/model/link for its lifetime. */
+    const ds4_glm5_next_state *draft_owner;
+    ds4_glm5_next_exec_ctx draft_context;
+    uint32_t draft_runtime_features;
+    uint64_t draft_prefill_config;
     bool decode_phase;
     ds4_glm5_kda_workspace kda;
 };
@@ -359,6 +452,12 @@ static int route_failure_stats(const char *name,
 
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     if (!w) return;
+    if (w->expert_pair_mode) fprintf(stderr,
+        "VERIFY_EXPERT_PAIRS rank=%u mode=%u workspace=%u kda_six=%llu mla_six=%llu kda_tail=%llu mla_tail=%llu kda_pairs=%llu mla_pairs=%llu\n",
+        w->expert_pair_rank, w->expert_pair_mode, w->capacity_tokens,
+        (unsigned long long)w->expert_six_calls[0], (unsigned long long)w->expert_six_calls[1],
+        (unsigned long long)w->expert_tail_calls[0], (unsigned long long)w->expert_tail_calls[1],
+        (unsigned long long)w->expert_pair_reads[0], (unsigned long long)w->expert_pair_reads[1]);
     if (w->q4_window_scratch) {
         ds4_gpu_q4k_window_cache_destroy(w->q4_window_scratch);
         w->q4_window_scratch = NULL;
@@ -836,6 +935,38 @@ static int kda_half_state_view(ds4_glm5_kda_layer_state *local,
     return 1;
 }
 
+static int kda_prefix_rows(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                           ds4_glm5_next_workspace *w,
+                           const ds4_gpu_tensor *hc_in, uint32_t n_tokens,
+                           bool serial_mix) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    if (!ds4_gpu_rms_norm_plain_rows_tensor(
+            w->hc_flat, hc_in, GLM5_HC_WIDTH, n_tokens,
+            ctx->model->rms_norm_eps)) return 0;
+    if (serial_mix) {
+        const uint64_t in_bytes = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)GLM5_HC_MIX * sizeof(float);
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            ds4_gpu_tensor *in = ds4_gpu_tensor_view(w->hc_flat, t * in_bytes, in_bytes);
+            ds4_gpu_tensor *out = ds4_gpu_tensor_view(w->hc_mix, t * out_bytes, out_bytes);
+            const int ok = in && out && ds4_gpu_matmul_bf16_tensor(
+                out, ctx->model_map, ctx->model_size, layer->hc.attn_fn,
+                GLM5_HC_WIDTH, GLM5_HC_MIX, in, 1u);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(in);
+            if (!ok) return 0;
+        }
+    } else if (!ds4_gpu_matmul_bf16_tensor(
+            w->hc_mix, ctx->model_map, ctx->model_size,
+            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
+            w->hc_flat, n_tokens)) return 0;
+    return ds4_gpu_hc_split_weighted_sum_tensor(
+        w->collapsed, w->hc_split, w->hc_mix, hc_in,
+        ctx->model_map, ctx->model_size,
+        layer->hc.attn_scale, layer->hc.attn_base,
+        GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps);
+}
+
 static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t il,
                               ds4_glm5_next_state *state,
@@ -844,20 +975,9 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
+    if (state->kda.pending_verifications) return 0;
     glm5_phase_trace(ctx, "kda_prefix_enter", il, n_tokens);
-    const int prefix_ok =
-        ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, n_tokens,
-            ctx->model->rms_norm_eps) &&
-        ds4_gpu_matmul_bf16_tensor(
-            w->hc_mix, ctx->model_map, ctx->model_size,
-            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->hc_flat, n_tokens) &&
-        ds4_gpu_hc_split_weighted_sum_tensor(
-            w->collapsed, w->hc_split, w->hc_mix, hc_in,
-            ctx->model_map, ctx->model_size,
-            layer->hc.attn_scale, layer->hc.attn_base,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps);
+    const int prefix_ok = kda_prefix_rows(ctx, il, w, hc_in, n_tokens, false);
     if (!prefix_ok) return 0;
     glm5_phase_trace(ctx, "kda_prefix_done", il, n_tokens);
 #ifdef DS4_TP_TEST_HOOKS
@@ -1180,6 +1300,48 @@ static const ds4_gpu_tensor *kda_attention_result_for_trace(
 }
 #endif
 
+static int dense_ffn_prefix(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                            ds4_glm5_next_workspace *w,
+                            uint32_t n_tokens, int finite_debug) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    int ok = ds4_gpu_rms_norm_plain_rows_tensor(
+        w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
+        ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_bf16_tensor(
+            w->ffn_mix, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
+            w->ffn_flat, n_tokens) &&
+        ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
+            w->after_attention, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps);
+    if (finite_debug) route_failure_stats("dense_ffn_hidden", w->ffn_hidden,
+                                          n_tokens * GLM5_WIDTH);
+    return ok;
+}
+
+static int dense_ffn_rows(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                          ds4_glm5_next_workspace *w, ds4_gpu_tensor *hc_out,
+                          uint32_t n_tokens, int finite_debug) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    int ok = dense_ffn_prefix(ctx, il, w, n_tokens, finite_debug);
+    if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+        w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
+        layer->ffn_weight.gate, layer->ffn_weight.up,
+        GLM5_WIDTH, GLM5_DENSE_MID, w->ffn_hidden, n_tokens, 10.0f) &&
+        ds4_gpu_matmul_q8_0_tensor(
+            w->down, ctx->model_map, ctx->model_size,
+            layer->ffn_weight.down, GLM5_DENSE_MID, GLM5_WIDTH,
+            w->mid, n_tokens);
+    if (finite_debug) route_failure_stats("dense_ffn_down", w->down,
+                                          n_tokens * GLM5_WIDTH);
+    return ok && ds4_gpu_hc_expand_split_tensor(
+        hc_out, w->down, w->after_attention, w->ffn_split,
+        GLM5_WIDTH, GLM5_HC);
+}
+
 static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
                                   uint32_t il,
                                   ds4_glm5_next_state *state,
@@ -1187,7 +1349,6 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
                                   const ds4_gpu_tensor *hc_in,
                                   ds4_gpu_tensor *hc_out,
                                   uint32_t n_tokens) {
-    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const int finite_debug = getenv("DS4_GLM5_NEXT_VALIDATE_FINITE") != NULL;
     const int async_terminal =
         glm5_decode_async_layer_enabled(w, n_tokens);
@@ -1215,34 +1376,7 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
         route_failure_stats("dense_after_attention", w->after_attention,
                             n_tokens * GLM5_HC_WIDTH);
     }
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(
-            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
-            ctx->model->rms_norm_eps);
-    if (ok) ok = ds4_gpu_matmul_bf16_tensor(
-            w->ffn_mix, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->ffn_flat, n_tokens);
-    if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
-            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
-            w->after_attention, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
-            ctx->model->rms_norm_eps);
-    if (finite_debug) route_failure_stats("dense_ffn_hidden", w->ffn_hidden,
-                                          n_tokens * GLM5_WIDTH);
-    if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
-            w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
-            layer->ffn_weight.gate, layer->ffn_weight.up,
-            GLM5_WIDTH, GLM5_DENSE_MID, w->ffn_hidden, n_tokens, 10.0f);
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
-            w->down, ctx->model_map, ctx->model_size,
-            layer->ffn_weight.down, GLM5_DENSE_MID, GLM5_WIDTH,
-            w->mid, n_tokens);
-    if (finite_debug) route_failure_stats("dense_ffn_down", w->down,
-                                          n_tokens * GLM5_WIDTH);
-    if (ok) ok = ds4_gpu_hc_expand_split_tensor(
-            hc_out, w->down, w->after_attention, w->ffn_split,
-            GLM5_WIDTH, GLM5_HC);
+    if (ok) ok = dense_ffn_rows(ctx, il, w, hc_out, n_tokens, finite_debug);
 #ifdef DS4_TP_TEST_HOOKS
     if (ok && n_tokens == 1u)
         ok = trace_tensor(
@@ -1309,7 +1443,7 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
     if (cache_fence && !fence_release && !fence_acquire) return 0;
 
     const int small_gate_requested =
-        bytes == ds4_tp_vec_bytes(ctx->tp) &&
+        !ctx->force_bulk_gates && bytes == ds4_tp_vec_bytes(ctx->tp) &&
         (ds4_tp_runtime_features(ctx->tp) &
          DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u;
     if (small_gate_requested) {
@@ -1377,7 +1511,10 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
             return 0;
         }
         const uint64_t sequence = ++*ctx->tp_sequence;
-        const int exchanged = direct_send ?
+        const bool native_session = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(ctx->tp)) != 0u;
+        const int exchanged = native_session ?
+            ds4_tp_native_gate_exchange_next(ctx->tp, layer, gate,
+                direct_send ? ctx->tp_big_out_host : NULL) : direct_send ?
             ds4_tp_gate_exchange_from_registered(
                 ctx->tp, layer, gate, sequence, ctx->tp_big_out_host) :
             ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence);
@@ -1720,12 +1857,39 @@ static int validate_layer_finite(const ds4_glm5_next_exec_ctx *ctx,
     return finite;
 }
 
+/* Independent of routed IDs/weights. Queue the incumbent shared arithmetic
+ * before waiting on peer agreement; all outputs use separate shared scratch.
+ * The caller drains outstanding work on any later failure. */
+static int shared_ffn_before_route_check(
+        const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
+        ds4_glm5_next_workspace *w) {
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[layer].ffn_weight;
+    const uint32_t base = ctx->tp_rank * GLM5_RANK_MID;
+    const uint64_t row_bytes =
+        (GLM5_WIDTH / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    return ds4_gpu_matmul_q8_0_tensor(
+               w->shared_gate, ctx->model_map, ctx->model_size,
+               f->gate_shexp + (uint64_t)base * row_bytes,
+               GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+           ds4_gpu_matmul_q8_0_tensor(
+               w->shared_up, ctx->model_map, ctx->model_size,
+               f->up_shexp + (uint64_t)base * row_bytes,
+               GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+           ds4_gpu_swiglu_tensor(w->shared_mid, w->shared_gate, w->shared_up,
+                                GLM5_RANK_MID, 10.0f, 1.0f) &&
+           ds4_gpu_matmul_q8_0_kslice_tensor(
+               w->shared_out, ctx->model_map, ctx->model_size, f->down_shexp,
+               GLM5_ROUTED_MID, base, GLM5_RANK_MID,
+               GLM5_WIDTH, w->shared_mid, 0u);
+}
+
 static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
                         uint32_t token_ordinal,
                         const ds4_gpu_tensor *selected,
                         const ds4_gpu_tensor *weights,
                         const ds4_gpu_tensor *logits,
-                        const ds4_gpu_tensor *hidden) {
+                        const ds4_gpu_tensor *hidden,
+                        ds4_glm5_next_workspace *early_shared) {
     int32_t ids[GLM5_EXPERTS_USED];
     float route_weights[GLM5_EXPERTS_USED];
     if (!tp_context_valid(ctx)) {
@@ -1770,6 +1934,10 @@ static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     const uint64_t check_sequence = fnv64_continue(
         UINT64_C(1469598103934665603), sequence_fields,
         sizeof(sequence_fields));
+    if (early_shared && !shared_ffn_before_route_check(ctx, layer, early_shared)) {
+        ds4_tp_mark_failed(ctx->tp);
+        return 0;
+    }
     char error[256] = {0};
     const int rc = ds4_tp_hash_check(ctx->tp, check_sequence, hash,
                                      error, sizeof(error));
@@ -1780,6 +1948,32 @@ static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
         return 0;
     }
     return 1;
+}
+
+/* Return -1 for an invalid requested decode configuration, never silently
+ * substitute another schedule. The switch deliberately does not alter prefill. */
+static int shared_route_overlap_mode(const ds4_glm5_next_exec_ctx *ctx,
+                                      const ds4_glm5_next_workspace *w,
+                                      int q4_residency) {
+    const char *value = getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") != 0 || !ctx || !w) return -1;
+    if (!w->decode_phase) return 0;
+#ifdef DS4_ROCM_BUILD
+    const char *paired = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+    const char *window_overlap = getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
+    const char *window_scratch = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
+    /* This schedule is qualified only for resident experts. Reject the
+     * separate window/scratch overlap recipe explicitly rather than letting
+     * residency silently mask an untested combination of scheduling modes. */
+    if (window_overlap && strcmp(window_overlap, "1") == 0 &&
+        window_scratch && strcmp(window_scratch, "1") == 0) return -1;
+    if (q4_residency == 1 && ctx->tp_rank < 2u && tp_context_valid(ctx) &&
+        (!paired || strcmp(paired, "0") == 0)) return 1;
+#else
+    (void)q4_residency;
+#endif
+    return -1;
 }
 
 static int route_batch_agrees(const ds4_glm5_next_exec_ctx *ctx,
@@ -1945,26 +2139,6 @@ static int local_q4k_half_residency(
     return loaded == 0 ? 0 : loaded == 3 ? 1 : -1;
 }
 
-static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
-                                  const ds4_glm5_next_layer_offsets *layer) {
-    const uint64_t gate_row_bytes =
-        (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
-    const uint64_t down_half_bytes =
-        (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
-    const uint32_t row_base = ctx->tp_rank * GLM5_RANK_MID;
-    const uint64_t column_base = (uint64_t)ctx->tp_rank * down_half_bytes;
-    return declare_local_q4k_half_only(ctx, layer) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.gate_exps,
-               row_base, GLM5_RANK_MID, 0u, gate_row_bytes) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.up_exps,
-               row_base, GLM5_RANK_MID, 0u, gate_row_bytes) &&
-           ds4_gpu_q4k_packed_slice_load(
-               ctx->model_map, layer->ffn_weight.down_exps,
-               0u, GLM5_WIDTH, column_base, down_half_bytes);
-}
-
 static int mla_publish_completed_pool(
         const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_mla_offsets *offsets,
@@ -2006,7 +2180,8 @@ static int mla_sparse_prelude_rows(
         const ds4_gpu_tensor *hc_in,
         uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos0 = mla->token_count;
     const uint64_t full_heads =
@@ -2077,37 +2252,129 @@ static int mla_sparse_prelude_rows(
             w->ffn_hidden, n_tokens);
 }
 
+/* Scalar MLA owns the same contiguous heads as its existing output K slice.
+ * Prefill consumers retain full heads; the verifier's deferred tail explicitly
+ * keeps this scalar layout. Only native Q8 pointer offsets change here.
+ */
+static int mla_scalar_head_layout(const ds4_glm5_next_exec_ctx *ctx,
+                                  bool scalar_consumer,
+                                  ds4_glm5_next_mla_offsets *m,
+                                  uint32_t *heads,
+                                  uint64_t *output_input_start) {
+    const char *value = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if (value && strcmp(value, "0") != 0 && strcmp(value, "1") != 0)
+        return 0;
+    *heads = GLM5_HEADS;
+    *output_input_start =
+        (uint64_t)ctx->tp_rank * (GLM5_HEADS / 2u) * GLM5_HEAD_DIM;
+    if (!scalar_consumer || !value || strcmp(value, "1") != 0) return 1;
+    /* Full-layout tensor dumps have a separate contract; never emit a stale
+     * unowned half as if this were a complete 64-head projection. */
+    if (ctx->tp_rank > 1u || ctx->trace_prefix) return 0;
+    const uint64_t first_head = (uint64_t)ctx->tp_rank * (GLM5_HEADS / 2u);
+    const uint64_t q_offset = first_head * GLM5_HEAD_DIM *
+        (GLM5_Q_RANK / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    const uint64_t k_offset = first_head * GLM5_KV_LORA *
+        (GLM5_HEAD_DIM / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    const uint64_t v_offset = first_head * GLM5_HEAD_DIM *
+        (GLM5_KV_LORA / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    if (m->q_b > UINT64_MAX - q_offset ||
+        m->k_b > UINT64_MAX - k_offset ||
+        m->v_b > UINT64_MAX - v_offset) return 0;
+    m->q_b += q_offset;
+    m->k_b += k_offset;
+    m->v_b += v_offset;
+    *heads = GLM5_HEADS / 2u;
+    *output_input_start = 0u;
+    static int reported[2];
+    if (!reported[ctx->tp_rank]) {
+        fprintf(stderr, "ds4: GLM5 scalar MLA owned heads active "
+                "rank=%u first=%llu heads=%u indexer_heads=%u\n",
+                ctx->tp_rank, (unsigned long long)first_head,
+                *heads, GLM5_INDEX_HEADS);
+        reported[ctx->tp_rank] = 1;
+    }
+    return 1;
+}
+
+static int mla_scalar_prepare(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_layer_offsets *layer, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *input) {
+    if (!layer->is_trunk)
+        return ds4_gpu_rms_norm_weight_tensor(w->ffn_hidden, input,
+            ctx->model_map, ctx->model_size, layer->attn_norm,
+            GLM5_WIDTH, ctx->model->rms_norm_eps);
+    return ds4_gpu_rms_norm_plain_rows_tensor(w->hc_flat, input,
+            GLM5_HC_WIDTH, 1u, ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_bf16_tensor(w->hc_mix, ctx->model_map, ctx->model_size,
+            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX, w->hc_flat, 1u) &&
+        ds4_gpu_hc_split_weighted_sum_norm_tensor(w->collapsed, w->ffn_hidden,
+            w->hc_split, w->hc_mix, input, ctx->model_map, ctx->model_size,
+            layer->hc.attn_scale, layer->hc.attn_base, layer->attn_norm,
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps, ctx->model->rms_norm_eps);
+}
+
+static int mla_scalar_residual(const ds4_glm5_next_layer_offsets *layer,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *input) {
+    return layer->is_trunk ? ds4_gpu_hc_expand_split_tensor(
+            w->after_attention, w->attention, input, w->hc_split, GLM5_WIDTH, GLM5_HC) :
+        ds4_gpu_add_tensor(w->after_attention, input, w->attention, GLM5_WIDTH);
+}
+
+/* Verifier-only diagnostic. NULL preserves the original asynchronous call
+ * sequence. Completed spans add fences and include host/peer waiting; they
+ * are not active GPU time or a pure network latency measurement. */
+enum {
+    MLA_PROFILE_ENTRY, MLA_PROFILE_PREPARE_QKV, MLA_PROFILE_KV_STORE,
+    MLA_PROFILE_LOWRANK, MLA_PROFILE_INDEX_STATE, MLA_PROFILE_SELECT,
+    MLA_PROFILE_ATTENTION, MLA_PROFILE_OUTPUT, MLA_PROFILE_EXCHANGE,
+    MLA_PROFILE_RESIDUAL, MLA_PROFILE_COUNT
+};
+typedef struct {
+    double last, seconds[MLA_PROFILE_COUNT];
+    uint32_t dense_rows, sparse_rows;
+} glm5_mla_profile;
+
+static int mla_profile_mark(glm5_mla_profile *p, unsigned stage) {
+    if (!p) return 1;
+    if (!ds4_gpu_synchronize()) return 0;
+    const double now = glm5_exec_now_sec();
+    p->seconds[stage] += now - p->last;
+    p->last = now;
+    return 1;
+}
+
+static int mla_profile_begin(glm5_mla_profile *p) {
+    if (!p) return 1;
+    p->last = glm5_exec_now_sec();
+    return mla_profile_mark(p, MLA_PROFILE_ENTRY);
+}
+
 /* The official selector uses the full visible range through top-k. Pooled
  * selection begins only when visible exceeds 2048 and is a separate path. */
-static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
+static int mla_dense_selection_attention_impl(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t il,
-                                       ds4_glm5_next_state *state,
+                                       ds4_glm5_next_mla_state *mla,
                                        ds4_glm5_next_workspace *w,
                                        const ds4_gpu_tensor *hc_in,
                                        uint32_t visible,
                                        uint32_t tail_slot,
                                        uint32_t pool_index,
-                                       bool publish_pool) {
+                                       bool publish_pool,
+                                       bool defer_tail,
+                                       glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
-    ds4_glm5_next_mla_state *mla = &state->mla[il];
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
+    uint32_t heads = GLM5_HEADS;
+    uint64_t output_input_start = 0u;
     const uint32_t pos = mla->token_count;
     const uint64_t half_heads =
         ((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM) / 2u;
-    return
-        ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
-            ctx->model->rms_norm_eps) &&
-        ds4_gpu_matmul_bf16_tensor(
-            w->hc_mix, ctx->model_map, ctx->model_size,
-            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->hc_flat, 1u) &&
-        ds4_gpu_hc_split_weighted_sum_norm_tensor(
-            w->collapsed, w->ffn_hidden, w->hc_split, w->hc_mix, hc_in,
-            ctx->model_map, ctx->model_size,
-            layer->hc.attn_scale, layer->hc.attn_base, layer->attn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
-            ctx->model->rms_norm_eps) &&
+    if (!mla_scalar_head_layout(ctx, true, &local_m,
+                                &heads, &output_input_start)) return 0;
+    int ok = mla_profile_begin(profile) &&
+        mla_scalar_prepare(ctx, layer, w, hc_in) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
             GLM5_WIDTH, GLM5_Q_RANK, w->ffn_hidden, 1u) &&
@@ -2116,7 +2383,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             m->q_a_norm, GLM5_Q_RANK, ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, GLM5_HEADS * GLM5_HEAD_DIM,
+            GLM5_Q_RANK, heads * GLM5_HEAD_DIM,
             w->mla_q_resid, 1u) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
@@ -2126,14 +2393,17 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             ctx->model_map, ctx->model_size, m->kv_a_norm,
             1u, GLM5_KV_LORA, GLM5_KV_LORA,
             ctx->model->rms_norm_eps) &&
+        mla_profile_mark(profile, MLA_PROFILE_PREPARE_QKV) &&
         ds4_gpu_glm_store_compact_kv_tensor(
             mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
             pos, 1u, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
+        mla_profile_mark(profile, MLA_PROFILE_KV_STORE) &&
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+        mla_profile_mark(profile, MLA_PROFILE_LOWRANK) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2152,39 +2422,65 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                             (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
                             w->mla_pool_gate_raw,
                             0u, GLM5_INDEX_DIM * sizeof(float)) &&
+        ds4_glm5_next_mla_verify_record(
+            mla, mla->token_count, mla->index_tail,
+            (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
+            w->mla_pool_gate_raw, 0u, 1u) &&
         mla_publish_completed_pool(
             ctx, m, mla, w, pool_index, publish_pool) &&
+        mla_profile_mark(profile, MLA_PROFILE_INDEX_STATE) &&
         ds4_gpu_glm_fill_selected_range_tensor(w->mla_selected_token,
                                                 visible) &&
+        mla_profile_mark(profile, MLA_PROFILE_SELECT) &&
         ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             w->mla_heads, w->mla_query, w->mla_qk_low,
             mla->compact_kv, NULL, ctx->model_map, ctx->model_size,
             m->v_b, 8u, w->mla_selected_token, visible,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+        mla_profile_mark(profile, MLA_PROFILE_ATTENTION);
+    if (defer_tail) {
+        if (ok && profile) ++profile->dense_rows;
+        return ok;
+    }
+    ok = ok &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
             ctx->tp_big_out, ctx->model_map, ctx->model_size, m->output,
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
-            (uint64_t)ctx->tp_rank * half_heads) &&
+            output_input_start) &&
+        mla_profile_mark(profile, MLA_PROFILE_OUTPUT) &&
         tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
                            GLM5_WIDTH) &&
-        ds4_gpu_hc_expand_split_tensor(
-            w->after_attention, w->attention, hc_in, w->hc_split,
-            GLM5_WIDTH, GLM5_HC);
+        mla_scalar_residual(layer, w, hc_in) &&
+        mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (ok && profile) ++profile->dense_rows;
+    return ok;
+}
+
+static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
+                                       uint32_t il,
+                                       ds4_glm5_next_mla_state *mla,
+                                       ds4_glm5_next_workspace *w,
+                                       const ds4_gpu_tensor *hc_in,
+                                       uint32_t visible, uint32_t tail_slot,
+                                       uint32_t pool_index, bool publish_pool) {
+    return mla_dense_selection_attention_impl(ctx, il, mla, w, hc_in,
+        visible, tail_slot, pool_index, publish_pool, false, NULL);
 }
 
 /* Beyond the model's 2048-row index budget, score completed pool-4 keys,
  * retain the best 512 pools, expand them back to raw rows, and append the
  * current incomplete tail.  All selector intermediates remain device-local;
  * only the established attention output slice crosses RDMA. */
-static int mla_sparse_selection_attention(
+static int mla_sparse_selection_attention_impl(
         const ds4_glm5_next_exec_ctx *ctx,
         uint32_t il,
-        ds4_glm5_next_state *state,
+        ds4_glm5_next_mla_state *mla,
         ds4_glm5_next_workspace *w,
         const ds4_gpu_tensor *hc_in,
         uint32_t tail_slot,
@@ -2193,10 +2489,14 @@ static int mla_sparse_selection_attention(
         uint32_t top_k,
         ds4_gpu_tensor *local_output,
         bool project_output,
-        bool finish_attention) {
+        bool finish_attention,
+        bool defer_tail,
+        glm5_mla_profile *profile) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
-    ds4_glm5_next_mla_state *mla = &state->mla[il];
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
+    uint32_t heads = GLM5_HEADS;
+    uint64_t output_input_start = 0u;
     const uint32_t pos = mla->token_count;
     uint32_t visible = 0u, n_pools = 0u, selected_pools = 0u;
     uint32_t selected_tokens = 0u;
@@ -2222,20 +2522,10 @@ static int mla_sparse_selection_attention(
          (!project_output || local_output != ctx->tp_big_out))) {
         return 0;
     }
-    int ok =
-        ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
-            ctx->model->rms_norm_eps) &&
-        ds4_gpu_matmul_bf16_tensor(
-            w->hc_mix, ctx->model_map, ctx->model_size,
-            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->hc_flat, 1u) &&
-        ds4_gpu_hc_split_weighted_sum_norm_tensor(
-            w->collapsed, w->ffn_hidden, w->hc_split, w->hc_mix, hc_in,
-            ctx->model_map, ctx->model_size,
-            layer->hc.attn_scale, layer->hc.attn_base, layer->attn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
-            ctx->model->rms_norm_eps) &&
+    if (!mla_scalar_head_layout(ctx, finish_attention, &local_m,
+                                &heads, &output_input_start)) return 0;
+    int ok = mla_profile_begin(profile) &&
+        mla_scalar_prepare(ctx, layer, w, hc_in) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
             GLM5_WIDTH, GLM5_Q_RANK, w->ffn_hidden, 1u) &&
@@ -2244,7 +2534,7 @@ static int mla_sparse_selection_attention(
             m->q_a_norm, GLM5_Q_RANK, ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, GLM5_HEADS * GLM5_HEAD_DIM,
+            GLM5_Q_RANK, heads * GLM5_HEAD_DIM,
             w->mla_q_resid, 1u) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
@@ -2254,14 +2544,17 @@ static int mla_sparse_selection_attention(
             ctx->model_map, ctx->model_size, m->kv_a_norm,
             1u, GLM5_KV_LORA, GLM5_KV_LORA,
             ctx->model->rms_norm_eps) &&
+        mla_profile_mark(profile, MLA_PROFILE_PREPARE_QKV) &&
         ds4_gpu_glm_store_compact_kv_tensor(
             mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
             pos, 1u, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
+        mla_profile_mark(profile, MLA_PROFILE_KV_STORE) &&
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+        mla_profile_mark(profile, MLA_PROFILE_LOWRANK) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2280,6 +2573,10 @@ static int mla_sparse_selection_attention(
             mla->pool_gate_tail,
             (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
             w->mla_pool_gate_raw, 0u, GLM5_INDEX_DIM * sizeof(float)) &&
+        ds4_glm5_next_mla_verify_record(
+            mla, mla->token_count, mla->index_tail,
+            (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
+            w->mla_pool_gate_raw, 0u, 1u) &&
         mla_publish_completed_pool(
             ctx, m, mla, w, pool_index, publish_pool) &&
         ds4_gpu_matmul_bf16_tensor(
@@ -2289,7 +2586,8 @@ static int mla_sparse_selection_attention(
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_weights, ctx->model_map, ctx->model_size,
             m->index_proj, GLM5_WIDTH, GLM5_INDEX_HEADS,
-            w->ffn_hidden, 1u);
+            w->ffn_hidden, 1u) &&
+        mla_profile_mark(profile, MLA_PROFILE_INDEX_STATE);
     ok = ok &&
         ds4_gpu_glm_indexer_score_one_tensor(
             w->mla_pool_scores, w->mla_index_q, w->mla_index_weights,
@@ -2305,15 +2603,21 @@ static int mla_sparse_selection_attention(
             mla->index_pool_ids, mla->index_pool_valid,
             mla->index_valid_keys, n_pools, selected_pools,
             mla->capacity_tokens, mla->first_valid, visible,
-            top_k, GLM5_INDEX_POOL);
+            top_k, GLM5_INDEX_POOL) &&
+        mla_profile_mark(profile, MLA_PROFILE_SELECT);
     ok = ok &&
         ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             w->mla_heads, w->mla_query, w->mla_qk_low,
             mla->compact_kv, NULL, ctx->model_map, ctx->model_size,
             m->v_b, 8u, w->mla_selected_token, selected_tokens,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
-            1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+        mla_profile_mark(profile, MLA_PROFILE_ATTENTION);
+    if (defer_tail) {
+        if (ok && profile) ++profile->sparse_rows;
+        return ok;
+    }
     if (!project_output) return ok;
     ok = ok &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
@@ -2321,15 +2625,149 @@ static int mla_sparse_selection_attention(
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
-            (uint64_t)ctx->tp_rank * half_heads);
+            output_input_start) &&
+        mla_profile_mark(profile, MLA_PROFILE_OUTPUT);
     if (!finish_attention) return ok;
-    ok = ok && tp_exchange(ctx, il, DS4_TP_GATE_ATTN);
+    ok = ok && tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE);
     ok = ok &&
         ds4_gpu_add_tensor(
             w->attention, ctx->tp_big_out, ctx->tp_big_in, GLM5_WIDTH) &&
-        ds4_gpu_hc_expand_split_tensor(
-            w->after_attention, w->attention, hc_in, w->hc_split,
-            GLM5_WIDTH, GLM5_HC);
+        mla_scalar_residual(layer, w, hc_in) &&
+        mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (ok && profile) ++profile->sparse_rows;
+    return ok;
+}
+
+static int mla_sparse_selection_attention(
+        const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        ds4_glm5_next_mla_state *mla, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in, uint32_t tail_slot, uint32_t pool_index,
+        bool publish_pool, uint32_t top_k, ds4_gpu_tensor *local_output,
+        bool project_output, bool finish_attention) {
+    return mla_sparse_selection_attention_impl(ctx, il, mla, w, hc_in,
+        tail_slot, pool_index, publish_pool, top_k, local_output,
+        project_output, finish_attention, false, NULL);
+}
+
+static int mla_output_small_m(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        const ds4_glm5_next_workspace *batch, uint32_t rows, bool launch) {
+    const uint32_t full = GLM5_HEADS * GLM5_HEAD_DIM, local = full / 2u;
+    return (launch ? ds4_rocm_glm5_mla_output_q8_small_m :
+        ds4_rocm_glm5_mla_output_q8_small_m_supported)(ctx->tp_big_out,
+        ctx->model_map, ctx->model_size, ctx->model->layer[il].mla.output,
+        full, ctx->tp_rank * local, local, GLM5_WIDTH,
+        (uint64_t)full / GLM5_Q8_QK * GLM5_Q8_BLOCK_BYTES, batch->mla_heads, rows);
+}
+
+int ds4_glm5_next_mla_output_batch_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *batch) {
+    if (!context_valid(ctx) || !batch || !batch->decode_phase || ctx->tp_rank > 1u ||
+        (batch->capacity_tokens != 2u && batch->capacity_tokens != 4u && batch->capacity_tokens != 6u))
+        return 0;
+    unsigned count = 0u;
+    for (uint32_t il = 0u; il < ctx->model->trunk_count; ++il) {
+        if (ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_MLA) continue;
+        if (!mla_output_small_m(ctx, il, batch, batch->capacity_tokens, false)) return 0;
+        ++count;
+    }
+    return count == 11u;
+}
+
+/* Keep causal attention and the M1 projection/residual arithmetic unchanged.
+ * Only the output reduction is deferred. Heads and mHC coefficients live in
+ * existing batch scratch; do not reuse the scalar row's overwritten split. */
+static int verify_mla_attention_handoff(const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il, ds4_glm5_next_mla_state *mla,
+        ds4_glm5_next_workspace *batch, ds4_glm5_next_workspace *scalar,
+        const ds4_gpu_tensor *hc_in, uint32_t frontier, uint32_t rows,
+        bool row_sync, bool batch_output, int ok, glm5_mla_profile *profile) {
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const uint64_t head_elements = (uint64_t)(GLM5_HEADS / 2u) * GLM5_HEAD_DIM;
+    const uint64_t head_row = head_elements * sizeof(float);
+    const uint64_t out_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    char error[128] = {0};
+    for (uint32_t t = 0u; ok && t < rows; ++t) {
+        ds4_glm5_next_workspace w = *scalar;
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * hc_row, hc_row);
+        w.mla_heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
+        w.hc_split = ds4_gpu_tensor_view(batch->hc_split, t * split_row, split_row);
+        uint32_t slot = 0u, pool = 0u, visible = 0u;
+        bool publish = false;
+        ok = in && w.mla_heads && w.hc_split &&
+            ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
+        const bool dense = ok && ds4_glm5_next_mla_dense_selection_visible(
+            mla->token_count, mla->capacity_tokens, &visible);
+        /* finish_attention stays true: it selects the scalar owned32 layout.
+         * defer_tail is an independent stop point after the attention kernel. */
+        if (ok) ok = dense ? mla_dense_selection_attention_impl(ctx, il, mla,
+            &w, in, visible, slot, pool, publish, true, profile) :
+            mla_sparse_selection_attention_impl(ctx, il, mla, &w, in, slot,
+                pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K, ctx->tp_big_out,
+                true, true, true, profile);
+        if (ok && row_sync) ok = ds4_gpu_synchronize();
+        if (ok) ok = ds4_glm5_next_mla_append_commit(mla);
+        ds4_gpu_tensor_free(in);
+        ds4_gpu_tensor_free(w.mla_heads);
+        ds4_gpu_tensor_free(w.hc_split);
+    }
+    if (profile) profile->last = glm5_exec_now_sec();
+    if (ok && batch_output) {
+        ok = mla_output_small_m(ctx, il, batch, rows, true);
+    }
+    for (uint32_t t = 0u; ok && !batch_output && t < rows; ++t) {
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(ctx->tp_big_out, t * out_row, out_row);
+        ok = heads && out && ds4_gpu_matmul_q8_0_kslice_tensor(out,
+            ctx->model_map, ctx->model_size, layer->mla.output,
+            GLM5_HEADS * GLM5_HEAD_DIM, ctx->tp_rank * head_elements,
+            head_elements, GLM5_WIDTH, heads, 0u);
+        ds4_gpu_tensor_free(heads);
+        ds4_gpu_tensor_free(out);
+    }
+    /* Drain even after partial enqueue failure, then agree before posting
+     * payload. Phase2 is distinct from the subsequent FFN phases0/1. */
+    const int completed = ds4_gpu_synchronize();
+    ok = completed && ok;
+    if (profile) {
+        const double now = glm5_exec_now_sec();
+        profile->seconds[MLA_PROFILE_OUTPUT] += now - profile->last;
+        profile->last = now;
+    }
+    if (!ds4_tp_verify_layer_agree(ctx->tp, *ctx->tp_sequence, il, frontier,
+            rows, 2u, 0u, ok, error, sizeof(error))) {
+        ds4_tp_mark_failed(ctx->tp);
+        fprintf(stderr, "ds4: native MLA attention agreement failed rank=%u layer=%u: %s\n",
+            ctx->tp_rank, il, error);
+        return 0;
+    }
+    ok = ok && tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, rows) &&
+        mla_profile_mark(profile, MLA_PROFILE_EXCHANGE);
+    for (uint32_t t = 0u; ok && t < rows; ++t) {
+        ds4_glm5_next_workspace w = *scalar;
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * hc_row, hc_row);
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out, t * out_row, out_row);
+        ds4_gpu_tensor *peer = ds4_gpu_tensor_view(ctx->tp_big_in, t * out_row, out_row);
+        w.hc_split = ds4_gpu_tensor_view(batch->hc_split, t * split_row, split_row);
+        w.attention = ds4_gpu_tensor_view(batch->attention, t * out_row, out_row);
+        w.after_attention = ds4_gpu_tensor_view(batch->after_attention, t * hc_row, hc_row);
+        ok = in && local && peer && w.hc_split && w.attention && w.after_attention &&
+            ds4_gpu_add_tensor(w.attention, local, peer, GLM5_WIDTH) &&
+            mla_scalar_residual(layer, &w, in);
+        ds4_gpu_tensor_free(in);
+        ds4_gpu_tensor_free(local);
+        ds4_gpu_tensor_free(peer);
+        ds4_gpu_tensor_free(w.hc_split);
+        ds4_gpu_tensor_free(w.attention);
+        ds4_gpu_tensor_free(w.after_attention);
+    }
+    ok = ok && mla_profile_mark(profile, MLA_PROFILE_RESIDUAL);
+    if (!ok) {
+        ds4_gpu_synchronize();
+        ds4_tp_mark_failed(ctx->tp);
+    }
     return ok;
 }
 
@@ -2404,6 +2842,10 @@ static int mla_sparse_selection_from_prelude_row(
               mla->pool_gate_tail, (uint64_t)tail_slot * index_k_row,
               batch_w->mla_pool_gate_raw, (uint64_t)row * index_k_row,
               index_k_row) &&
+          ds4_glm5_next_mla_verify_record(
+              mla, mla->token_count, batch_w->mla_index_k_norm,
+              (uint64_t)row * index_k_row, batch_w->mla_pool_gate_raw,
+              (uint64_t)row * index_k_row, 1u) &&
           mla_publish_completed_pool(
               ctx, m, mla, scalar_w, pool_index, publish_pool))) &&
         (batched_scores ?
@@ -2455,6 +2897,9 @@ static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
     if (!ctx || !offsets || !mla || !w || n_tokens == 0u ||
         mla->token_count != pos0 || mla->complete_pools != pos0 / 4u ||
         mla->tail_count != pos0 % 4u) return 0;
+    if (!ds4_glm5_next_mla_verify_record(
+            mla, pos0, w->mla_index_k_norm, 0u, w->mla_pool_gate_raw, 0u,
+            n_tokens)) return 0;
 #ifdef DS4_ROCM_BUILD
     const char *batch_pool_value =
         getenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE");
@@ -2509,9 +2954,13 @@ static int mla_value_project_rows_batch(
         const ds4_glm5_next_mla_offsets *offsets,
         ds4_glm5_next_workspace *w,
         uint32_t n_tokens) {
+    const uint64_t full_bytes = (uint64_t)n_tokens * GLM5_HEADS *
+        GLM5_HEAD_DIM * sizeof(float);
+    const uint32_t heads = ds4_gpu_tensor_bytes(w->mla_heads) ==
+        full_bytes / 2u ? GLM5_HEADS / 2u : GLM5_HEADS;
     return ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         w->mla_heads, w->routed_experts, ctx->model_map, ctx->model_size,
-        offsets->v_b, 8u, n_tokens, GLM5_HEADS,
+        offsets->v_b, 8u, n_tokens, heads,
         GLM5_KV_LORA, GLM5_HEAD_DIM);
 }
 
@@ -2794,6 +3243,10 @@ static int mla_output_project_rows_batch(
         (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
     const uint64_t half_heads = full_heads / 2u;
     const uint64_t in_start = (uint64_t)ctx->tp_rank * half_heads;
+    const bool owned = ds4_gpu_tensor_bytes(w->mla_heads) ==
+        (uint64_t)n_tokens * half_heads * sizeof(float);
+    const uint64_t activation_start = owned ? 0u : in_start;
+    const uint64_t activation_stride = owned ? half_heads : full_heads;
     /* A single row keeps the established decode implementation. Besides
      * avoiding a 64 KiB token-tile launch for one row, this makes the hook's
      * 0 return unambiguously mean that an engaged batch path failed. */
@@ -2804,7 +3257,7 @@ static int mla_output_project_rows_batch(
         const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
             out, ctx->model_map, ctx->model_size, offsets->output,
             full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
-            in_start);
+            activation_start);
         ds4_gpu_tensor_free(out);
         return ok;
     }
@@ -2817,7 +3270,7 @@ static int mla_output_project_rows_batch(
         ds4_rocm_q8_kslice_f32_rows_strided(
             ctx->tp_big_out, ctx->model_map, ctx->model_size,
             offsets->output, full_heads, GLM5_WIDTH, in_start, half_heads,
-            w->mla_heads, in_start, n_tokens, full_heads);
+            w->mla_heads, activation_start, n_tokens, activation_stride);
     if (batch >= 0) return batch;
     /* Preserve the exact one-row implementation on backends without the
      * strided token-tile entry point. */
@@ -2829,7 +3282,7 @@ static int mla_output_project_rows_batch(
         const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
             out, ctx->model_map, ctx->model_size, offsets->output,
             full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
-            (uint64_t)t * full_heads + in_start);
+            (uint64_t)t * activation_stride + activation_start);
         ds4_gpu_tensor_free(out);
         if (!ok) return 0;
     }
@@ -2844,12 +3297,67 @@ static int mla_dense_selection_attention_rows(
         const ds4_gpu_tensor *hc_in,
         uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos0 = mla->token_count;
     const uint32_t n_selected = pos0 + n_tokens;
-    const uint64_t full_heads =
-        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
+    const bool owned = n_tokens >= 16u &&
+        getenv("DS4_GLM5_MLA_BATCH_OWNED_HEADS") != NULL &&
+        strcmp(getenv("DS4_GLM5_MLA_BATCH_OWNED_HEADS"), "1") == 0 &&
+        ctx->tp_rank < 2u && ctx->trace_prefix == NULL;
+    const uint32_t attention_heads = owned ? GLM5_HEADS / 2u : GLM5_HEADS;
+    ds4_gpu_tensor *query_view = NULL;
+    ds4_gpu_tensor *qk_view = NULL;
+    ds4_gpu_tensor *heads_view = NULL;
+    ds4_glm5_next_workspace owned_w = *w;
+    ds4_gpu_tensor *query = w->mla_query;
+    ds4_gpu_tensor *qk_low = w->mla_qk_low;
+    if (owned) {
+        const uint64_t first_head = (uint64_t)ctx->tp_rank * attention_heads;
+        const uint64_t q_offset = first_head * GLM5_HEAD_DIM *
+            (GLM5_Q_RANK / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        const uint64_t k_offset = first_head * GLM5_KV_LORA *
+            (GLM5_HEAD_DIM / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        const uint64_t v_offset = first_head * GLM5_HEAD_DIM *
+            (GLM5_KV_LORA / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        if (m->q_b > UINT64_MAX - q_offset ||
+            m->k_b > UINT64_MAX - k_offset ||
+            m->v_b > UINT64_MAX - v_offset) return 0;
+        local_m.q_b += q_offset;
+        local_m.k_b += k_offset;
+        local_m.v_b += v_offset;
+        query_view = ds4_gpu_tensor_view(
+            w->mla_query, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_HEAD_DIM *
+                sizeof(float));
+        qk_view = ds4_gpu_tensor_view(
+            w->mla_qk_low, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_KV_LORA *
+                sizeof(float));
+        heads_view = ds4_gpu_tensor_view(
+            w->mla_heads, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_HEAD_DIM *
+                sizeof(float));
+        if (!query_view || !qk_view || !heads_view) {
+            ds4_gpu_tensor_free(heads_view);
+            ds4_gpu_tensor_free(qk_view);
+            ds4_gpu_tensor_free(query_view);
+            return 0;
+        }
+        query = query_view;
+        qk_low = qk_view;
+        owned_w.mla_query = query_view;
+        owned_w.mla_qk_low = qk_view;
+        owned_w.mla_heads = heads_view;
+        static int reported[2];
+        if (!reported[ctx->tp_rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 batched MLA owned heads active rank=%u heads=%u\n",
+                    ctx->tp_rank, attention_heads);
+            reported[ctx->tp_rank] = 1;
+        }
+    }
     const uint64_t elements = (uint64_t)n_tokens * GLM5_WIDTH;
     if (n_tokens == 0u || n_selected < pos0 ||
         n_selected > DS4_GLM5_NEXT_INDEX_TOP_K ||
@@ -2878,8 +3386,9 @@ static int mla_dense_selection_attention_rows(
             m->q_a_norm, GLM5_Q_RANK, n_tokens,
             ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
-            w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, full_heads, w->mla_q_resid, n_tokens) &&
+            query, ctx->model_map, ctx->model_size, m->q_b,
+            GLM5_Q_RANK, (uint64_t)attention_heads * GLM5_HEAD_DIM,
+            w->mla_q_resid, n_tokens) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
             GLM5_WIDTH, GLM5_KV_LORA, w->ffn_hidden, n_tokens) &&
@@ -2893,9 +3402,9 @@ static int mla_dense_selection_attention_rows(
             pos0, n_tokens, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
         ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
-            w->mla_qk_low, w->mla_query,
+            qk_low, query,
             ctx->model_map, ctx->model_size, m->k_b, 8u, n_tokens,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            attention_heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n_tokens) &&
@@ -2912,17 +3421,20 @@ static int mla_dense_selection_attention_rows(
             w->ffn_hidden, n_tokens) &&
         mla_stage_index_rows(ctx, m, mla, w, pos0, n_tokens) &&
         ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
-            w->routed_experts, w->mla_query, w->mla_qk_low,
+            w->routed_experts, query, qk_low,
             mla->compact_kv, NULL, n_tokens, pos0, n_selected,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, attention_heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
-        mla_value_project_rows_batch(ctx, m, w, n_tokens) &&
+        mla_value_project_rows_batch(ctx, m, owned ? &owned_w : w, n_tokens) &&
         mla_output_project_rows_batch(
-            ctx, m, w, n_tokens,
+            ctx, m, owned ? &owned_w : w, n_tokens,
             !(layer->ffn_weight.gate_exps_type == 16u &&
               layer->ffn_weight.up_exps_type == 16u &&
               layer->ffn_weight.down_exps_type == 10u));
+    ds4_gpu_tensor_free(heads_view);
+    ds4_gpu_tensor_free(qk_view);
+    ds4_gpu_tensor_free(query_view);
     return ok &&
         tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, n_tokens) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
@@ -2932,13 +3444,36 @@ static int mla_dense_selection_attention_rows(
             GLM5_WIDTH, GLM5_HC);
 }
 
-static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
+static int routed_ffn_prefix(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                             ds4_glm5_next_workspace *w) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const bool native = !layer->is_trunk && il == DS4_GLM5_NEXT_TRUNK_COUNT;
+    if (w->draft_only != native) return 0;
+    if (native) return ds4_gpu_rms_norm_weight_tensor(w->ffn_hidden, w->after_attention,
+        ctx->model_map, ctx->model_size, layer->ffn_norm,
+        GLM5_WIDTH, ctx->model->rms_norm_eps);
+    return ds4_gpu_rms_norm_plain_rows_tensor(w->ffn_flat, w->after_attention,
+            GLM5_HC_WIDTH, 1u, ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_bf16_tensor(w->ffn_mix, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX, w->ffn_flat, 1u) &&
+        ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
+            w->after_attention, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps, ctx->model->rms_norm_eps);
+}
+
+static int routed_ffn_one_impl(const ds4_glm5_next_exec_ctx *ctx,
                           uint32_t il,
                           uint32_t token_ordinal,
                           ds4_glm5_next_workspace *w,
-                          ds4_gpu_tensor *hc_out) {
+                          ds4_gpu_tensor *hc_out,
+                          const ds4_glm5_next_workspace *prepared,
+                          uint32_t prepared_row) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const ds4_glm5_next_ffn_offsets *f = &layer->ffn_weight;
+    const bool native = !layer->is_trunk && il == DS4_GLM5_NEXT_TRUNK_COUNT;
+    if (w->draft_only != native) return 0;
     const uint32_t rank_mid_base = ctx->tp_rank * GLM5_RANK_MID;
     const uint64_t q8_gate_row_bytes =
         (GLM5_WIDTH / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
@@ -2959,27 +3494,38 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     bool overlap_prefetched = false;
     const int q4_residency = mixed_q2 ? 0 :
         local_q4k_half_residency(ctx, layer);
+    if (prepared && (native || !layer->is_trunk || !ctx->force_bulk_gates ||
+        layer->attention != DS4_GLM5_NEXT_ATTN_KDA || !w->decode_phase ||
+        q4_residency != 1 || prepared == w ||
+        prepared_row >= prepared->capacity_tokens)) return 0;
     /* A nonresident layer releases packed descriptors below; retain its
      * historical fence even when the diagnostic switch is enabled. */
     const int async_terminal = q4_residency == 1 &&
         glm5_decode_async_layer_enabled(w, 1u);
-    int ok = ds4_gpu_rms_norm_plain_rows_tensor(
-            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
-            ctx->model->rms_norm_eps);
-    if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at FFN HC norm rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    ok = ds4_gpu_matmul_bf16_tensor(
-            w->ffn_mix, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->ffn_flat, 1u);
-    if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at FFN HC projection rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
-            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
-            w->after_attention, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
-            ctx->model->rms_norm_eps);
-    if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at FFN HC split rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    ok = ds4_gpu_matmul_f32_tensor(
+    const int shared_route_setting = native ? 0 :
+        shared_route_overlap_mode(ctx, w, q4_residency);
+    const int shared_route_overlap = prepared ? 0 : shared_route_setting;
+    if (shared_route_setting < 0) {
+        fprintf(stderr, "ds4: GLM5 shared route overlap unsupported configuration rank=%u\n",
+                ctx->tp_rank);
+        ds4_tp_mark_failed(ctx->tp);
+        return 0;
+    }
+    int ok = 1;
+    if (prepared) {
+        const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+        const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+        ok = ds4_gpu_tensor_copy(w->ffn_hidden, 0u, prepared->ffn_hidden,
+                prepared_row * hidden_row, hidden_row) &&
+            ds4_gpu_tensor_copy(w->ffn_split, 0u, prepared->ffn_split,
+                prepared_row * split_row, split_row) &&
+            ds4_gpu_tensor_copy(w->shared_out, 0u, prepared->shared_out,
+                prepared_row * hidden_row, hidden_row);
+    } else {
+        ok = routed_ffn_prefix(ctx, il, w);
+    }
+    if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at FFN prefix rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
+    ok = ok && ds4_gpu_matmul_f32_tensor(
             w->router_logits, ctx->model_map, ctx->model_size, f->gate_inp,
             GLM5_WIDTH, GLM5_EXPERTS, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at router projection rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
@@ -2990,15 +3536,28 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at top-8 select rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
     ok = route_agrees(ctx, il, token_ordinal,
                       w->router_selected, w->router_weights,
-                      w->router_logits, w->ffn_hidden);
+                      w->router_logits, w->ffn_hidden,
+                      shared_route_overlap ? w : NULL);
     if (!ok) {
         route_failure_stats("after_attention", w->after_attention,
                             GLM5_HC_WIDTH);
-        route_failure_stats("ffn_mix", w->ffn_mix, GLM5_HC_MIX);
-        route_failure_stats("ffn_collapsed", w->ffn_collapsed, GLM5_WIDTH);
+        /* Prepared rows restore the live operands, not prefix diagnostic
+         * temporaries, which belong to the last prepared row. */
+        if (!prepared) {
+            route_failure_stats("ffn_mix", w->ffn_mix, GLM5_HC_MIX);
+            route_failure_stats("ffn_collapsed", w->ffn_collapsed, GLM5_WIDTH);
+        }
         fprintf(stderr, "ds4: GLM5 routed layer %u failed at router prelude rank=%u\n",
                 il, ctx->tp_rank);
         goto routed_one_done;
+    }
+    if (shared_route_overlap) {
+        static int logged[2];
+        if (!logged[ctx->tp_rank]) {
+            fprintf(stderr, "ds4: GLM5 shared FFN queued before route agreement rank=%u weights=original cache_bytes=0\n",
+                    ctx->tp_rank);
+            logged[ctx->tp_rank] = 1;
+        }
     }
     if (q4_residency < 0) {
         fprintf(stderr,
@@ -3042,8 +3601,8 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                  GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, NULL, il);
     } else if (ok) {
         const char *scratch_windows = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
-        const bool use_scratch = w->decode_phase && scratch_windows &&
-            strcmp(scratch_windows, "1") == 0;
+        const bool use_scratch = native || (w->decode_phase && scratch_windows &&
+            strcmp(scratch_windows, "1") == 0);
         uint32_t window_slots = use_scratch ? 8u : GLM5_EXPERTS_USED;
         const char *window_slots_env =
             getenv("DS4_ROCM_GLM5_WINDOW_SLOTS");
@@ -3080,12 +3639,18 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             (!w->decode_phase && persist_prefill &&
              strcmp(persist_prefill, "1") == 0);
         if (ok && use_scratch && il < DS4_GLM5_NEXT_LAYER_COUNT) {
+            const char *reuse = getenv("DS4_GLM5_NATIVE_WINDOW_REUSE");
+            const bool reuse_native = native && reuse && strcmp(reuse, "1") == 0;
             if (!w->q4_window_scratch)
                 w->q4_window_scratch =
                     ds4_gpu_q4k_window_cache_create(&config);
-            else
+            else if (!reuse_native)
                 ok = ds4_gpu_q4k_window_cache_rebind(
                     w->q4_window_scratch, &config);
+            /* A native workspace is bound to immutable layer45/model/rank
+             * before entry and its previous consumer has synchronized.
+             * Keep the same eight slots; prepare handles routing changes.
+             * Generic scratch workspaces still rebind across trunk layers. */
             cache = w->q4_window_scratch;
         } else if (ok && persist_this_call &&
             il < DS4_GLM5_NEXT_LAYER_COUNT) {
@@ -3098,7 +3663,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             cache = ok ? ds4_gpu_q4k_window_cache_create(&config) : NULL;
         }
         const char *overlap_env = getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
-        overlap_prefetched = ok && use_scratch && overlap_env &&
+        overlap_prefetched = ok && !native && use_scratch && overlap_env &&
             strcmp(overlap_env, "1") == 0;
         if (overlap_prefetched) {
             /* Start selected-expert uploads before the shared Q8 path.  The
@@ -3141,7 +3706,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 }
             }
         }
-        ok = cache && ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+        ok = ok && cache && ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
                  w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
                  w->routed_experts, cache, w->router_selected,
                  w->router_weights, GLM5_EXPERTS_USED, 10.0f,
@@ -3152,28 +3717,28 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank, mixed_q2 ? 1 : 0);
         goto routed_one_done;
     }
-    if (ok && !overlap_prefetched && shared_q8_pair_decode) ok =
+    if (ok && !prepared && !shared_route_overlap && !overlap_prefetched && shared_q8_pair_decode) ok =
         ds4_gpu_matmul_q8_0_pair_tensor(
             w->shared_gate, w->shared_up, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID,
             w->ffn_hidden, 1u);
-    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok =
+    if (ok && !prepared && !shared_route_overlap && !overlap_prefetched && !shared_q8_pair_decode) ok =
         ds4_gpu_matmul_q8_0_tensor(
             w->shared_gate, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared gate rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok && !overlap_prefetched && !shared_q8_pair_decode) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !prepared && !shared_route_overlap && !overlap_prefetched && !shared_q8_pair_decode) ok = ds4_gpu_matmul_q8_0_tensor(
             w->shared_up, ctx->model_map, ctx->model_size,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared up rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
+    if (ok && !prepared && !shared_route_overlap && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
             GLM5_RANK_MID, 10.0f, 1.0f);
-    if (ok && !overlap_prefetched && shared_q8_pair_decode) {
+    if (ok && !prepared && !overlap_prefetched && shared_q8_pair_decode) {
         static int logged_shared_q8_pair_serial[2] = {0, 0};
         const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
         if (!logged_shared_q8_pair_serial[rank]) {
@@ -3184,7 +3749,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         }
     }
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared SwiGLU rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_matmul_q8_0_kslice_tensor(
+    if (ok && !prepared && !shared_route_overlap) ok = ds4_gpu_matmul_q8_0_kslice_tensor(
             w->shared_out, ctx->model_map, ctx->model_size, f->down_shexp,
             GLM5_ROUTED_MID, rank_mid_base, GLM5_RANK_MID,
             GLM5_WIDTH, w->shared_mid, 0u);
@@ -3197,9 +3762,10 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     if (ok) ok = ds4_gpu_add_tensor(w->down, ctx->tp_big_out, ctx->tp_big_in,
                                     GLM5_WIDTH);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at all-rank compose rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_hc_expand_split_tensor(
-            hc_out, w->down, w->after_attention, w->ffn_split,
-            GLM5_WIDTH, GLM5_HC);
+    if (ok) ok = native ?
+        ds4_gpu_add_tensor(hc_out, w->after_attention, w->down, GLM5_WIDTH) :
+        ds4_gpu_hc_expand_split_tensor(hc_out, w->down, w->after_attention,
+            w->ffn_split, GLM5_WIDTH, GLM5_HC);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at mHC expand rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
     if (ok && !async_terminal) ok = ds4_gpu_synchronize();
     if (ok && async_terminal) {
@@ -3225,14 +3791,20 @@ routed_one_done:
         (!w->decode_phase && persist_prefill &&
          strcmp(persist_prefill, "1") == 0);
     const char *scratch_windows = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
-    const bool use_scratch = w->decode_phase && scratch_windows &&
-        strcmp(scratch_windows, "1") == 0;
+    const bool use_scratch = native || (w->decode_phase && scratch_windows &&
+        strcmp(scratch_windows, "1") == 0);
     if (!mixed_q2 && q4_residency == 0 &&
         !persist_this_call &&
         !use_scratch)
         ds4_gpu_q4k_packed_slice_release_all();
     (void)q8_down_row_bytes;
     return ok;
+}
+
+static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
+                          uint32_t il, uint32_t token_ordinal,
+                          ds4_glm5_next_workspace *w, ds4_gpu_tensor *hc_out) {
+    return routed_ffn_one_impl(ctx, il, token_ordinal, w, hc_out, NULL, 0u);
 }
 
 #ifdef DS4_TP_TEST_HOOKS
@@ -3770,10 +4342,10 @@ static int mla_routed_dense_selection_forward(const ds4_glm5_next_exec_ctx *ctx,
         mla->token_count, mla->capacity_tokens, &visible);
     const int attention_ok = dense ?
         mla_dense_selection_attention(
-            ctx, il, state, w, hc_in, visible, tail_slot,
+            ctx, il, mla, w, hc_in, visible, tail_slot,
             pool_index, publish_pool) :
         mla_sparse_selection_attention(
-            ctx, il, state, w, hc_in, tail_slot,
+            ctx, il, mla, w, hc_in, tail_slot,
             pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
             ctx->tp_big_out, true, true);
     const int ok = attention_ok &&
@@ -3976,6 +4548,1178 @@ static int mla_routed_dense_selection_rows_forward(
     return 1;
 }
 
+static int verify_layer_valid(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                               const ds4_glm5_next_state *state) {
+    return context_valid(ctx) && state && state->valid && ctx->tp_rank < 2u &&
+        il < ctx->model->trunk_count && state->layer_count == ctx->model->trunk_count &&
+        state->kda.layer && state->kda.layer_count == ctx->model->trunk_count;
+}
+
+static int verify_kda_layout(const ds4_glm5_next_exec_ctx *ctx, uint32_t il) {
+    const uint32_t features = ctx->tp ? ds4_tp_runtime_features(ctx->tp) : 0u;
+    const uint32_t required = DS4_TP_FEATURE_GLM5_KDA_TP |
+        DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE;
+    const ds4_glm5_kda_weight_offsets *k = &ctx->model->layer[il].kda;
+    const char *exact = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT");
+    return (features & required) == required &&
+        !(features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE) &&
+        exact && strcmp(exact, "1") == 0 && k->output_type == 30u &&
+        k->q_type == 30u && k->k_type == 30u && k->v_type == 30u &&
+        k->f_a_type == 30u && k->f_b_type == 30u &&
+        k->g_a_type == 30u && k->g_b_type == 30u && k->beta_type == 30u;
+}
+
+int ds4_glm5_next_layer_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
+                                       uint32_t il,
+                                       ds4_glm5_next_state *state,
+                                       uint32_t capacity) {
+    if (!verify_layer_valid(ctx, il, state) || state->verification.tokens ||
+        state->kda.pending_verifications ||
+        state->pending_mla_verifications ||
+        !ds4_tp_glm5_native_width_valid(capacity)) return 0;
+    if (ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA)
+        return verify_kda_layout(ctx, il) &&
+            ds4_glm5_kda_replay_reserve(&state->kda.layer[il], capacity, ctx->tp_rank);
+    return ds4_glm5_next_mla_replay_reserve(&state->mla[il], capacity);
+}
+
+static int verify_kda_attention(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                                ds4_glm5_next_state *state,
+                                ds4_glm5_next_workspace *w,
+                                const ds4_gpu_tensor *hc_in, uint32_t n_tokens) {
+    const ds4_glm5_kda_weight_offsets *weights = &ctx->model->layer[il].kda;
+    const uint64_t half_row = (uint64_t)(GLM5_WIDTH / 2u) * sizeof(float);
+    const uint64_t weight_half =
+        (uint64_t)(GLM5_WIDTH / 2u) * DS4_GLM5_KDA_CHANNELS * sizeof(uint16_t);
+    if (!kda_prefix_rows(ctx, il, w, hc_in, n_tokens, true) ||
+        !ds4_glm5_kda_verify_begin(&state->kda.layer[il], &w->kda, weights,
+            ctx->model_map, ctx->model_size, w->collapsed, ctx->tp_big_out,
+            n_tokens, ctx->model->rms_norm_eps) ||
+        !tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, n_tokens)) return 0;
+    const ds4_gpu_tensor *rank0 = ctx->tp_rank == 0u ? ctx->tp_big_out : ctx->tp_big_in;
+    const ds4_gpu_tensor *rank1 = ctx->tp_rank == 0u ? ctx->tp_big_in : ctx->tp_big_out;
+    if (!ds4_glm5_kda_compose_head_halves(w->kda.recurrent_out, rank0, rank1, n_tokens) ||
+        !ds4_gpu_matmul_bf16_tensor(w->down, ctx->model_map, ctx->model_size,
+            weights->output + ctx->tp_rank * weight_half,
+            DS4_GLM5_KDA_CHANNELS, GLM5_WIDTH / 2u, w->kda.recurrent_out, n_tokens) ||
+        !ds4_gpu_tensor_copy(ctx->tp_big_out, 0u, w->down, 0u, n_tokens * half_row) ||
+        !tp_exchange_bytes(ctx, il, DS4_TP_GATE_ATTN, n_tokens * half_row)) return 0;
+    /* The latency-QP auxiliary receive belongs to one preceding scalar gate.
+     * Batch halves use one bulk exchange instead; unpack into full token rows
+     * without overwriting subsequent packed local rows. */
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const uint64_t base = (uint64_t)t * half_row * 2u;
+        if (!ds4_gpu_tensor_copy(w->attention, base + ctx->tp_rank * half_row,
+                w->down, t * half_row, half_row) ||
+            !ds4_gpu_tensor_copy(w->attention, base + (1u - ctx->tp_rank) * half_row,
+                ctx->tp_big_in, t * half_row, half_row)) return 0;
+    }
+    const int ok = ds4_gpu_hc_expand_split_tensor(w->after_attention, w->attention,
+        hc_in, w->hc_split, GLM5_WIDTH, GLM5_HC);
+    static uint32_t reported_rows[2];
+    if (ok && !(reported_rows[ctx->tp_rank] & (1u << n_tokens))) {
+        reported_rows[ctx->tp_rank] |= 1u << n_tokens;
+        fprintf(stderr, "ds4: GLM5 native KDA verifier batch engaged rank=%u rows=%u qkv=bf16-small-m-exact\n",
+            ctx->tp_rank, n_tokens);
+    }
+    return ok;
+}
+
+static int verify_dense_ffn(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                            ds4_glm5_next_workspace *batch_w,
+                            ds4_glm5_next_workspace *scalar_w,
+                            ds4_gpu_tensor *hc_out, uint32_t tokens) {
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    /* mHC's M1 reduction order is load-bearing. Batch only after scalar
+     * preparation; all destinations are existing owned activation scratch. */
+    for (uint32_t t = 0; t < tokens; ++t) {
+        if (!ds4_gpu_tensor_copy(scalar_w->after_attention, 0u,
+                batch_w->after_attention, t * hc_row, hc_row) ||
+            !dense_ffn_prefix(ctx, il, scalar_w, 1u, 0) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_hidden, t * hidden_row,
+                scalar_w->ffn_hidden, 0u, hidden_row) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_split, t * split_row,
+                scalar_w->ffn_split, 0u, split_row)) return 0;
+    }
+    return ds4_rocm_glm5_dense_q8_small_m(batch_w->gate, batch_w->up,
+            ctx->model_map, ctx->model_size, f->gate, f->up,
+            GLM5_WIDTH, GLM5_DENSE_MID, batch_w->ffn_hidden, tokens) &&
+        ds4_gpu_swiglu_tensor(batch_w->mid, batch_w->gate, batch_w->up,
+            tokens * GLM5_DENSE_MID, 10.0f, 1.0f) &&
+        ds4_rocm_glm5_dense_q8_small_m(batch_w->down, NULL,
+            ctx->model_map, ctx->model_size, f->down, 0u,
+            GLM5_DENSE_MID, GLM5_WIDTH, batch_w->mid, tokens) &&
+        ds4_gpu_hc_expand_split_tensor(hc_out, batch_w->down,
+            batch_w->after_attention, batch_w->ffn_split, GLM5_WIDTH, GLM5_HC);
+}
+
+static int verify_shared_ffn_prepare(const ds4_glm5_next_exec_ctx *ctx,
+                                     uint32_t il,
+                                     ds4_glm5_next_workspace *batch_w,
+                                     ds4_glm5_next_workspace *scalar_w,
+                                     uint32_t tokens) {
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    const uint64_t gate_half = (uint64_t)ctx->tp_rank * GLM5_RANK_MID * 4352u;
+    /* Same M1 prefix/reduction as ordinary decode. Existing batch activation
+     * scratch retains the only operands needed by routed_ffn_one_impl. */
+    for (uint32_t t = 0u; t < tokens; ++t) {
+        if (!ds4_gpu_tensor_copy(scalar_w->after_attention, 0u,
+                batch_w->after_attention, t * hc_row, hc_row) ||
+            !routed_ffn_prefix(ctx, il, scalar_w) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_hidden, t * hidden_row,
+                scalar_w->ffn_hidden, 0u, hidden_row) ||
+            !ds4_gpu_tensor_copy(batch_w->ffn_split, t * split_row,
+                scalar_w->ffn_split, 0u, split_row)) return 0;
+    }
+    return ds4_rocm_glm5_shared_q8_small_m(batch_w->shared_gate, batch_w->shared_up,
+            ctx->model_map, ctx->model_size, f->gate_shexp + gate_half,
+            f->up_shexp + gate_half, GLM5_WIDTH, GLM5_RANK_MID, 4352u, 0u,
+            batch_w->ffn_hidden, tokens) &&
+        ds4_gpu_swiglu_tensor(batch_w->shared_mid, batch_w->shared_gate,
+            batch_w->shared_up, tokens * GLM5_RANK_MID, 10.0f, 1.0f) &&
+        ds4_rocm_glm5_shared_q8_small_m(batch_w->shared_out, NULL,
+            ctx->model_map, ctx->model_size, f->down_shexp, 0u,
+            GLM5_RANK_MID, GLM5_WIDTH, 2176u, ctx->tp_rank * GLM5_RANK_MID,
+            batch_w->shared_mid, tokens);
+}
+
+/* All attention/prefix/shared rows have already been prepared. Retain the M1
+ * router and packed expert dispatch: only their route and output handoffs are
+ * batched. No prefill GEMM, alternate activation codec or route reordering. */
+static int expert_six_admit(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        const ds4_glm5_next_workspace *batch, ds4_glm5_expert_six_plan *plan) {
+    if (!batch || !batch->decode_phase || batch->draft_only || batch->capacity_tokens != 6u ||
+        !ctx->model->layer[il].is_trunk || local_q4k_half_residency(ctx, &ctx->model->layer[il]) != 1)
+        return 0;
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    const ds4_glm5_expert_six_args a = {
+        .out = batch->routed_out, .mid = batch->routed_mid,
+        .input_q8 = batch->routed_experts, .mid_q8 = batch->routed_gate,
+        .descriptors = batch->routed_up, .input = batch->ffn_hidden,
+        .selected = batch->router_selected, .weights = batch->router_weights,
+        .model_map = ctx->model_map, .model_size = ctx->model_size,
+        .gate_offset = f->gate_exps, .up_offset = f->up_exps, .down_offset = f->down_exps,
+        .rank = ctx->tp_rank, .rows = 6u
+    };
+    return ds4_rocm_glm5_expert_six_admit(plan, &a);
+}
+
+int ds4_glm5_next_expert_pairs_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *batch) {
+    if (!context_valid(ctx) || !batch || ctx->tp_rank > 1u) return 0;
+    unsigned count = 0;
+    for (uint32_t il = 0; il < ctx->model->trunk_count; ++il) {
+        if (ctx->model->layer[il].ffn != DS4_GLM5_NEXT_FFN_ROUTED) continue;
+        ds4_glm5_expert_six_plan plan;
+        if (!expert_six_admit(ctx, il, batch, &plan)) return 0;
+        ++count;
+    }
+    return count == 42u;
+}
+
+static int verify_ffn_handoff(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+                             ds4_glm5_next_workspace *batch,
+                             ds4_glm5_next_workspace *scalar,
+                             ds4_gpu_tensor *hc_out, uint32_t frontier,
+                             uint32_t rows, int ok) {
+    const uint64_t hidden_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint64_t route_row = GLM5_EXPERTS_USED * sizeof(uint32_t);
+    const uint64_t hc_row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t split_row = (uint64_t)GLM5_HC_MIX * sizeof(float);
+    const uint64_t q4_gate_row = (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t q4_down_row = (GLM5_ROUTED_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t q4_down_half = (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const ds4_glm5_next_ffn_offsets *f = &ctx->model->layer[il].ffn_weight;
+    const uint64_t sequence = *ctx->tp_sequence;
+    const bool queue_experts = (ds4_tp_prefill_config(ctx->tp) &
+        DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u;
+    const uint32_t pair_mode = ds4_tp_glm5_expert_pairs_mode(ds4_tp_prefill_config(ctx->tp));
+    const bool six = pair_mode && rows == 6u;
+    ds4_glm5_expert_six_plan plan = {0};
+    ds4_glm5_expert_groups groups = {0};
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const char *routes_env = getenv("DS4_GLM5_VERIFY_ROUTE_PROFILE");
+    const bool route_profile = routes_env && strcmp(routes_env, "1") == 0;
+    const double begin = profile ? glm5_exec_now_sec() : 0.0;
+    int32_t ids[8u * GLM5_EXPERTS_USED] = {0};
+    float weights[8u * GLM5_EXPERTS_USED] = {0};
+    uint64_t hash = UINT64_C(1469598103934665603);
+    char error[128] = {0};
+    ok = ok && shared_route_overlap_mode(ctx, scalar, 1) >= 0;
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ok = ds4_gpu_tensor_copy(scalar->ffn_hidden, 0, batch->ffn_hidden,
+                t * hidden_row, hidden_row) &&
+            ds4_gpu_matmul_f32_tensor(scalar->router_logits, ctx->model_map,
+                ctx->model_size, f->gate_inp, GLM5_WIDTH, GLM5_EXPERTS,
+                scalar->ffn_hidden, 1u) &&
+            ds4_gpu_glm_router_select_tensor(scalar->router_selected,
+                scalar->router_weights, scalar->router_probs, ctx->model_map,
+                ctx->model_size, f->exp_probs_b, scalar->router_logits,
+                GLM5_EXPERTS, GLM5_EXPERTS_USED, 2.5f) &&
+            ds4_gpu_tensor_copy(batch->router_selected, t * route_row,
+                scalar->router_selected, 0, route_row) &&
+            ds4_gpu_tensor_copy(batch->router_weights, t * route_row,
+                scalar->router_weights, 0, route_row);
+    }
+    if (ok) ok = ds4_gpu_tensor_read(batch->router_selected, 0, ids, rows * route_row) &&
+        ds4_gpu_tensor_read(batch->router_weights, 0, weights, rows * route_row);
+    for (uint32_t t = 0; ok && t < rows; ++t)
+        for (uint32_t i = 0; ok && i < GLM5_EXPERTS_USED; ++i) {
+            const uint32_t index = t * GLM5_EXPERTS_USED + i;
+            ok = ids[index] >= 0 && ids[index] < GLM5_EXPERTS &&
+                isfinite(weights[index]) && weights[index] >= 0.0f;
+            for (uint32_t j = 0; ok && j < i; ++j)
+                ok = ids[index] != ids[t * GLM5_EXPERTS_USED + j];
+        }
+    if (ok) {
+        hash = fnv64_continue(hash, ids, rows * route_row);
+        hash = fnv64_continue(hash, weights, rows * route_row);
+    }
+    if (ok && six) ok = expert_six_admit(ctx, il, batch, &plan) &&
+        ds4_glm5_expert_groups_build(&groups, ids, weights, pair_mode);
+    const double routes_done = profile ? glm5_exec_now_sec() : 0.0;
+    if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 0u,
+            hash, ok, error, sizeof(error))) goto failed;
+    const double route_agree_done = profile ? glm5_exec_now_sec() : 0.0;
+
+    /* The completed router readbacks above also finish earlier stream0 MLA
+     * consumers of routed_experts. It can now hold input Q8_K safely. */
+    if (six) ok = ds4_rocm_glm5_expert_six_begin(&plan, &groups, ids, weights);
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
+            t * hidden_row, hidden_row);
+        if (six) {
+            ds4_gpu_tensor *routed = ds4_gpu_tensor_view(batch->routed_out,
+                t * hidden_row, hidden_row);
+            ds4_gpu_tensor *shared = ds4_gpu_tensor_view(batch->shared_out,
+                t * hidden_row, hidden_row);
+            ok = local && routed && shared &&
+                ds4_rocm_glm5_expert_six_down_row(&plan, t) &&
+                ds4_gpu_add_tensor(local, routed, shared, GLM5_WIDTH) &&
+                (queue_experts || ds4_gpu_synchronize());
+            ds4_gpu_tensor_free(routed); ds4_gpu_tensor_free(shared);
+            ds4_gpu_tensor_free(local);
+            continue;
+        }
+        ok = local && ds4_gpu_tensor_copy(scalar->ffn_hidden, 0,
+                batch->ffn_hidden, t * hidden_row, hidden_row) &&
+            ds4_gpu_tensor_copy(scalar->router_selected, 0,
+                batch->router_selected, t * route_row, route_row) &&
+            ds4_gpu_tensor_copy(scalar->router_weights, 0,
+                batch->router_weights, t * route_row, route_row) &&
+            ds4_gpu_tensor_copy(scalar->shared_out, 0,
+                batch->shared_out, t * hidden_row, hidden_row) &&
+            ds4_gpu_routed_moe_one_packed_q4k_tensor(scalar->routed_out,
+                scalar->routed_gate, scalar->routed_up, scalar->routed_mid,
+                scalar->routed_experts, ctx->model_map, ctx->model_size,
+                f->gate_exps, f->up_exps, f->down_exps, GLM5_EXPERTS,
+                q4_gate_row, q4_down_row, ctx->tp_rank * GLM5_RANK_MID, GLM5_RANK_MID,
+                ctx->tp_rank * q4_down_half, q4_down_half, scalar->router_selected,
+                scalar->router_weights, GLM5_EXPERTS_USED, 10.0f,
+                scalar->ffn_hidden, NULL, il) &&
+            ds4_gpu_add_tensor(local, scalar->routed_out,
+                scalar->shared_out, GLM5_WIDTH) &&
+            (queue_experts || ds4_gpu_synchronize());
+        ds4_gpu_tensor_free(local);
+    }
+    if (queue_experts || (six && !ok)) {
+        /* All copies, packed kernels and adds use stream0. The row view owns
+         * no storage. Drain even on an enqueue failure, and report completion
+         * status before phase1 agreement; the later payload fence is too late. */
+        const int completed = ds4_gpu_synchronize();
+        ok = ok && completed;
+    }
+    const double experts_done = profile ? glm5_exec_now_sec() : 0.0;
+    /* Failure is always exchanged before either side posts the bulk payload. */
+    if (!ds4_tp_verify_layer_agree(ctx->tp, sequence, il, frontier, rows, 1u,
+            hash, ok, error, sizeof(error))) goto failed;
+    const double compute_agree_done = profile ? glm5_exec_now_sec() : 0.0;
+    if (!tp_exchange_rows(ctx, il, DS4_TP_GATE_FFN, rows)) goto failed;
+    const double bulk_done = profile ? glm5_exec_now_sec() : 0.0;
+    for (uint32_t t = 0; ok && t < rows; ++t) {
+        ds4_gpu_tensor *local = ds4_gpu_tensor_view(ctx->tp_big_out,
+            t * hidden_row, hidden_row);
+        ds4_gpu_tensor *remote = ds4_gpu_tensor_view(ctx->tp_big_in,
+            t * hidden_row, hidden_row);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * hc_row, hc_row);
+        ok = local && remote && out &&
+            ds4_gpu_tensor_copy(scalar->after_attention, 0,
+                batch->after_attention, t * hc_row, hc_row) &&
+            ds4_gpu_tensor_copy(scalar->ffn_split, 0,
+                batch->ffn_split, t * split_row, split_row) &&
+            ds4_gpu_add_tensor(scalar->down, local, remote, GLM5_WIDTH) &&
+            ds4_gpu_hc_expand_split_tensor(out, scalar->down,
+                scalar->after_attention, scalar->ffn_split, GLM5_WIDTH, GLM5_HC);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(remote); ds4_gpu_tensor_free(local);
+    }
+    if (ok) ok = ds4_gpu_synchronize();
+    if (!ok) goto failed;
+    if (pair_mode) {
+        const unsigned kind = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_MLA;
+        batch->expert_pair_mode = pair_mode; batch->expert_pair_rank = ctx->tp_rank;
+        if (six) {
+            ++batch->expert_six_calls[kind];
+            batch->expert_pair_reads[kind] += groups.doubles;
+        } else ++batch->expert_tail_calls[kind];
+    }
+    const double done = profile ? glm5_exec_now_sec() : 0.0;
+    if (profile) fprintf(stderr,
+        "VERIFY_FFN rank=%u layer=%u frontier=%u m=%u sequence=%llu queue=%u route_ms=%.6f route_agree_ms=%.6f expert_ms=%.6f compute_agree_ms=%.6f bulk_ms=%.6f tail_ms=%.6f total_ms=%.6f\n",
+        ctx->tp_rank, il, frontier, rows, (unsigned long long)sequence, queue_experts,
+        (routes_done - begin) * 1000.0, (route_agree_done - routes_done) * 1000.0,
+        (experts_done - route_agree_done) * 1000.0,
+        (compute_agree_done - experts_done) * 1000.0,
+        (bulk_done - compute_agree_done) * 1000.0, (done - bulk_done) * 1000.0,
+        (done - begin) * 1000.0);
+    if (route_profile) {
+        ds4_glm5_route_profile p = {0};
+        const int valid = ds4_glm5_route_profile_count(ids, rows, &p);
+        unsigned zero_weights = 0;
+        for (unsigned i = 0; i < rows * GLM5_EXPERTS_USED; ++i)
+            zero_weights += weights[i] == 0.0f;
+        fprintf(stderr,
+            "VERIFY_ROUTES rank=%u layer=%u frontier=%u m=%u sequence=%llu hash=%016llx valid=%d unique2=%u unique4=%u unique_all=%u h1=%u h2=%u h3=%u h4=%u h5=%u h6=%u h7=%u h8=%u zero_weights=%u\n",
+            ctx->tp_rank, il, frontier, rows, (unsigned long long)sequence,
+            (unsigned long long)hash, valid, p.unique2, p.unique4, p.unique_all,
+            p.multiplicity[0], p.multiplicity[1], p.multiplicity[2], p.multiplicity[3],
+            p.multiplicity[4], p.multiplicity[5], p.multiplicity[6], p.multiplicity[7], zero_weights);
+    }
+    return 1;
+failed:
+    ds4_gpu_synchronize();
+    ds4_tp_mark_failed(ctx->tp);
+    fprintf(stderr, "ds4: native FFN handoff failed rank=%u layer=%u: %s\n",
+        ctx->tp_rank, il, error[0] ? error : "local operation or payload exchange");
+    return 0;
+}
+
+static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
+                               uint32_t il, ds4_glm5_next_state *state,
+                               ds4_glm5_next_workspace *batch_w,
+                               ds4_glm5_next_workspace *scalar_w,
+                               const ds4_gpu_tensor *hc_in,
+                               ds4_gpu_tensor *hc_out, uint32_t n_tokens) {
+    const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    if (!verify_layer_valid(ctx, il, state) || !batch_w || !scalar_w ||
+        batch_w == scalar_w || !scalar_w->decode_phase ||
+        batch_w->capacity_tokens != n_tokens || scalar_w->capacity_tokens != 1u ||
+        !ds4_tp_glm5_native_width_valid(n_tokens) ||
+        !hc_in || !hc_out || hc_in == hc_out || ctx->trace_prefix ||
+        ds4_gpu_tensor_bytes(hc_in) != n_tokens * row ||
+        ds4_gpu_tensor_bytes(hc_out) != n_tokens * row ||
+        !tp_context_valid_bytes(ctx, (uint64_t)n_tokens * GLM5_WIDTH * sizeof(float)))
+        return 0;
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const bool is_kda = layer->attention == DS4_GLM5_NEXT_ATTN_KDA;
+    const char *mla_profile_option = getenv("DS4_GLM5_VERIFY_MLA_PROFILE");
+    if (mla_profile_option && strcmp(mla_profile_option, "0") &&
+        strcmp(mla_profile_option, "1")) {
+        fprintf(stderr, "ds4: invalid GLM5 MLA verification profile selector\n");
+        return 0;
+    }
+    glm5_mla_profile mla_timings = {0};
+    glm5_mla_profile *mla_profile = (!is_kda && mla_profile_option &&
+        strcmp(mla_profile_option, "1") == 0) ? &mla_timings : NULL;
+    const char *dense_option = getenv("DS4_ROCM_GLM5_VERIFY_DENSE_Q8");
+    if (dense_option && strcmp(dense_option, "0") != 0 && strcmp(dense_option, "1") != 0) {
+        fprintf(stderr, "ds4: invalid GLM5 dense Q8 verification selector\n");
+        return 0;
+    }
+    const bool batch_dense = is_kda && layer->ffn == DS4_GLM5_NEXT_FFN_DENSE &&
+        dense_option && strcmp(dense_option, "1") == 0;
+    const char *shared_option = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    if (shared_option && strcmp(shared_option, "0") != 0 && strcmp(shared_option, "1") != 0) {
+        fprintf(stderr, "ds4: invalid GLM5 shared Q8 verification selector\n");
+        return 0;
+    }
+    const char *mla_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+    const bool mla_requested = mla_option && strcmp(mla_option, "1") == 0;
+    const uint64_t config = ds4_tp_prefill_config(ctx->tp);
+    const uint32_t pair_mode = ds4_tp_glm5_expert_pairs_parse(
+        getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS"));
+    if (pair_mode != ds4_tp_glm5_expert_pairs_mode(config) ||
+        !ds4_tp_glm5_expert_pairs_config_valid(config) ||
+        (pair_mode && (n_tokens > 6u || (n_tokens != 2u && n_tokens != 4u && n_tokens != 6u)))) {
+        ds4_tp_mark_failed(ctx->tp);
+        fprintf(stderr, "ds4: native expert pair selector/hello/width mismatch\n");
+        return 0;
+    }
+    const char *queue_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
+    const bool queue_requested = queue_option && strcmp(queue_option, "1") == 0;
+    if ((queue_option && strcmp(queue_option, "0") && strcmp(queue_option, "1")) ||
+        queue_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u) ||
+        !ds4_tp_glm5_ffn_queue_config_valid(config)) {
+        fprintf(stderr, "ds4: native FFN queue selector/hello mismatch or missing prerequisites\n");
+        return 0;
+    }
+    if ((mla_option && strcmp(mla_option, "0") && strcmp(mla_option, "1")) ||
+        mla_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_handoff_config_valid(config)) {
+        fprintf(stderr, "ds4: native MLA FFN verifier selector/hello mismatch or missing prerequisites\n");
+        return 0;
+    }
+    const bool batch_mla = !is_kda && mla_requested;
+    const bool batch_shared = (is_kda || batch_mla) && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
+        shared_option && strcmp(shared_option, "1") == 0;
+    const char *handoff_option = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+    if (handoff_option && strcmp(handoff_option, "0") && strcmp(handoff_option, "1"))
+        return 0;
+    const bool handoff_requested = handoff_option && strcmp(handoff_option, "1") == 0;
+    if (handoff_requested != ((ds4_tp_prefill_config(ctx->tp) &
+            DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
+        (handoff_requested && (!shared_option || strcmp(shared_option, "1")))) return 0;
+    const bool batch_handoff = handoff_requested && batch_shared;
+    if (batch_mla && !batch_handoff) return 0;
+    if (pair_mode && layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+        ds4_glm5_expert_six_plan plan;
+        if (!batch_handoff || (n_tokens == 6u && !expert_six_admit(ctx, il, batch_w, &plan))) {
+            ds4_tp_mark_failed(ctx->tp);
+            fprintf(stderr, "ds4: native expert pair admission failed\n");
+            return 0;
+        }
+    }
+    const char *attn_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+    const bool attn_requested = attn_option && !strcmp(attn_option, "1");
+    const char *row_sync_option = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");
+    const bool row_sync = row_sync_option && !strcmp(row_sync_option, "1");
+    const char *owned = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if ((attn_option && strcmp(attn_option, "0") && strcmp(attn_option, "1")) ||
+        attn_requested != ((config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_attn_handoff_config_valid(config) ||
+        (attn_requested && (!owned || strcmp(owned, "1") || n_tokens > 6u ||
+            n_tokens > ds4_tp_glm5_native_rows(config) || (!is_kda && !batch_handoff))) ||
+        (row_sync_option && strcmp(row_sync_option, "0") && strcmp(row_sync_option, "1")) ||
+        (row_sync && !attn_requested)) {
+        fprintf(stderr, "ds4: native MLA attention handoff selector/hello/layout mismatch\n");
+        return 0;
+    }
+    const bool batch_attn = batch_mla && attn_requested;
+    const char *output_option = getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH");
+    const bool output_requested = output_option && !strcmp(output_option, "1");
+    if ((output_option && strcmp(output_option, "0") && strcmp(output_option, "1")) ||
+        (output_requested && !attn_requested)) {
+        fprintf(stderr, "ds4: native MLA output batch requires attention handoff and a valid selector\n");
+        return 0;
+    }
+    const bool batch_output = batch_attn && output_requested;
+    /* Model binding already requires each MLA output to be Q8_0 K16384/N4096.
+     * Check modes, resident range and scratch before starting private replay.
+     * The causal loop writes packed owned32 heads, not full64-head rows. */
+    if (batch_output && !mla_output_small_m(ctx, il, batch_w, n_tokens, false)) {
+        ds4_tp_mark_failed(ctx->tp);
+        fprintf(stderr, "ds4: native MLA output batch unsupported resident layout/settings\n");
+        return 0;
+    }
+    if (batch_shared) {
+        const char *pair = getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE");
+        if (!layer->is_trunk || scalar_w->draft_only ||
+            local_q4k_half_residency(ctx, layer) != 1 ||
+            (pair && strcmp(pair, "0") != 0)) {
+            fprintf(stderr, "ds4: GLM5 shared Q8 verification unsupported layout/settings\n");
+            return 0;
+        }
+    }
+    const uint64_t frontier = is_kda ? state->kda.layer[il].token_count :
+        state->mla[il].token_count;
+    if (frontier > state->context_capacity ||
+        n_tokens > state->context_capacity - frontier ||
+        (is_kda && (!verify_kda_layout(ctx, il) ||
+                    !ds4_glm5_kda_verify_ready(&state->kda.layer[il], n_tokens, ctx->tp_rank))) ||
+        (!is_kda && (layer->ffn != DS4_GLM5_NEXT_FFN_ROUTED ||
+                    !ds4_glm5_next_mla_verify_ready(&state->mla[il], n_tokens)))) return 0;
+    ds4_glm5_next_exec_ctx bulk = *ctx;
+    bulk.force_bulk_gates = true;
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    double phase_start = profile ? glm5_exec_now_sec() : 0.0;
+    double attention_sec = 0.0, ffn_sec = 0.0, shared_sec = 0.0, handoff_sec = 0.0;
+    ds4_glm5_next_mla_state *mla = NULL;
+    int ok = is_kda ? verify_kda_attention(&bulk, il, state, batch_w, hc_in, n_tokens) :
+        ds4_glm5_next_mla_verify_begin(&state->mla[il], n_tokens, &mla);
+    if (batch_attn) {
+        ok = verify_mla_attention_handoff(&bulk, il, mla, batch_w, scalar_w,
+            hc_in, (uint32_t)frontier, n_tokens, row_sync, batch_output, ok, mla_profile);
+        if (!ok) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+        static int reported[2][2];
+        if (!reported[ctx->tp_rank][batch_output]) {
+            fprintf(stderr, "ds4: native MLA attention handoff active rank=%u owned_heads=32 output=%s row_sync=%u cache_bytes=0\n",
+                ctx->tp_rank, batch_output ? "batch" : "M1", row_sync);
+            reported[ctx->tp_rank][batch_output] = 1;
+        }
+    }
+    /* Each layer input is already available for every verification row. Its
+     * FFN does not feed the same layer's next attention row. Keep MLA append,
+     * pool selection and attention arithmetic serial, then save the complete
+     * residual before scalar scratch is reused by the next attention/FFN.
+     * These are private replay appends; accepted-prefix publication is still
+     * performed by target_verify_finish, after every layer succeeds. */
+    for (uint32_t t = 0u; ok && batch_mla && !batch_attn && t < n_tokens; ++t) {
+        ds4_gpu_tensor *in = ds4_gpu_tensor_view(hc_in, t * row, row);
+        uint32_t slot = 0u, pool = 0u, visible = 0u;
+        bool publish = false;
+        ok = in && ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
+        const bool dense = ds4_glm5_next_mla_dense_selection_visible(
+            mla->token_count, mla->capacity_tokens, &visible);
+        if (ok) ok = dense ? mla_dense_selection_attention_impl(
+            &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, false, mla_profile) :
+            mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
+                slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
+                bulk.tp_big_out, true, true, false, mla_profile);
+        if (ok) ok = ds4_gpu_tensor_copy(batch_w->after_attention, t * row,
+                scalar_w->after_attention, 0u, row) &&
+            ds4_glm5_next_mla_append_commit(mla);
+        ds4_gpu_tensor_free(in);
+    }
+    if (profile) {
+        if (ok) ok = ds4_gpu_synchronize();
+        attention_sec += glm5_exec_now_sec() - phase_start;
+    }
+    if (ok && batch_dense) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ok = verify_dense_ffn(&bulk, il, batch_w, scalar_w, hc_out, n_tokens);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            ffn_sec += glm5_exec_now_sec() - phase_start;
+        }
+    }
+    if (ok && batch_shared) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ok = verify_shared_ffn_prepare(&bulk, il, batch_w, scalar_w, n_tokens);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            shared_sec = glm5_exec_now_sec() - phase_start;
+            ffn_sec += shared_sec;
+        }
+        if (ok) {
+            static int reported[2];
+            if (!reported[ctx->tp_rank]) {
+                fprintf(stderr, "ds4: GLM5 exact shared Q8 verifier batch active rank=%u weights=original new_weight_cache_bytes=0\n",
+                        ctx->tp_rank);
+                reported[ctx->tp_rank] = 1;
+            }
+        }
+    }
+    if (batch_handoff) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ok = verify_ffn_handoff(&bulk, il, batch_w, scalar_w, hc_out,
+            (uint32_t)frontier, n_tokens, ok);
+        if (profile) {
+            handoff_sec = glm5_exec_now_sec() - phase_start;
+            ffn_sec += handoff_sec;
+        }
+        if (ok) {
+            static int reported[2][2];
+            if (!reported[ctx->tp_rank][batch_mla]) {
+                fprintf(stderr, "ds4: native %s FFN handoff batch active rank=%u arithmetic=M1 weights=original cache_bytes=0 expert_completion=%s\n",
+                    batch_mla ? "MLA" : "KDA", ctx->tp_rank, queue_requested ? "layer" : "row");
+                reported[ctx->tp_rank][batch_mla] = 1;
+            }
+        }
+    }
+    for (uint32_t t = 0u; ok && !batch_dense && !batch_handoff && t < n_tokens; ++t) {
+        if (profile) phase_start = glm5_exec_now_sec();
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_out, t * row, row);
+        ds4_gpu_tensor *in = is_kda ? NULL : ds4_gpu_tensor_view(hc_in, t * row, row);
+        ok = out != NULL;
+        if (ok && is_kda) {
+            ok = ds4_gpu_tensor_copy(scalar_w->after_attention, 0u,
+                batch_w->after_attention, t * row, row);
+        } else if (ok) {
+            uint32_t slot = 0u, pool = 0u, visible = 0u;
+            bool publish = false;
+            ok = in && ds4_glm5_next_mla_append_plan(mla, &slot, &pool, &publish);
+            const bool dense = ds4_glm5_next_mla_dense_selection_visible(
+                mla->token_count, mla->capacity_tokens, &visible);
+            if (ok) ok = dense ? mla_dense_selection_attention_impl(
+                &bulk, il, mla, scalar_w, in, visible, slot, pool, publish, false, mla_profile) :
+                mla_sparse_selection_attention_impl(&bulk, il, mla, scalar_w, in,
+                    slot, pool, publish, DS4_GLM5_NEXT_INDEX_TOP_K,
+                    bulk.tp_big_out, true, true, false, mla_profile);
+        }
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            attention_sec += glm5_exec_now_sec() - phase_start;
+            phase_start = glm5_exec_now_sec();
+        }
+        if (ok) ok = layer->ffn == DS4_GLM5_NEXT_FFN_DENSE ?
+            dense_ffn_rows(&bulk, il, scalar_w, out, 1u, 0) :
+            routed_ffn_one_impl(&bulk, il, (uint32_t)frontier + t, scalar_w, out,
+                batch_shared ? batch_w : NULL, t);
+        if (ok && !is_kda) ok = ds4_glm5_next_mla_append_commit(mla);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize();
+            ffn_sec += glm5_exec_now_sec() - phase_start;
+        }
+        ds4_gpu_tensor_free(in);
+        ds4_gpu_tensor_free(out);
+    }
+    if (ok) ok = ds4_gpu_synchronize();
+    if (mla_profile) {
+        double total = 0.0;
+        for (unsigned i = 0; i < MLA_PROFILE_COUNT; ++i)
+            total += mla_timings.seconds[i];
+        fprintf(stderr,
+            "VERIFY_MLA rank=%u layer=%u frontier=%llu m=%u dense=%u sparse=%u ok=%d entry_ms=%.6f prepare_qkv_ms=%.6f kv_store_ms=%.6f lowrank_ms=%.6f index_state_ms=%.6f select_ms=%.6f attention_ms=%.6f output_ms=%.6f exchange_ms=%.6f residual_ms=%.6f total_ms=%.6f\n",
+            ctx->tp_rank, il, (unsigned long long)frontier, n_tokens,
+            mla_timings.dense_rows, mla_timings.sparse_rows, ok,
+            mla_timings.seconds[MLA_PROFILE_ENTRY] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_PREPARE_QKV] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_KV_STORE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_LOWRANK] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_INDEX_STATE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_SELECT] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_ATTENTION] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_OUTPUT] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_EXCHANGE] * 1000.0,
+            mla_timings.seconds[MLA_PROFILE_RESIDUAL] * 1000.0,
+            total * 1000.0);
+    }
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u layer=%u kind=%s m=%u attention_ms=%.6f ffn_ms=%.6f ok=%d frontier=%llu shared_ms=%.6f handoff_ms=%.6f\n",
+        ctx->tp_rank, il, is_kda ? "kda" : "mla", n_tokens,
+        attention_sec * 1000.0, ffn_sec * 1000.0, ok, (unsigned long long)frontier,
+        shared_sec * 1000.0, handoff_sec * 1000.0);
+    if (!ok) ds4_glm5_next_state_invalidate(state);
+    return ok;
+}
+
+int ds4_glm5_next_layer_verify(const ds4_glm5_next_exec_ctx *ctx,
+                               uint32_t il, ds4_glm5_next_state *state,
+                               ds4_glm5_next_workspace *batch_w,
+                               ds4_glm5_next_workspace *scalar_w,
+                               const ds4_gpu_tensor *hc_in,
+                               ds4_gpu_tensor *hc_out, uint32_t n_tokens) {
+    return state && !state->verification.tokens &&
+        layer_verify_run(ctx, il, state, batch_w, scalar_w, hc_in, hc_out, n_tokens);
+}
+
+int ds4_glm5_next_layer_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
+                                      uint32_t il, ds4_glm5_next_state *state,
+                                      uint32_t accepted_inputs) {
+    if (!verify_layer_valid(ctx, il, state) || state->verification.tokens) return 0;
+    return ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
+        ds4_glm5_kda_verify_finish(&state->kda.layer[il], accepted_inputs) :
+        ds4_glm5_next_mla_verify_finish(&state->mla[il], accepted_inputs);
+}
+
+static int target_verify_ready(const ds4_glm5_next_exec_ctx *ctx,
+                                 const ds4_glm5_next_state *state,
+                                 uint32_t tokens) {
+    if (!verify_layer_valid(ctx, 0u, state) || state->verification.tokens ||
+        state->kda.pending_verifications || state->pending_mla_verifications ||
+        state->kda.kda_count != 34u || state->mla_count != DS4_GLM5_NEXT_MLA_COUNT ||
+        !ds4_tp_glm5_native_width_valid(tokens) || ctx->trace_prefix ||
+        !tp_context_valid_bytes(ctx, (uint64_t)tokens * GLM5_WIDTH * sizeof(float)))
+        return 0;
+    const uint64_t frontier = state->kda.layer[0].token_count;
+    if (frontier > state->context_capacity || tokens > state->context_capacity - frontier)
+        return 0;
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA) {
+            if (state->kda.layer[il].token_count != frontier ||
+                !verify_kda_layout(ctx, il) ||
+                !ds4_glm5_kda_verify_ready(&state->kda.layer[il], tokens, ctx->tp_rank))
+                return 0;
+        } else if (state->mla[il].token_count != frontier ||
+                   !ds4_glm5_next_mla_verify_ready(&state->mla[il], tokens)) return 0;
+    }
+    return 1;
+}
+
+int ds4_glm5_next_target_verify_reserve(const ds4_glm5_next_exec_ctx *ctx,
+                                        ds4_glm5_next_state *state,
+                                        uint32_t capacity) {
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il)
+        if (!ds4_glm5_next_layer_verify_reserve(ctx, il, state, capacity)) return 0;
+    return target_verify_ready(ctx, state, capacity);
+}
+
+static int target_buffers_disjoint(ds4_gpu_tensor *a, ds4_gpu_tensor *b) {
+#ifdef DS4_ROCM_BUILD
+    /* The ROCm tensor ABI exposes addresses as host metadata. contents()
+     * synchronizes the device; alias preflight must not add those fences. */
+    const uintptr_t ap = a ? (uintptr_t)a->ptr : 0u;
+    const uintptr_t bp = b ? (uintptr_t)b->ptr : 0u;
+#else
+    const uintptr_t ap = (uintptr_t)ds4_gpu_tensor_contents(a);
+    const uintptr_t bp = (uintptr_t)ds4_gpu_tensor_contents(b);
+#endif
+    if (!ap || !bp) return 0;
+    return ap <= bp ? ds4_gpu_tensor_bytes(a) <= bp - ap :
+                     ds4_gpu_tensor_bytes(b) <= ap - bp;
+}
+
+static int target_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
+                                    const ds4_glm5_next_state *state) {
+    if (!verify_layer_valid(ctx, 0u, state)) return 0;
+    const ds4_glm5_next_verification *v = &state->verification;
+    return v->tokens && v->model == ctx->model && v->model_map == ctx->model_map &&
+        v->model_size == ctx->model_size && v->tp == ctx->tp && v->rank == ctx->tp_rank &&
+        v->tp_slab == ctx->tp_slab && v->tp_big_out == ctx->tp_big_out &&
+        v->tp_big_in == ctx->tp_big_in && v->tp_big_out_host == ctx->tp_big_out_host &&
+        v->tp_big_in_host == ctx->tp_big_in_host && v->tp_sequence == ctx->tp_sequence &&
+        tp_context_valid_bytes(ctx, (uint64_t)v->tokens * GLM5_WIDTH * sizeof(float)) &&
+        v->sequence_end == *ctx->tp_sequence &&
+        v->runtime_features == ds4_tp_runtime_features(ctx->tp) &&
+        v->prefill_config == ds4_tp_prefill_config(ctx->tp);
+}
+
+static int native_draft_settings(void) {
+    const char *reuse = getenv("DS4_GLM5_NATIVE_WINDOW_REUSE");
+    if (reuse && strcmp(reuse, "0") != 0 && strcmp(reuse, "1") != 0) return 0;
+    const char *disabled[] = {"DS4_ROCM_GLM5_WINDOW_PERSIST",
+        "DS4_ROCM_GLM5_WINDOW_PERSIST_PREFILL", "DS4_ROCM_GLM5_WINDOW_SCRATCH",
+        "DS4_ROCM_GLM5_WINDOW_ASYNC", "DS4_ROCM_GLM5_WINDOW_OVERLAP"};
+    for (size_t i = 0; i < sizeof(disabled) / sizeof(disabled[0]); ++i) {
+        const char *value = getenv(disabled[i]);
+        if (value && strcmp(value, "0") != 0) return 0;
+    }
+    const char *slots = getenv("DS4_ROCM_GLM5_WINDOW_SLOTS");
+    return !slots || strcmp(slots, "8") == 0;
+}
+
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create_rows(
+        uint32_t tokens, uint32_t capacity) {
+    if (!tokens || tokens > 256u || !native_draft_settings()) return NULL;
+    ds4_glm5_next_workspace *w = ds4_glm5_next_workspace_create_capacity_context(tokens, capacity);
+    if (w) { w->draft_only = true; ds4_glm5_next_workspace_begin_decode(w); }
+    return w;
+}
+
+ds4_glm5_next_workspace *ds4_glm5_next_draft_workspace_create(uint32_t capacity) {
+    return ds4_glm5_next_draft_workspace_create_rows(1u, capacity);
+}
+
+static int draft_binding_matches(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_state *owner, const ds4_glm5_next_workspace *w) {
+    if (!w->draft_owner) return true;
+    const ds4_glm5_next_exec_ctx *b = &w->draft_context;
+    return w->draft_owner == owner && b->model == ctx->model &&
+        b->model_map == ctx->model_map && b->model_size == ctx->model_size &&
+        b->tp == ctx->tp && b->tp_rank == ctx->tp_rank && b->tp_slab == ctx->tp_slab &&
+        b->tp_big_out == ctx->tp_big_out && b->tp_big_in == ctx->tp_big_in &&
+        b->tp_big_out_host == ctx->tp_big_out_host && b->tp_big_in_host == ctx->tp_big_in_host &&
+        b->tp_sequence == ctx->tp_sequence &&
+        w->draft_runtime_features == ds4_tp_runtime_features(ctx->tp) &&
+        w->draft_prefill_config == ds4_tp_prefill_config(ctx->tp);
+}
+
+int ds4_glm5_next_draft_target_hidden(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *hc, ds4_gpu_tensor *hidden) {
+    return ds4_glm5_next_draft_target_hidden_rows(ctx, w, hc, hidden,
+        w ? w->capacity_tokens : 0u);
+}
+
+int ds4_glm5_next_draft_target_hidden_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *hc,
+        ds4_gpu_tensor *hidden, uint32_t n) {
+    if (!context_valid(ctx) || !w || !n || n > w->capacity_tokens ||
+        ds4_gpu_tensor_bytes(hc) != (uint64_t)n * GLM5_HC_WIDTH * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hidden) != (uint64_t)n * GLM5_WIDTH * sizeof(float) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)hc, hidden)) return 0;
+    ds4_gpu_tensor *means = ds4_gpu_tensor_view(n == 1u ? w->hc_mean_weights : w->hc_flat,
+        0, (uint64_t)n * GLM5_HC * sizeof(float));
+    ds4_gpu_tensor *contracted = n == 1u ? w->output_hidden :
+        ds4_gpu_tensor_view(w->collapsed, 0, (uint64_t)n * GLM5_WIDTH * sizeof(float));
+    int ok = means && contracted && (n == 1u || ds4_gpu_tensor_fill_f32(means,
+        1.0f / GLM5_HC, (uint64_t)n * GLM5_HC));
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(contracted, hc, means,
+            GLM5_WIDTH, GLM5_HC) &&
+        (n == 1u ? ds4_gpu_rms_norm_weight_tensor(hidden, contracted,
+            ctx->model_map, ctx->model_size, ctx->model->output_norm,
+            GLM5_WIDTH, ctx->model->rms_norm_eps) :
+        ds4_gpu_rms_norm_weight_rows_tensor(hidden, contracted,
+            ctx->model_map, ctx->model_size, ctx->model->output_norm,
+            GLM5_WIDTH, n, ctx->model->rms_norm_eps));
+    if (n != 1u) ds4_gpu_tensor_free(contracted);
+    ds4_gpu_tensor_free(means);
+    return ok;
+}
+
+static void draft_bind(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w) {
+    if (w->draft_owner) return;
+    w->draft_owner = owner;
+    w->draft_context = *ctx;
+    w->draft_runtime_features = ds4_tp_runtime_features(ctx->tp);
+    w->draft_prefill_config = ds4_tp_prefill_config(ctx->tp);
+}
+
+/* Only activation tiles are concatenated. M1 keeps the original scalar
+ * primitive calls; M>1 uses ordinary GGUF projection dispatch. */
+static int native_project_inputs(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_workspace *w, const ds4_gpu_tensor *previous,
+        const uint32_t *tokens, uint32_t n) {
+    const uint64_t row = GLM5_WIDTH * sizeof(float);
+    ds4_gpu_tensor *concat = ds4_gpu_tensor_view(w->hc_flat, 0, n * 2u * row);
+    ds4_gpu_tensor *enorm = n == 1u ? ds4_gpu_tensor_view(w->hc_flat, 0, row) : NULL;
+    ds4_gpu_tensor *hnorm = n == 1u ? ds4_gpu_tensor_view(w->hc_flat, row, row) : NULL;
+    int ok = concat && (n != 1u || (enorm && hnorm));
+    if (ok && n == 1u) {
+        ok = ctx->model->token_embd_type == 8u ?
+            ds4_gpu_embed_token_q8_0_tensor(w->ffn_collapsed, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, tokens[0], GLM5_WIDTH) :
+            ds4_gpu_embed_token_hc_bf16_tensor(w->ffn_collapsed, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, tokens[0], GLM5_WIDTH, 1u);
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(enorm, w->ffn_collapsed,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_enorm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps) &&
+            ds4_gpu_rms_norm_weight_tensor(hnorm, previous,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_hnorm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps);
+    } else if (ok) {
+        /* Query selection is unused during warming: borrow its existing
+         * integer storage for the small shifted-token tile. */
+        ds4_gpu_tensor *ids = ds4_gpu_tensor_view(w->mla_selected_token, 0, n * 4u);
+        ok = ids && ds4_gpu_tensor_write(ids, 0, tokens, n * 4u);
+        if (ok) ok = ctx->model->token_embd_type == 8u ?
+            ds4_gpu_embed_tokens_q8_0_tensor(w->ffn_collapsed, ids, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, n, GLM5_WIDTH) :
+            ds4_gpu_embed_tokens_hc_bf16_tensor(w->ffn_collapsed, ids, ctx->model_map,
+                ctx->model_size, ctx->model->token_embd, GLM5_VOCAB, n, GLM5_WIDTH, 1u);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(w->ffn_hidden, w->ffn_collapsed,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_enorm,
+                GLM5_WIDTH, n, ctx->model->rms_norm_eps) &&
+            ds4_gpu_rms_norm_weight_rows_tensor(w->down, previous,
+                ctx->model_map, ctx->model_size, ctx->model->nextn_hnorm,
+                GLM5_WIDTH, n, ctx->model->rms_norm_eps);
+        for (uint32_t t = 0; ok && t < n; ++t)
+            ok = ds4_gpu_tensor_copy(concat, 2u * t * row, w->ffn_hidden, t * row, row) &&
+                 ds4_gpu_tensor_copy(concat, (2u * t + 1u) * row, w->down, t * row, row);
+        ds4_gpu_tensor_free(ids);
+    }
+    if (ok) ok = ds4_gpu_matmul_bf16_tensor(w->collapsed, ctx->model_map, ctx->model_size,
+        ctx->model->nextn_eh_proj, 2u * GLM5_WIDTH, GLM5_WIDTH, concat, n);
+    ds4_gpu_tensor_free(hnorm); ds4_gpu_tensor_free(enorm); ds4_gpu_tensor_free(concat);
+    return ok;
+}
+
+int ds4_glm5_next_draft_warm_rows(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *previous, const uint32_t *tokens, uint32_t n) {
+    uint32_t slot = 0, pool = 0;
+    bool publish = false;
+    if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
+        !owner || !owner->draft_only || owner->draft_model != ctx->model ||
+        owner->pending_mla_verifications ||
+        !w || !w->draft_only || !tokens || !n || n > 256u || n != w->capacity_tokens ||
+        !draft_binding_matches(ctx, owner, w) || !native_draft_settings() ||
+        ds4_gpu_tensor_bytes(previous) != (uint64_t)n * GLM5_WIDTH * sizeof(float)) return 0;
+    ds4_glm5_next_mla_state *s = &owner->mla[DS4_GLM5_NEXT_TRUNK_COUNT];
+    if (w->sparse_pool_capacity < s->capacity_pools ||
+        !ds4_glm5_next_mla_append_plan(s, &slot, &pool, &publish) ||
+        n > s->capacity_tokens - s->token_count ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_big_out) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_big_in) ||
+        (ctx->tp_slab && !target_buffers_disjoint((ds4_gpu_tensor *)previous, ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < n; ++t) if (tokens[t] >= GLM5_VOCAB) return 0;
+    draft_bind(ctx, owner, w);
+    const uint32_t pos = s->token_count;
+    const ds4_glm5_next_layer_offsets *l = &ctx->model->layer[DS4_GLM5_NEXT_TRUNK_COUNT];
+    const ds4_glm5_next_mla_offsets *m = &l->mla;
+    int ok = native_project_inputs(ctx, w, previous, tokens, n);
+    if (ok) ok = n == 1u ? ds4_gpu_rms_norm_weight_tensor(w->ffn_hidden, w->collapsed,
+        ctx->model_map, ctx->model_size, l->attn_norm, GLM5_WIDTH, ctx->model->rms_norm_eps) :
+        ds4_gpu_rms_norm_weight_rows_tensor(w->ffn_hidden, w->collapsed,
+        ctx->model_map, ctx->model_size, l->attn_norm, GLM5_WIDTH, n, ctx->model->rms_norm_eps);
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(w->mla_kv_raw, ctx->model_map, ctx->model_size,
+            m->kv_a_mqa, GLM5_WIDTH, GLM5_KV_LORA, w->ffn_hidden, n) &&
+        ds4_gpu_glm_kv_lora_rms_norm_tensor(w->mla_kv_norm, w->mla_kv_raw,
+            ctx->model_map, ctx->model_size, m->kv_a_norm, n, GLM5_KV_LORA,
+            GLM5_KV_LORA, ctx->model->rms_norm_eps) &&
+        ds4_gpu_glm_store_compact_kv_tensor(s->compact_kv, NULL, w->mla_kv_norm,
+            w->mla_kv_raw, pos, n, s->capacity_tokens, GLM5_KV_LORA,
+            GLM5_KV_LORA, 0u, false) &&
+        ds4_gpu_matmul_bf16_tensor(w->mla_index_k_raw, ctx->model_map, ctx->model_size,
+            m->index_k, GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n) &&
+        ds4_gpu_glm_store_indexer_k_tensor(w->mla_index_k_norm, w->mla_index_k_raw,
+            ctx->model_map, ctx->model_size, m->index_k_norm, m->index_k_norm_b,
+            0u, n, n, GLM5_INDEX_DIM, 0u, 1u, 1.0e-6f, 1, 1, 0, 1, 0, 0, false) &&
+        ds4_gpu_matmul_bf16_tensor(w->mla_pool_gate_raw, ctx->model_map, ctx->model_size,
+            m->index_pool_gate, GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n) &&
+        mla_stage_index_rows(ctx, m, s, w, pos, n);
+    /* The aligned pooled helper can omit inactive tails. Preserve their
+     * physical scalar bytes too, so future accepted-prefix journals match. */
+    const uint64_t index_row = GLM5_INDEX_DIM * sizeof(float);
+    for (uint32_t t = n > 4u ? n - 4u : 0u; ok && t < n; ++t)
+        ok = ds4_gpu_tensor_copy(s->index_tail, ((pos + t) % 4u) * index_row,
+                w->mla_index_k_norm, t * index_row, index_row) &&
+             ds4_gpu_tensor_copy(s->pool_gate_tail, ((pos + t) % 4u) * index_row,
+                w->mla_pool_gate_raw, t * index_row, index_row);
+    if (ok) ok = ds4_gpu_synchronize();
+    for (uint32_t t = 0; ok && t < n; ++t) ok = ds4_glm5_next_mla_append_commit(s);
+    if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(owner); }
+    return ok;
+}
+
+int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_mla_state *s, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *previous, uint32_t token,
+        ds4_gpu_tensor *hidden, ds4_gpu_tensor *logits) {
+    uint32_t slot = 0, pool = 0, visible = 0;
+    bool publish = false;
+    if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
+        (ds4_tp_runtime_features(ctx->tp) & DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) ||
+        !s || !s->owner || !s->owner->valid || !s->owner->draft_only ||
+        s->owner->draft_model != ctx->model ||
+        s->owner->layer_count != DS4_GLM5_NEXT_LAYER_COUNT || s->owner->mla_count != 1u ||
+        !w || !w->draft_only || !w->decode_phase || w->capacity_tokens != 1u ||
+        !draft_binding_matches(ctx, s->owner, w) ||
+        w->sparse_pool_capacity < s->capacity_pools || !native_draft_settings() ||
+        token >= GLM5_VOCAB || !ds4_glm5_next_mla_append_plan(s, &slot, &pool, &publish) ||
+        ds4_gpu_tensor_bytes(previous) != GLM5_WIDTH * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hidden) != GLM5_WIDTH * sizeof(float) ||
+        ds4_gpu_tensor_bytes(logits) != GLM5_VOCAB * sizeof(float) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, hidden) ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)previous, logits) ||
+        !target_buffers_disjoint(hidden, logits)) return 0;
+    ds4_gpu_tensor *buffers[] = {(ds4_gpu_tensor *)previous, hidden, logits};
+    for (unsigned i = 0; i < 3; ++i)
+        if (!target_buffers_disjoint(buffers[i], ctx->tp_big_out) ||
+            !target_buffers_disjoint(buffers[i], ctx->tp_big_in) ||
+            (ctx->tp_slab && !target_buffers_disjoint(buffers[i], ctx->tp_slab))) return 0;
+    const unsigned il = DS4_GLM5_NEXT_TRUNK_COUNT;
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const ds4_glm5_next_ffn_offsets *f = &layer->ffn_weight;
+    if (f->gate_exps_type != 12u || f->up_exps_type != 12u ||
+        f->down_exps_type != 12u || local_q4k_half_residency(ctx, layer) != 0) return 0;
+    /* A target streaming-layer cleanup would destroy retained window handles.
+     * Never allow a private draft to run across that ownership change. */
+    for (unsigned trunk = 3; trunk < DS4_GLM5_NEXT_TRUNK_COUNT; ++trunk)
+        if (local_q4k_half_residency(ctx, &ctx->model->layer[trunk]) != 1) return 0;
+    draft_bind(ctx, s->owner, w);
+    int ok = native_project_inputs(ctx, w, previous, &token, 1u);
+    ds4_glm5_next_exec_ctx bulk = *ctx;
+    bulk.force_bulk_gates = true;
+    const uint32_t pos = s->token_count;
+    if (ok) ok = ds4_glm5_next_mla_dense_selection_visible(pos, s->capacity_tokens, &visible) ?
+        mla_dense_selection_attention(&bulk, il, s, w, w->collapsed, visible, slot, pool, publish) :
+        mla_sparse_selection_attention(&bulk, il, s, w, w->collapsed, slot, pool,
+            publish, DS4_GLM5_NEXT_INDEX_TOP_K, bulk.tp_big_out, true, true);
+    if (ok) ok = routed_ffn_one(&bulk, il, pos, w, w->output_hidden) &&
+        ds4_gpu_rms_norm_weight_tensor(hidden, w->output_hidden,
+            ctx->model_map, ctx->model_size, ctx->model->nextn_shared_head_norm,
+            GLM5_WIDTH, ctx->model->rms_norm_eps);
+    if (ok) ok = ctx->model->output_type == 8u ?
+        ds4_gpu_matmul_q8_0_tensor(logits, ctx->model_map, ctx->model_size,
+            ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, hidden, 1u) :
+        ds4_gpu_matmul_bf16_tensor(logits, ctx->model_map, ctx->model_size,
+            ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, hidden, 1u);
+    if (ok) ok = ds4_gpu_synchronize() && ds4_glm5_next_mla_append_commit(s);
+    if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(s->owner); }
+    return ok;
+}
+
+int ds4_glm5_next_draft_refresh(const ds4_glm5_next_exec_ctx *ctx,
+        ds4_glm5_next_state *owner, ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *target_hidden, const uint32_t *inputs,
+        uint32_t prefix, uint32_t rows, uint32_t accepted,
+        ds4_gpu_tensor *previous) {
+    const uint64_t row = GLM5_WIDTH * sizeof(float);
+    if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
+        !owner || !owner->valid || !owner->draft_only || owner->draft_model != ctx->model ||
+        !w || !w->draft_only || !w->decode_phase || w->capacity_tokens != 1u ||
+        !draft_binding_matches(ctx, owner, w) || !native_draft_settings() ||
+        !inputs || !prefix || !ds4_tp_glm5_native_width_valid(rows) ||
+        !accepted || accepted > rows || prefix > owner->context_capacity ||
+        rows > owner->context_capacity - prefix ||
+        ds4_gpu_tensor_bytes(target_hidden) != rows * row ||
+        ds4_gpu_tensor_bytes(previous) != row ||
+        !target_buffers_disjoint((ds4_gpu_tensor *)target_hidden, previous)) return 0;
+    ds4_glm5_next_mla_state *s = &owner->mla[DS4_GLM5_NEXT_TRUNK_COUNT];
+    if (owner->pending_mla_verifications != 1u ||
+        w->sparse_pool_capacity < s->capacity_pools ||
+        !ds4_glm5_next_mla_verify_pending(s, prefix - 1u, rows - 1u)) return 0;
+    ds4_gpu_tensor *buffers[] = {(ds4_gpu_tensor *)target_hidden, previous};
+    for (unsigned i = 0; i < 2u; ++i)
+        if (!target_buffers_disjoint(buffers[i], ctx->tp_big_out) ||
+            !target_buffers_disjoint(buffers[i], ctx->tp_big_in) ||
+            (ctx->tp_slab && !target_buffers_disjoint(buffers[i], ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < rows; ++t) if (inputs[t] >= GLM5_VOCAB) return 0;
+
+    /* Create metadata views before retiring the journal so allocation refusal
+     * leaves it usable. No GPU storage is allocated or copied here. */
+    ds4_gpu_tensor *hidden[8] = {0};
+    uint32_t prepared = 0;
+    while (prepared < accepted) {
+        hidden[prepared] = ds4_gpu_tensor_view((ds4_gpu_tensor *)target_hidden,
+            prepared * row, row);
+        if (!hidden[prepared]) break;
+        ++prepared;
+    }
+    if (prepared != accepted) {
+        for (uint32_t t = 0; t < prepared; ++t) ds4_gpu_tensor_free(hidden[t]);
+        return 0;
+    }
+    draft_bind(ctx, owner, w);
+    int ok = ds4_glm5_next_mla_verify_finish(s, 0u);
+    for (uint32_t t = 0; ok && t < accepted; ++t)
+        ok = ds4_glm5_next_draft_warm_rows(ctx, owner, w,
+            t ? hidden[t - 1u] : previous, &inputs[t], 1u);
+    if (ok) ok = ds4_gpu_tensor_copy(previous, 0, hidden[accepted - 1u], 0, row) &&
+        ds4_gpu_synchronize();
+    for (uint32_t t = 0; t < prepared; ++t) ds4_gpu_tensor_free(hidden[t]);
+    if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(owner); }
+    return ok;
+}
+
+static int target_output_logits_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                    ds4_glm5_next_workspace *batch_w,
+                                    ds4_glm5_next_workspace *scalar_w,
+                                    const ds4_gpu_tensor *hc_hidden,
+                                    ds4_gpu_tensor *logits, uint32_t tokens) {
+    const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t norm_row = (uint64_t)GLM5_WIDTH * sizeof(float);
+    /* Trunk execution has finished. Reuse its collapsed activation scratch;
+     * journals own their replay inputs independently of this workspace.
+     * Collapse and normalization retain scalar dispatch and arithmetic. */
+    for (uint32_t t = 0; t < tokens; ++t) {
+        ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_hidden, t * row, row);
+        ds4_gpu_tensor *norm = ds4_gpu_tensor_view(batch_w->collapsed, t * norm_row, norm_row);
+        const int ok = hidden && norm &&
+            ds4_gpu_hc_weighted_sum_tensor(scalar_w->output_hidden, hidden,
+                scalar_w->hc_mean_weights, GLM5_WIDTH, GLM5_HC) &&
+            ds4_gpu_rms_norm_weight_tensor(norm, scalar_w->output_hidden,
+                ctx->model_map, ctx->model_size, ctx->model->output_norm,
+                GLM5_WIDTH, ctx->model->rms_norm_eps);
+        ds4_gpu_tensor_free(norm);
+        ds4_gpu_tensor_free(hidden);
+        if (!ok) return 0;
+    }
+    return ds4_gpu_matmul_bf16_tensor(logits, ctx->model_map, ctx->model_size,
+        ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, batch_w->collapsed, tokens);
+}
+
+int ds4_glm5_next_target_verify(const ds4_glm5_next_exec_ctx *ctx,
+                                ds4_glm5_next_state *state,
+                                ds4_glm5_next_workspace *batch_w,
+                                ds4_glm5_next_workspace *scalar_w,
+                                const uint32_t *input_tokens, uint32_t tokens,
+                                ds4_gpu_tensor *hc_scratch,
+                                ds4_gpu_tensor *hc_out,
+                                ds4_gpu_tensor *logits_out) {
+    const uint64_t row = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t logits_row = (uint64_t)GLM5_VOCAB * sizeof(float);
+    const char *head_option = getenv("DS4_ROCM_GLM5_BF16_VERIFY_HEAD");
+    if (head_option && strcmp(head_option, "0") != 0 &&
+        strcmp(head_option, "1") != 0) return 0;
+    if (!input_tokens || !target_verify_ready(ctx, state, tokens) ||
+        !batch_w || !scalar_w || batch_w == scalar_w || !scalar_w->decode_phase ||
+        scalar_w->capacity_tokens != 1u || batch_w->capacity_tokens != tokens ||
+        scalar_w->sparse_pool_capacity < state->context_capacity / 4u +
+            (state->context_capacity % 4u != 0u) ||
+        ds4_gpu_tensor_bytes(hc_scratch) != tokens * row ||
+        ds4_gpu_tensor_bytes(hc_out) != tokens * row ||
+        ds4_gpu_tensor_bytes(logits_out) != tokens * logits_row ||
+        !target_buffers_disjoint(hc_scratch, hc_out) ||
+        !target_buffers_disjoint(hc_scratch, logits_out) ||
+        !target_buffers_disjoint(hc_out, logits_out)) return 0;
+    ds4_gpu_tensor *buffers[] = {hc_scratch, hc_out, logits_out};
+    for (uint32_t i = 0; i < 3u; ++i)
+        if (!target_buffers_disjoint(buffers[i], ctx->tp_big_out) ||
+            !target_buffers_disjoint(buffers[i], ctx->tp_big_in) ||
+            (ctx->tp_slab && !target_buffers_disjoint(buffers[i], ctx->tp_slab))) return 0;
+    for (uint32_t t = 0; t < tokens; ++t) if (input_tokens[t] >= GLM5_VOCAB) return 0;
+    ds4_glm5_next_verification *v = &state->verification;
+    *v = (ds4_glm5_next_verification){
+        .model=ctx->model, .model_map=ctx->model_map, .model_size=ctx->model_size,
+        .tp=ctx->tp, .tp_slab=ctx->tp_slab, .tp_big_out=ctx->tp_big_out,
+        .tp_big_in=ctx->tp_big_in, .tp_big_out_host=ctx->tp_big_out_host,
+        .tp_big_in_host=ctx->tp_big_in_host, .tp_sequence=ctx->tp_sequence,
+        .prefill_config=ds4_tp_prefill_config(ctx->tp),
+        .runtime_features=ds4_tp_runtime_features(ctx->tp), .rank=ctx->tp_rank,
+        .frontier=state->kda.layer[0].token_count, .tokens=tokens,
+    };
+    memcpy(v->input_tokens, input_tokens, tokens * sizeof(*input_tokens));
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const double begin_sec = profile ? glm5_exec_now_sec() : 0.0;
+    int ok = 1;
+    for (uint32_t t = 0; ok && t < tokens; ++t) {
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(hc_scratch, t * row, row);
+        ok = out && ds4_glm5_next_embed_token(ctx, v->input_tokens[t], out);
+        ds4_gpu_tensor_free(out);
+    }
+    if (profile && ok) ok = ds4_gpu_synchronize();
+    const double embed_sec = profile ? glm5_exec_now_sec() : 0.0;
+    ds4_gpu_tensor *in = hc_scratch, *out = hc_out;
+    for (uint32_t il = 0; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        ok = layer_verify_run(ctx, il, state, batch_w, scalar_w, in, out, tokens);
+        if (ok) v->next_layer = il + 1u;
+        ds4_gpu_tensor *swap = in; in = out; out = swap;
+    }
+    const double trunk_sec = profile ? glm5_exec_now_sec() : 0.0;
+    /* The 45-layer trunk is odd: final hidden rows are always in hc_out. */
+    const bool batch_head = head_option && strcmp(head_option, "1") == 0 &&
+        ctx->model->output_type == 30u;
+    if (ok && batch_head)
+        ok = target_output_logits_rows(ctx, batch_w, scalar_w, hc_out, logits_out, tokens);
+    for (uint32_t t = 0; ok && !batch_head && t < tokens; ++t) {
+        ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(hc_out, t * row, row);
+        ds4_gpu_tensor *logits = ds4_gpu_tensor_view(logits_out, t * logits_row, logits_row);
+        ok = hidden && logits && ds4_glm5_next_output_logits(ctx, scalar_w, hidden, logits);
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(hidden);
+    }
+    if (ok) ok = ds4_gpu_synchronize();
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u target m=%u embed_ms=%.6f trunk_ms=%.6f head_ms=%.6f ok=%d\n",
+        ctx->tp_rank, tokens, (embed_sec - begin_sec) * 1000.0,
+        (trunk_sec - embed_sec) * 1000.0,
+        (glm5_exec_now_sec() - trunk_sec) * 1000.0, ok);
+    if (!ok) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    v->sequence_end = *ctx->tp_sequence;
+    v->complete = true;
+    return 1;
+}
+
+int ds4_glm5_next_target_verify_finish(const ds4_glm5_next_exec_ctx *ctx,
+                                       ds4_glm5_next_state *state,
+                                       uint32_t accepted) {
+    if (!target_binding_matches(ctx, state)) return 0;
+    const bool profile = getenv("DS4_GLM5_VERIFY_PROFILE") != NULL;
+    const double begin_sec = profile ? glm5_exec_now_sec() : 0.0;
+    const ds4_glm5_next_verification *v = &state->verification;
+    if (!v->complete || v->next_layer != DS4_GLM5_NEXT_TRUNK_COUNT ||
+        accepted > v->tokens || state->kda.pending_verifications != 34u ||
+        state->pending_mla_verifications != DS4_GLM5_NEXT_MLA_COUNT) return 0;
+    /* Check every journal before a single committed counter or byte changes. */
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const int ready = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
+            ds4_glm5_kda_verify_pending(&state->kda.layer[il], v->frontier, v->tokens, v->rank) :
+            ds4_glm5_next_mla_verify_pending(&state->mla[il], (uint32_t)v->frontier, v->tokens);
+        if (!ready) return 0;
+    }
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const int ok = ctx->model->layer[il].attention == DS4_GLM5_NEXT_ATTN_KDA ?
+            ds4_glm5_kda_verify_finish(&state->kda.layer[il], accepted) :
+            ds4_glm5_next_mla_verify_finish(&state->mla[il], accepted);
+        if (!ok) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    memset(&state->verification, 0, sizeof(state->verification));
+    if (profile) fprintf(stderr,
+        "VERIFY_PROFILE rank=%u finish accepted=%u commit_ms=%.6f ok=1\n",
+        ctx->tp_rank, accepted, (glm5_exec_now_sec() - begin_sec) * 1000.0);
+    return 1;
+}
+
 int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 uint32_t il,
                                 ds4_glm5_next_state *state,
@@ -3983,7 +5727,9 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 const ds4_gpu_tensor *hc_in,
                                 ds4_gpu_tensor *hc_out) {
     const uint64_t hc_bytes = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out ||
         ds4_gpu_tensor_bytes(hc_in) < hc_bytes ||
         ds4_gpu_tensor_bytes(hc_out) < hc_bytes ||
@@ -4022,7 +5768,9 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       uint32_t n_tokens) {
     const uint64_t hc_row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         (uint64_t)n_tokens > UINT64_MAX / hc_row_bytes ||
@@ -4065,7 +5813,9 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         const ds4_gpu_tensor *hc_in,
         ds4_gpu_tensor *hc_out,
         uint32_t n_tokens) {
-    if (!context_valid(ctx) || !state || !state->valid || !batch_w ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !batch_w ||
         !scalar_w || batch_w == scalar_w || !hc_in || !hc_out ||
         hc_in == hc_out || n_tokens == 0u ||
         batch_w->capacity_tokens != n_tokens ||
@@ -4196,7 +5946,7 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
                 pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
                 selected_row, !batch_value, score_row, row_pools) :
             (in_row && mla_sparse_selection_attention(
-                &scalar_ctx, il, state, scalar_w, in_row, tail_slot,
+                &scalar_ctx, il, mla, scalar_w, in_row, tail_slot,
                 pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
                 local_row, !batch_output, false)));
         const int row_ok = (batch_prelude || in_row) &&
@@ -4300,7 +6050,9 @@ int ds4_glm5_next_kda_attention_forward_test(
         uint32_t n_tokens) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens || il >= ctx->model->trunk_count ||
         ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_KDA ||
@@ -4328,7 +6080,9 @@ int ds4_glm5_next_mla_attention_forward_test(
         uint32_t n_tokens) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || n_tokens == 0u ||
         w->capacity_tokens != n_tokens ||
         il >= ctx->model->trunk_count ||
@@ -4348,11 +6102,11 @@ int ds4_glm5_next_mla_attention_forward_test(
         if (ok && ds4_glm5_next_mla_dense_selection_visible(
                       mla->token_count, mla->capacity_tokens, &visible)) {
             ok = mla_dense_selection_attention(
-                ctx, il, state, w, hc_in, visible, tail_slot,
+                ctx, il, mla, w, hc_in, visible, tail_slot,
                 pool_index, publish_pool);
         } else if (ok) {
             ok = mla_sparse_selection_attention(
-                ctx, il, state, w, hc_in, tail_slot,
+                ctx, il, mla, w, hc_in, tail_slot,
                 pool_index, publish_pool, DS4_GLM5_NEXT_INDEX_TOP_K,
                 ctx->tp_big_out, true, true);
         }
@@ -4389,7 +6143,9 @@ int ds4_glm5_next_mla_sparse_attention_forward_test(
         uint32_t top_k) {
     const uint64_t row_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
-    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+    if (!context_valid(ctx) || !state || !state->valid ||
+        state->verification.tokens || state->pending_mla_verifications ||
+        state->kda.pending_verifications || !w || !hc_in ||
         !hc_out || hc_in == hc_out || w->capacity_tokens != 1u ||
         il >= ctx->model->trunk_count || top_k == 0u ||
         top_k > DS4_GLM5_NEXT_INDEX_TOP_K ||
@@ -4406,7 +6162,7 @@ int ds4_glm5_next_mla_sparse_attention_forward_test(
     const int ok = ds4_glm5_next_mla_append_plan(
                        mla, &tail_slot, &pool_index, &publish_pool) &&
                    mla_sparse_selection_attention(
-                       ctx, il, state, w, hc_in, tail_slot, pool_index,
+                       ctx, il, mla, w, hc_in, tail_slot, pool_index,
                        publish_pool, top_k, ctx->tp_big_out, true, true) &&
                    ds4_gpu_tensor_copy(
                        hc_out, 0u, w->after_attention, 0u, row_bytes) &&

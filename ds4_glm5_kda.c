@@ -79,10 +79,178 @@ int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
 }
 
 #ifndef DS4_GLM5_KDA_SCHEDULE_ONLY
+struct ds4_glm5_kda_replay {
+    ds4_glm5_kda_layer_state *owner;
+    ds4_glm5_kda_replay_buffers buffers;
+    ds4_gpu_tensor *source[4];
+    uint64_t frontier;
+    uint64_t bytes;
+    uint32_t capacity, rank, tokens;
+    bool active;
+};
+
+static void replay_discard(ds4_glm5_kda_layer_state *s) {
+    if (s && s->replay && s->replay->owner == s) s->replay->active = false;
+}
+
+static void replay_free(ds4_glm5_kda_layer_state *s) {
+    if (!s || !s->replay) return;
+    struct ds4_glm5_kda_replay *r = s->replay;
+    if (r->owner == s) {
+        ds4_gpu_tensor_free(r->buffers.raw_q);
+        ds4_gpu_tensor_free(r->buffers.raw_k);
+        ds4_gpu_tensor_free(r->buffers.raw_v);
+        ds4_gpu_tensor_free(r->buffers.k);
+        ds4_gpu_tensor_free(r->buffers.v);
+        ds4_gpu_tensor_free(r->buffers.gate);
+        ds4_gpu_tensor_free(r->buffers.beta);
+        free(r);
+    }
+    s->replay = NULL;
+}
+
+static int replay_pending(const ds4_glm5_kda_layer_state *s) {
+    return s && ((s->replay && s->replay->active) ||
+        (s->owner_slot && s->owner_slot->pending_verifications));
+}
+
+static int replay_sources_valid(const ds4_glm5_kda_layer_state *s) {
+    if (!s || !s->valid || !s->owner_slot || !s->owner_slot->valid ||
+        !s->owner_slot->layer) return 0;
+    bool owned = false;
+    for (uint32_t i = 0; i < s->owner_slot->layer_count; ++i)
+        if (s == &s->owner_slot->layer[i]) owned = true;
+    if (!owned) return 0;
+    return ds4_gpu_tensor_bytes(s->q_history) == 8192u * 3u * 4u &&
+           ds4_gpu_tensor_bytes(s->k_history) == 8192u * 3u * 4u &&
+           ds4_gpu_tensor_bytes(s->v_history) == 8192u * 3u * 4u &&
+           ds4_gpu_tensor_bytes(s->recurrent) == 64u * 128u * 128u * 4u;
+}
+
+static int replay_matches(const ds4_glm5_kda_layer_state *s) {
+    const struct ds4_glm5_kda_replay *r = s ? s->replay : NULL;
+    return r && r->owner == s && replay_sources_valid(s) &&
+           r->source[0] == s->q_history && r->source[1] == s->k_history &&
+           r->source[2] == s->v_history && r->source[3] == s->recurrent;
+}
+
+int ds4_glm5_kda_replay_reserve(ds4_glm5_kda_layer_state *s,
+                               uint32_t capacity, uint32_t rank) {
+    if (!replay_sources_valid(s) || s->pending_tokens || rank > 1u ||
+        (capacity != 2u && capacity != 4u && capacity != 6u && capacity != 8u)) return 0;
+    if (s->replay) return replay_matches(s) && !s->replay->active &&
+        s->replay->capacity == capacity && s->replay->rank == rank;
+    struct ds4_glm5_kda_replay *r = calloc(1, sizeof(*r));
+    if (!r) return 0;
+    r->owner = s;
+    r->capacity = capacity;
+    r->rank = rank;
+    r->source[0] = s->q_history; r->source[1] = s->k_history;
+    r->source[2] = s->v_history; r->source[3] = s->recurrent;
+    const uint64_t vector_bytes = (uint64_t)capacity * 4096u * 4u;
+    const uint64_t beta_bytes = (uint64_t)capacity * 32u * 4u;
+    r->bytes = 6u * vector_bytes + beta_bytes;
+    r->buffers.raw_q = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.raw_k = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.raw_v = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.k = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.v = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.gate = ds4_gpu_tensor_alloc(vector_bytes);
+    r->buffers.beta = ds4_gpu_tensor_alloc(beta_bytes);
+    s->replay = r;
+    if (!r->buffers.raw_q || !r->buffers.raw_k || !r->buffers.raw_v ||
+        !r->buffers.k || !r->buffers.v || !r->buffers.gate || !r->buffers.beta) {
+        replay_free(s);
+        return 0;
+    }
+    return 1;
+}
+
+uint64_t ds4_glm5_kda_replay_bytes(const ds4_glm5_kda_layer_state *s) {
+    return s && s->replay && s->replay->owner == s ? s->replay->bytes : 0;
+}
+
+int ds4_glm5_kda_verify_ready(const ds4_glm5_kda_layer_state *s,
+                               uint32_t tokens, uint32_t rank) {
+    return replay_matches(s) && !s->replay->active && !s->pending_tokens &&
+        rank == s->replay->rank &&
+        s->owner_slot->pending_verifications < s->owner_slot->kda_count &&
+        (tokens == 2u || tokens == 4u || tokens == 6u || tokens == 8u) &&
+        tokens <= s->replay->capacity && s->token_count <= UINT64_MAX - tokens;
+}
+
+int ds4_glm5_kda_verify_begin(ds4_glm5_kda_layer_state *s,
+                              ds4_glm5_kda_workspace *workspace,
+                              const ds4_glm5_kda_weight_offsets *weights,
+                              const void *model_map, uint64_t model_size,
+                              const ds4_gpu_tensor *input,
+                              ds4_gpu_tensor *gated_output,
+                              uint32_t tokens, float norm_eps) {
+    if (!s || !s->replay || !ds4_glm5_kda_verify_ready(s, tokens, s->replay->rank) ||
+        !workspace || !weights || !model_map || !model_size ||
+        tokens > workspace->capacity_tokens || norm_eps != 1.0e-5f ||
+        ds4_gpu_tensor_bytes(input) < (uint64_t)tokens * 4096u * 4u ||
+        ds4_gpu_tensor_bytes(gated_output) < (uint64_t)tokens * 4096u * 4u)
+        return 0;
+    const uint32_t types[] = {weights->q_type, weights->k_type, weights->v_type,
+        weights->f_a_type, weights->f_b_type, weights->g_a_type,
+        weights->g_b_type, weights->beta_type};
+    for (uint32_t i = 0; i < sizeof(types)/sizeof(types[0]); ++i)
+        if (types[i] != 30u) return 0;
+    const char *exact = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT");
+    if (!exact || strcmp(exact, "1") != 0) return 0;
+    const ds4_glm5_kda_device_args args = {
+        .weights=weights, .model_map=model_map, .model_size=model_size,
+        .state=s, .workspace=workspace, .input=input, .gated_output=gated_output,
+        .n_tokens=tokens, .head_start=s->replay->rank * 32u, .n_heads=32u,
+        .norm_eps=norm_eps, .replay=&s->replay->buffers,
+    };
+    if (!ds4_rocm_glm5_kda_verify_begin(&args)) {
+        ds4_glm5_kda_layer_abort(s);
+        return 0;
+    }
+    s->replay->frontier = s->token_count;
+    s->replay->tokens = tokens;
+    s->replay->active = true;
+    s->pending_tokens = tokens;
+    ++s->owner_slot->pending_verifications;
+    return 1;
+}
+
+static int replay_commit_ready(const ds4_glm5_kda_layer_state *s) {
+    return replay_matches(s) && s->replay->active &&
+        s->owner_slot->pending_verifications &&
+        s->pending_tokens == s->replay->tokens &&
+        s->token_count == s->replay->frontier;
+}
+
+int ds4_glm5_kda_verify_pending(const ds4_glm5_kda_layer_state *s,
+                                 uint64_t frontier, uint32_t tokens,
+                                 uint32_t rank) {
+    return replay_commit_ready(s) && s->replay->frontier == frontier &&
+        s->replay->tokens == tokens && s->replay->rank == rank;
+}
+
+int ds4_glm5_kda_verify_finish(ds4_glm5_kda_layer_state *s,
+                               uint32_t accepted) {
+    if (!replay_commit_ready(s) || accepted > s->replay->tokens) return 0;
+    if (accepted && !ds4_rocm_glm5_kda_replay_commit(
+            s, &s->replay->buffers, accepted, s->replay->rank)) {
+        ds4_glm5_kda_layer_abort(s);
+        return 0;
+    }
+    s->token_count += accepted;
+    s->pending_tokens = 0;
+    s->replay->active = false;
+    --s->owner_slot->pending_verifications;
+    return 1;
+}
+
 void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot) {
     if (!slot) return;
     if (slot->layer) {
         for (uint32_t i = 0; i < slot->layer_count; ++i) {
+            replay_free(&slot->layer[i]);
             ds4_gpu_tensor_free(slot->layer[i].q_history);
             ds4_gpu_tensor_free(slot->layer[i].k_history);
             ds4_gpu_tensor_free(slot->layer[i].v_history);
@@ -96,8 +264,10 @@ void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot) {
 void ds4_glm5_kda_slot_invalidate(ds4_glm5_kda_slot *slot) {
     if (!slot || (slot->layer_count != 0u && !slot->layer)) return;
     slot->valid = false;
+    slot->pending_verifications = 0;
     for (uint32_t i = 0; i < slot->layer_count; ++i) {
         if (slot->layer[i].recurrent) {
+            replay_discard(&slot->layer[i]);
             slot->layer[i].pending_tokens = 0u;
             slot->layer[i].valid = false;
         }
@@ -106,6 +276,7 @@ void ds4_glm5_kda_slot_invalidate(ds4_glm5_kda_slot *slot) {
 
 int ds4_glm5_kda_slot_reset(ds4_glm5_kda_slot *slot) {
     if (!slot || (slot->layer_count != 0 && !slot->layer)) return 0;
+    slot->pending_verifications = 0;
     const uint64_t history_values =
         (uint64_t)DS4_GLM5_KDA_CHANNELS * DS4_GLM5_KDA_HISTORY;
     const uint64_t recurrent_values =
@@ -114,6 +285,7 @@ int ds4_glm5_kda_slot_reset(ds4_glm5_kda_slot *slot) {
     for (uint32_t i = 0; i < slot->layer_count; ++i) {
         ds4_glm5_kda_layer_state *state = &slot->layer[i];
         if (!state->recurrent) continue;
+        replay_discard(state);
         if (!ds4_gpu_tensor_fill_f32(state->q_history, 0.0f, history_values) ||
             !ds4_gpu_tensor_fill_f32(state->k_history, 0.0f, history_values) ||
             !ds4_gpu_tensor_fill_f32(state->v_history, 0.0f, history_values) ||
@@ -202,7 +374,13 @@ void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace) {
 }
 
 static int kda_six_workspace_requested(void) {
-    const char *decode = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Keep the old name as a source-compatible alias for existing diagnostic
+     * launchers.  New launchers use the explicit decode selector so enabling
+     * prefill fusion cannot implicitly alter decode workspace admission. */
+    if (!decode)
+        decode = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     return (decode && strcmp(decode, "1") == 0) ||
            (prefill && strcmp(prefill, "1") == 0);
@@ -292,6 +470,24 @@ int ds4_rocm_glm5_kda_layer_begin(
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
 #endif
+int ds4_rocm_glm5_kda_verify_begin(const ds4_glm5_kda_device_args *args) {
+    (void)args;
+    return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_kda_replay_commit(ds4_glm5_kda_layer_state *state,
+                                    const ds4_glm5_kda_replay_buffers *buffers,
+                                    uint32_t accepted, uint32_t rank) {
+    (void)state; (void)buffers; (void)accepted; (void)rank;
+    return 0;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
 int ds4_rocm_glm5_kda_layer_finish(
         const ds4_glm5_kda_device_args *args,
         const ds4_gpu_tensor *full_gated) {
@@ -330,6 +526,7 @@ int ds4_glm5_kda_test_should_fail(uint32_t stage) {
 
 void ds4_glm5_kda_layer_abort(ds4_glm5_kda_layer_state *state) {
     if (!state) return;
+    replay_discard(state);
     state->pending_tokens = 0u;
     if (state->owner_slot) ds4_glm5_kda_slot_invalidate(state->owner_slot);
     else state->valid = false;
@@ -346,6 +543,8 @@ int ds4_glm5_kda_layer_begin(ds4_glm5_kda_layer_state *state,
                              float norm_eps,
                              uint32_t head_start,
                              uint32_t n_heads) {
+    if (replay_pending(state) ||
+        (state && state->owner_slot && !state->owner_slot->valid)) return 0;
     if (!state || !state->valid || !state->q_history || !state->k_history ||
         !state->v_history || !state->recurrent || !workspace || !weights ||
         !model_map || model_size == 0u || !input || !gated_output ||
@@ -396,6 +595,8 @@ int ds4_glm5_kda_layer_finish(ds4_glm5_kda_layer_state *state,
                               const ds4_gpu_tensor *full_gated,
                               ds4_gpu_tensor *output,
                               uint32_t n_tokens) {
+    if (replay_pending(state) ||
+        (state && state->owner_slot && !state->owner_slot->valid)) return 0;
     const uint64_t full_bytes =
         (uint64_t)n_tokens * DS4_GLM5_KDA_CHANNELS * sizeof(float);
     const uint64_t output_bytes =
@@ -431,7 +632,9 @@ int ds4_glm5_kda_layer_finish(ds4_glm5_kda_layer_state *state,
 }
 
 int ds4_glm5_kda_layer_commit(ds4_glm5_kda_layer_state *state,
-                              uint32_t n_tokens) {
+                             uint32_t n_tokens) {
+    if (replay_pending(state) ||
+        (state && state->owner_slot && !state->owner_slot->valid)) return 0;
     if (!state || !state->valid || n_tokens == 0u ||
         state->pending_tokens != n_tokens ||
         state->token_count > UINT64_MAX - n_tokens) {

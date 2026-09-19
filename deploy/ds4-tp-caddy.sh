@@ -555,7 +555,7 @@ start() {
     esac
     decode_env=(
       DS4_TP_GREEDY_TOP2=1
-      DS4_TP_HOST_CALLBACK=1
+      DS4_TP_HOST_CALLBACK=0
       DS4_TP_PREFILL_FFN_WAVEFRONT="$PREFILL_FFN_WAVEFRONT"
       DS4_ROCM_TEMPORAL_COMPRESSOR=1
       DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
@@ -572,11 +572,11 @@ start() {
     support_args=()
   fi
   common+=("${decode_env[@]}")
-  # decode_env carries DeepSeek's two-candidate default.  GLM ordinary TP
-  # requires the full logits sampling contract, so override it after the
-  # generic block has been appended.
+  # The generic block carries DeepSeek's compact logits and compressor
+  # settings. Match the GLM benchmark's full-logits contract and disabled
+  # temporal compressor after those defaults have been appended.
   if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
-    common+=(DS4_TP_GREEDY_TOP2=0)
+    common+=(DS4_TP_GREEDY_TOP2=0 DS4_ROCM_TEMPORAL_COMPRESSOR=0)
   fi
   if [[ $GLM5_FULL_LOGITS == 1 ]]; then
     echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2

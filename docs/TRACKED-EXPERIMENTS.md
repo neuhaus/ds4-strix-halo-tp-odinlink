@@ -111,3 +111,166 @@ Run targeted CPU/protocol checks and
 `scripts/check-research-root-contract.sh` before committing. Keep candidate
 kernels default-off until their applicable gates pass. Keep advisor reviews in
 the promotion dossier; a repair or experiment commit is not a promotion.
+
+The quality launcher's `deepseek-ordinary` teacher arm records complete
+independent-case logits over RoCE v2 with both clean rank terminal proofs,
+matching DeepSeek feature negotiation and hashes of the selected fixture
+contents. `compare-teacher-logits.py --score-arm-mode deepseek-sdk` permits
+different frozen executable identities with otherwise matching experiment
+settings, reopens terminal/dump evidence, and remains threshold-free diagnostic
+output. It cannot grant a Lane B admission. When an unchanged inference binary
+is reused under a newer harness, record its separate source and executable
+pins; retain the stale-build check and original build dossier. See
+`$DS4_RESEARCH_ROOT/candidates/glm53-mtp-20260919/deepseek-teacher-admission-plan.md`.
+
+## Active uncensored-model verifier track
+
+`research/glm53-uncensored-six-kda-20260917` extends current main with
+default-off exact BF16 reuse and accepted-prefix target verification for the
+unchanged uncensored Q4 GGUF. Its dossier is
+`$DS4_RESEARCH_ROOT/candidates/glm53-uncensored-20260915/`. Local echo-peer
+checks do not establish real TP throughput or promotion. Session publication
+requires coordinator agreement on both ranks' verification and commit outcomes.
+
+The explicit native block45 draft step uses its own compact MLA state and a
+bounded eight-expert window of original Q4_K bytes. Its workspace remains bound
+to one state, immutable model and TP link. Native residual/norm semantics adapt
+donors `fa09e19` and `519cf21` from the retained September 14 successor; they do
+not merge that track. The adaptation, primary-source references and test scope
+are recorded in the same dossier under `research/native-draft-step-plan-20260918.md`.
+This step alone does not enable session drafting or establish acceptance/speed.
+
+The default-off `DS4_GLM5_NATIVE_DRAFT=2/4/6/8` session experiment connects native
+drafting, exact target verification and accepted-prefix refresh. Both ranks
+negotiate the width and agree before history publication; failures invalidate
+both states. Socket and controlled-arithmetic tests exercise orchestration,
+including 8K frontiers, but do not establish actual RoCE, 8K model quality,
+representative acceptance or whole-model speed. See the same dossier's
+`research/native-session-plan-91508e1.md` and associated result report. Do not
+enable this experiment for deployment before those checks and advisor review.
+
+Width 6 means six target rows (root plus five proposals), with a distinct
+canonical hello bit41 and exact M6 BF16/Q8 dispatch. It retains the existing
+eight-expert native window and allocates only M2/M4/M6 verifier workspaces.
+Short generation tails select 4/2/1 explicitly. Mixed width encodings and
+workspace/configuration mismatch refuse before drafting; no rounding to M8.
+See `research/native-width6-plan-3fae014.md` in the same dossier for validation.
+
+`DS4_TP_BULK_RECV_READY=1` is a separate default-off transport experiment.
+It negotiates hello bit39 and confirms both mlx5 receive queues before bulk
+sends, retaining the registered slab and RDMA payload path. The small-payload
+RoCE fixture is `tests/test_tp_bulk_small`; model evidence and protocol review
+are still required. See `research/bulk-receive-ready-plan-3bfefc5.md` in the
+same candidate dossier.
+
+`DS4_GLM5_NATIVE_WINDOW_REUSE=1` separately retains matching original Q4_K
+expert entries in the native workspace's existing eight-slot window. Its
+54MiB capacity is unchanged; generic trunk window rebinding is unaffected.
+This remains default-off, with native owner/model/rank binding and terminal
+consumer synchronization required. The rationale and validation scope are in
+`research/native-window-reuse-plan-48bb294.md` in the same dossier.
+
+`DS4_ROCM_GLM5_VERIFY_SHARED_Q8=1` is a default-off exact shared-expert
+batch experiment for resident KDA routed trunk layers in the target verifier.
+It retains scalar mHC prefixes and original Q8_0 bytes, then shares weights
+across M2/4/8 using existing activation scratch. Router agreement, routed Q4_K
+evaluation and TP exchanges remain per token. Unsupported shared-pair modes
+or nonresident layouts refuse. MLA and ordinary decode are unchanged by the
+selector. See `research/shared-q8-integration-plan-d02a636.md` for the bounded
+hypothesis and required real-weight, network and promotion checks.
+
+`DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF=1` separately batches route readbacks,
+agreements and FFN payload exchanges across M2/4/8 in resident KDA routed
+verification. It retains scalar router/expert arithmetic and existing scratch,
+requires shared-Q8 batching and negotiated bit40, and stays default-off.
+Layer agreements carry failure status with bounded I/O; negotiated bulk header
+waits also have deadlines and terminate both channels on failure. The optional
+`DS4_GLM5_NATIVE_PHASE_PROFILE=1` reports completed native-cycle boundaries
+without extra GPU fences. See `research/handoff-plan-927ae0e.md` in the same
+dossier. Echo-peer component fixtures and protocol tests do not establish
+whole-model speed, real RoCE correctness or promotion.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF=1` extends the native shared-Q8/FFN
+schedule to resident MLA trunk layers. It requires the existing handoff and
+shared-Q8 settings, a valid native width, and negotiated bit42. It preserves
+serial causal attention and saves each residual in existing batch scratch
+before the shared projection and one FFN handoff. Prefill, native drafting,
+model bytes and expert-window capacity are unchanged. Selector/configuration
+mismatch refuses. This is default-off Lane A research; the plan and measured
+results belong in `research/mla-ffn-handoff-plan-710f97e.md` in the dossier.
+
+`DS4_ROCM_GLM5_VERIFY_FFN_QUEUE=1` queues the existing resident M1 expert
+kernels and activation copies across verifier rows on stream0, with one
+completion fence before phase1 status agreement. It requires native drafting,
+FFN handoff, and negotiated bit43; malformed or mismatched settings refuse.
+The default-off control completes each row separately. No prefill, model,
+weight allocation or native draft-window change is involved. Fixture-only
+HIP event wrappers measure packed expert device intervals separately from
+complete loop wall time; they are not linked into model executables. The plan
+is `research/ffn-queue-plan-d65372d.md` in the candidate dossier.
+
+`DS4_GLM5_VERIFY_ROUTE_PROFILE=1` records host-only route overlap from the
+existing validated verifier readback, including rejected proposals. It adds
+no GPU transfer, allocation or weight cache. Existing `DS4_GLM5_VERIFY_PROFILE`
+also separates completed FFN handoff sections and shared preparation. These
+are instrumented diagnostic timings, including host/peer waits; existing
+layer-profile fences remain and neither these spans nor nominal byte rates
+are hardware ceilings. Use real two-rank runs for actual route distributions;
+echo-peer fixture activations are not a model-route oracle. See
+`research/verifier-route-profile-plan-11cbed2.md` in the candidate dossier.
+
+`DS4_GLM5_VERIFY_MLA_PROFILE=1` adds completed subphase timings only inside
+target verification's scalar MLA rows. Ordinary decode, drafting and prefill
+pass no profile. It preserves operation order and adds diagnostic fences;
+the index/state bucket deliberately includes interleaved index projections.
+Exchange time includes peer waiting, not pure network latency. It uses no
+persistent storage and does not alter widths or the communication schedule.
+Compare same-build profile-off/on runs and keep instrumented timings separate.
+The plan is `research/mla-subphase-plan-ea6d855.md` in the candidate dossier.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF=1` defers the native verifier's
+attention-output reduction until all causal MLA rows have produced heads.
+It preserves M1 output projections and scalar residuals, retains each row's
+heads and mHC split in existing batch scratch, and exchanges one row block.
+Negotiated bit44 requires native2/4/6, owned32heads and MLA/shared/FFN handoff;
+M8 refuses. A completed phase2 agreement precedes payload, including failure.
+The local `DS4_GLM5_VERIFY_MLA_ROW_SYNC=1` diagnostic retains per-row completion
+fences and requires this handoff. Both selectors default off; prefill and
+drafting retain their original schedule. No model or weight-cache change.
+See `research/mla-attn-handoff-plan-cc04c40.md` in the candidate dossier.
+
+The dedicated `ds4_rocm_glm5_mla_output_q8_small_m` leaf tests exact output
+weight reuse for M2/M4/M6, source K16384, local K8192 and N4096. It reuses
+the existing shared-Q8 kernel with the original full packed row stride and
+float activation rows and adds no weight allocation. Real-weight tests cover all trunk MLA output tensors,
+both rank slices, panel/token isolation, canaries and refused shapes/modes.
+See `research/mla-output-leaf-plan-f9146c7.md`; a component result does not
+establish full-model performance or permission to enable this leaf.
+
+`DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH=1` selects this leaf only within native
+MLA attention handoff. It defaults off, requires the existing negotiated
+handoff, preflights resident weights/modes/buffers before private replay and
+keeps mandatory completion agreement on launch failure. There is no scalar
+retry after failed batch launch. Both effective rank settings must match;
+the wire schedule is unchanged. Session startup checks all eleven resident
+output tensors for each exact workspace; per-layer checks remain and mark
+transport failed if a later admission check fails. Cleanup reports M2/M4/M6
+submissions; clean run completion is checked separately. Fixtures assert
+batch-versus-scalar engagement per arm and exercise startup refusal.
+Prefill, drafting and ordinary scalar tails keep their existing dispatch.
+See `research/mla-output-integration-plan-3fd2018.md` for real-rank fixtures
+and prospective same-binary4K/8K model comparisons before any promotion.
+
+`DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS=0/1/2` is a default-off native6 routed
+expert experiment: incumbent, scalar six-row schedule, or paired six-row
+schedule. Hello bits45/46 distinguish the modes and require native6 and both
+KDA/MLA FFN handoffs. Smaller2/4/1tails keep the incumbent path. It groups at
+most two routes per original packed expert; no weights or window capacity
+change. Admission rejects incompatible selectors, missing residency, invalid
+routes, insufficient or aliased scratch. Completed route readbacks end the
+earlier MLA scratch lifetime before reuse. Down/add still run row by row with
+completion fences when queue0; failure drains before agreement, without retry.
+The same-schedule scalar control isolates weight reuse from batching. Reports
+and the four-arm plan are in `research/expert-gateup-integration-plan-e01a353.md`
+and its implementation addendum in the uncensored dossier. This is Lane A
+research, not a promoted model speed claim.

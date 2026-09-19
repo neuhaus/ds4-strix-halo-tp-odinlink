@@ -247,36 +247,17 @@ __device__ static DS4_ROCM_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }
 
-__device__ static void dev_q4_K_get_scale_min(
-        uint32_t j,
-        const uint8_t *scales,
-        uint8_t *d_out,
-        uint8_t *m_out) {
-    if (j < 4u) {
-        *d_out = scales[j] & 63u;
-        *m_out = scales[j + 4u] & 63u;
-    } else {
-        *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
-        *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
-    }
-}
+#include "ds4_rocm_q4k_dot.cuh"
 
-__device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
-    int32_t sum = 0;
-    #pragma unroll
-    for (uint32_t i = 0; i < 32u; i += 4u) {
-        const int32_t v = (*(const int32_t *)(qs + i) >> shift) & 0x0f0f0f0f;
-        sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
-    }
-    return sum;
-}
-
-__device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const cuda_block_q8_K *y) {
+/* Same integer dot and floating expression, bounded group unrolling for the
+ * packed GLM decode experiment. The incumbent helper stays unchanged. */
+__device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_unroll2(
+        const cuda_block_q4_K *x, const cuda_block_q8_K *y) {
     const float xd = dev_f16_to_f32(x->d);
     const float xmin = dev_f16_to_f32(x->dmin);
     int isum = 0;
     int summs = 0;
-    #pragma unroll
+    #pragma unroll 2
     for (uint32_t j = 0; j < 8u; j++) {
         uint8_t sc, m;
         dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
@@ -285,6 +266,34 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
         const int shift = (j & 1u) ? 4 : 0;
         isum += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
     }
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+/* Four lanes share one original Q4_K block. Only the subgroup leader's
+ * result is consumed. Integer reassociation is exact: even the conservative
+ * eight-group bound is below 2^25, including signed Q8 activations. */
+__device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_lanes4(
+        const cuda_block_q4_K *x, const cuda_block_q8_K *y,
+        uint32_t part) {
+    int isum = 0;
+    int summs = 0;
+    #pragma unroll
+    for (uint32_t g = 0; g < 2u; ++g) {
+        const uint32_t j = 2u * part + g;
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+        summs += (int)m * (int)(y->bsums[2u*j] + y->bsums[2u*j+1u]);
+        isum += (int)sc * dev_dot_q4_32(x->qs + part*32u,
+                                       y->qs + j*32u, g ? 4 : 0);
+    }
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+    #pragma unroll
+    for (int delta = 2; delta > 0; delta >>= 1) {
+        isum += __shfl_down_sync(mask, isum, delta, 4);
+        summs += __shfl_down_sync(mask, summs, delta, 4);
+    }
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
@@ -338,40 +347,6 @@ __device__ static void dev_dot_q4_K_q8_K_block4(
     const float xmin = dev_f16_to_f32(x->dmin);
     int isum[4] = {0, 0, 0, 0};
     int summs[4] = {0, 0, 0, 0};
-    #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
-        uint8_t sc, m;
-        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
-        const uint32_t byte_off = (j >> 1u) * 32u;
-        const int shift = (j & 1u) ? 4 : 0;
-        for (uint32_t p = 0; p < n; p++) {
-            if (!ys[p]) continue;
-            summs[p] += (int)m * (int)(ys[p]->bsums[2u * j] + ys[p]->bsums[2u * j + 1u]);
-            isum[p] += (int)sc * dev_dot_q4_32(x->qs + byte_off, ys[p]->qs + j * 32u, shift);
-        }
-    }
-    for (uint32_t p = 0; p < n; p++) {
-        if (ys[p]) acc[p] += ys[p]->d * xd * (float)isum[p] - ys[p]->d * xmin * (float)summs[p];
-    }
-}
-
-__device__ static void dev_dot_q4_K_q8_K_block8(
-        const cuda_block_q4_K *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        uint32_t n,
-        float acc[8]) {
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    const float xd = dev_f16_to_f32(x->d);
-    const float xmin = dev_f16_to_f32(x->dmin);
-    int isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         uint8_t sc, m;
@@ -1033,6 +1008,77 @@ __global__ static void moe_count_sorted_pairs_kernel(
     if (expert_i < 0) return;
     if ((uint32_t)expert_i >= n_total_expert) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
+}
+
+/* GLM prefill preserves independent M256 occupancy domains. Absolute pair
+ * IDs still address the original activation/output buffers; only routing
+ * metadata has a group dimension. Physical weights remain shared. */
+__global__ static void moe_count_glm5_grouped_pairs_kernel(
+        uint32_t *counts, const int32_t *selected,
+        uint32_t pair_count, uint32_t n_expert) {
+    const uint32_t pair = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pair_count) return;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || expert >= 288) return;
+    const uint32_t group = pair / (256u * n_expert);
+    atomicAdd(counts + group * 288u + (uint32_t)expert, 1u);
+}
+
+__global__ static void moe_scatter_glm5_grouped_pairs_kernel(
+        uint32_t *pairs, const uint32_t *offsets,
+        const int32_t *selected, uint32_t n_expert) {
+    const uint32_t bucket = blockIdx.x;
+    const uint32_t expert = bucket % 288u;
+    const uint32_t first = (bucket / 288u) * 256u * n_expert;
+    uint32_t pos = offsets[bucket];
+    for (uint32_t pair = first; pair < first + 256u * n_expert; ++pair)
+        if (selected[pair] == (int32_t)expert) pairs[pos++] = pair;
+}
+
+__global__ static void moe_glm5_grouped_tile_offsets_kernel(
+        uint32_t *tile_offsets, uint32_t *tile_total,
+        const uint32_t *counts, uint32_t groups) {
+    uint32_t sum = 0u;
+    // Adjacent domains of one physical expert can reuse hardware caches.
+    for (uint32_t expert = 0u; expert < 288u; ++expert) {
+        for (uint32_t group = 0u; group < groups; ++group) {
+            const uint32_t bucket = group * 288u + expert;
+            tile_offsets[bucket] = sum;
+            sum += (counts[bucket] + 15u) / 16u;
+        }
+    }
+    tile_offsets[groups * 288u] = sum;
+    *tile_total = sum;
+}
+
+/* Merge only already-cold gate/up routes across M256 domains. Hot buckets
+ * and all down-projection metadata retain their original row positions.
+ * The launcher binds threshold=6 and groups in [2,4], so capacity<=20. */
+__global__ static void moe_glm5_gather_cold_pairs_kernel(
+        uint32_t *cold_counts, uint32_t *cold_offsets, uint32_t *cold_pairs,
+        const uint32_t *counts, const uint32_t *offsets,
+        const uint32_t *pairs, uint32_t groups) {
+    const uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= 288u) return;
+    const uint32_t capacity = groups * 5u;
+    const uint32_t first = expert * capacity;
+    uint32_t count = 0u;
+    for (uint32_t group = 0u; group < groups; ++group) {
+        const uint32_t bucket = group * 288u + expert;
+        const uint32_t n = counts[bucket];
+        if (n >= 6u) continue;
+        for (uint32_t p = 0u; p < n; ++p)
+            cold_pairs[first + count++] = pairs[offsets[bucket] + p];
+    }
+    cold_counts[expert] = count;
+    cold_offsets[expert] = first;
+    if (expert == 287u) cold_offsets[288u] = 288u * capacity;
+}
+
+template <uint32_t PhysicalExperts>
+__device__ __forceinline__ static uint32_t moe_weight_expert(uint32_t bucket) {
+    if constexpr (PhysicalExperts != 0u) return bucket % PhysicalExperts;
+    else return bucket;
 }
 
 __global__ static void moe_prefix_sorted_pairs_kernel(
@@ -2019,6 +2065,7 @@ __global__ static void moe_down_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+template <uint32_t Rows = 128u, bool BoundedDot = false>
 __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -2036,6 +2083,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         uint32_t skip_zero_weight,
         uint32_t write_aux,
         float clamp) {
+    static_assert(Rows == 32u || Rows == 64u || Rows == 128u,
+                  "decode row geometry must use complete groups of 32 rows");
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t pair = blockIdx.y;
@@ -2044,8 +2093,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     const float route_weight = weights[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0 || (skip_zero_weight && route_weight == 0.0f)) {
-        for (uint32_t rr = 0; rr < 4u; rr++) {
-            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        for (uint32_t rr = 0; rr < Rows / 32u; rr++) {
+            const uint32_t row = blockIdx.x * Rows + row_lane + rr * 32u;
             if (row >= expert_mid_dim || lane != 0u) continue;
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             if (write_aux) {
@@ -2058,16 +2107,21 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     }
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+    for (uint32_t rr = 0; rr < Rows / 32u; rr++) {
+        uint32_t row = blockIdx.x * Rows + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
         const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
-            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            if constexpr (BoundedDot) {
+                gate += dev_dot_q4_K_q8_K_block_unroll2(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block_unroll2(ur + b, xqb + b);
+            } else {
+                gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+                up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+            }
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -2082,6 +2136,66 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
+        }
+    }
+}
+
+/* One wave per row, eight cooperative four-lane block dots. The leader of
+ * each subgroup owns the same b, b+8 sequence as an incumbent quarter-wave
+ * lane; offsets 16/8/4 reproduce its eight-way FP32 sum tree exactly. */
+__global__ static void moe_gate_up_mid_decode_q4K_lanes4_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const char *gate_base, const char *up_base,
+        const cuda_block_q8_K *xq, const int32_t *selected,
+        const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert,
+        uint32_t skip_zero_weight, uint32_t write_aux, float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t part = lane & 3u;
+    const uint32_t block_lane = lane >> 2u;
+    const uint32_t row_lane = threadIdx.x >> 5u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    const float route_weight = weights[(uint64_t)tok * n_expert + slot];
+    const bool skip = expert_i < 0 || (skip_zero_weight && route_weight == 0.0f);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = blockIdx.x * 32u + row_lane + rr * 8u;
+        if (row >= expert_mid_dim) continue;
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (skip) {
+            if (lane == 0u) {
+                if (write_aux) { gate_out[off] = 0.0f; up_out[off] = 0.0f; }
+                mid_out[off] = 0.0f;
+            }
+            continue;
+        }
+        const uint64_t byte_off = (uint64_t)(uint32_t)expert_i * gate_expert_bytes +
+                                  (uint64_t)row * gate_row_bytes;
+        const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + byte_off);
+        const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + byte_off);
+        float gate = 0.0f, up = 0.0f;
+        for (uint32_t b = block_lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_q4_K_q8_K_block_lanes4(gr+b, xqb+b, part);
+            up += dev_dot_q4_K_q8_K_block_lanes4(ur+b, xqb+b, part);
+        }
+        const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+        #pragma unroll
+        for (int delta = 16; delta >= 4; delta >>= 1) {
+            gate += __shfl_down_sync(mask, gate, delta, 32);
+            up += __shfl_down_sync(mask, up, delta, 32);
+        }
+        if (lane == 0u) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            if (write_aux) { gate_out[off] = gate; up_out[off] = up; }
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
         }
     }
@@ -4699,7 +4813,7 @@ ds4_q4k_unpack_scales(const int32_t *scales, int32_t ksc) {
  * because production launches by scratch capacity rather than copying the
  * tile count back to the host.
  */
-template <int J>
+template <int J, uint32_t PhysicalExperts = 0u>
 __launch_bounds__(256)
 __global__ static void moe_q4K_routed_wmma_kernel(
         const char *weight_base,
@@ -4745,7 +4859,7 @@ __global__ static void moe_q4K_routed_wmma_kernel(
     float acc[J / 16][8] = {};
 
     const char *expert_weight_base =
-        weight_base + (uint64_t)expert * weight_expert_bytes;
+        weight_base + (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * weight_expert_bytes;
 
     for (uint32_t kb = 0; kb < xq_blocks; kb++) {
         /*
@@ -5462,7 +5576,7 @@ __global__ static void moe_gate_up_mid_iq2_i8_hotlist_wmma_kernel(
 
 /* Q4_K down projection over the same 16-pair routing descriptors as gate/up.
  * Activations are pair-major, unlike moe_q4K_routed_wmma_kernel above. */
-template <int J, bool ATOMIC_OUT>
+template <int J, bool ATOMIC_OUT, uint32_t PhysicalExperts = 0u>
 __launch_bounds__(256)
 __global__ static void moe_down_q4K_routed_wmma_kernel(
         float *out, const char *weight_base,
@@ -5485,7 +5599,8 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
     if (count < min_count) return;
     const uint32_t row0 = (uint32_t)blockIdx.x * I;
     float acc[J / 16][8] = {};
-    const char *expert_base = weight_base + (uint64_t)expert * weight_expert_bytes;
+    const char *expert_base = weight_base +
+        (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * weight_expert_bytes;
     for (uint32_t kb = 0; kb < xq_blocks; kb++) {
         if (wave < 8) {
             const int r = wave * 8 + lane / 4, tx = (lane % 4) * 8;
@@ -5578,6 +5693,7 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
 
 /* Cold-expert complement for the 16-wide stream; each tile is consumed as
  * two eight-pair DP4A halves. */
+template <uint32_t PhysicalExperts = 0u>
 __global__ static void moe_down_q4K_cold_tile16_kernel(
         float *out, const char *base, const cuda_block_q8_K *midq,
         const uint32_t *pairs, const uint32_t *offs, const uint32_t *counts,
@@ -5611,7 +5727,7 @@ __global__ static void moe_down_q4K_cold_tile16_kernel(
         for (uint32_t p = 0; p < np; p++) x[p] = sq[p];
         if (row < nrows) {
             const cuda_block_q4_K *wr = reinterpret_cast<const cuda_block_q4_K *>(
-                    base + (uint64_t)expert * expert_bytes + (uint64_t)row * row_bytes);
+                    base + (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * expert_bytes + (uint64_t)row * row_bytes);
             float acc[8] = {};
             for (uint32_t b = lane; b < xb; b += 8u)
                 dev_dot_q4_K_q8_K_block8(wr + b, x[0] ? x[0] + b : NULL,
@@ -5631,9 +5747,75 @@ __global__ static void moe_down_q4K_cold_tile16_kernel(
     }
 }
 
+/* Same Q4_K block arithmetic as block8, with only the five possible cold
+ * pointers live. Caller supplies valid staged rows and bounds n to five. */
+__device__ static void dev_dot_q4_K_q8_K_cold_block5(
+        const cuda_block_q4_K *x,
+        const cuda_block_q8_K *const ys[5],
+        uint32_t b, uint32_t n, float acc[5]) {
+    const float xd = dev_f16_to_f32(x->d);
+    const float xmin = dev_f16_to_f32(x->dmin);
+    int isum[5] = {};
+    int summs[5] = {};
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        uint8_t sc, m;
+        dev_q4_K_get_scale_min(j, x->scales, &sc, &m);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        for (uint32_t p = 0; p < n; p++) {
+            const cuda_block_q8_K *y = ys[p] + b;
+            summs[p] += (int)m * (int)(y->bsums[2u * j] + y->bsums[2u * j + 1u]);
+            isum[p] += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) {
+        const cuda_block_q8_K *y = ys[p] + b;
+        acc[p] += y->d * xd * (float)isum[p] - y->d * xmin * (float)summs[p];
+    }
+}
+
+#include "ds4_rocm_glm5_q4k_integer.cuh"
+
+// Only already-cold routes collected across unchanged M256 domains enter
+// this experimental path. Hot arithmetic and every down route stay intact.
+// The third grid dimension selects gate/up, sharing one launch while keeping
+// original independent weight pointers. The only tile scratch is 8 KiB LDS.
+__global__ static void moe_gate_up_q4K_cold_integer16_kernel(
+        float *gate_out, float *up_out, const char *gate_base,
+        const char *up_base, const cuda_block_q8_K *xq,
+        const uint32_t *pairs, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *tile_total, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, uint64_t expert_bytes, uint64_t row_bytes,
+        uint32_t blocks, uint32_t nrows, uint32_t n_expert) {
+    const uint32_t tile=blockIdx.y;
+    if (tile>=*tile_total) return;
+    const uint32_t expert=tile_experts[tile], start=tile_starts[tile];
+    const uint32_t count=counts[expert];
+    if (start>=count) return;
+    const uint32_t np=min(16u,count-start), col=threadIdx.x%16;
+    const uint32_t pair=pairs[offsets[expert]+start+(col<np ? col : 0u)];
+    const uint32_t tok=pair/n_expert;
+    const uint32_t first_row=blockIdx.x*16;
+    const char *base=blockIdx.z ? up_base : gate_base;
+    const auto *w=reinterpret_cast<const cuda_block_q4_K *>(
+        base+uint64_t(expert)*expert_bytes+uint64_t(first_row)*row_bytes);
+    __shared__ float partial[8][256];
+    float sum[8]={};
+    glm5_q4k_i8_partials<true>(w,xq+uint64_t(tok)*blocks,blocks,sum);
+    const float value=glm5_q4k_i8_reduce(partial,sum);
+    const uint32_t at=threadIdx.x;
+    if (at%16<np) {
+        const uint32_t out_pair=pairs[offsets[expert]+start+at%16];
+        float *out=blockIdx.z ? up_out : gate_out;
+        out[uint64_t(out_pair)*nrows+first_row+at/16]=value;
+    }
+}
+
 /* Complementary half of the Stage-3 crossover.  The routing stream is built
  * in 16-pair tiles for WMMA; cold experts consume each tile as two instances
  * of the shipping eight-pair DP4A computation. */
+template <uint32_t StagedRows = 8u, uint32_t PhysicalExperts = 0u>
 __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         float *gate_out,
         float *up_out,
@@ -5663,14 +5845,19 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
     const uint32_t row = (uint32_t)blockIdx.x * 32u +
                          ((uint32_t)threadIdx.x >> 3u);
     const uint32_t tile_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    static_assert(StagedRows == 8u || StagedRows == 5u,
+                  "cold staging supports the incumbent or bounded GLM tile");
+    // The five-row launcher requires wmma_min_count <= 6. The cold count
+    // guard above therefore bounds every staged row to [0, 5), while all
+    // used addresses and each output's block/reduction order stay intact.
+    __shared__ cuda_block_q8_K sxq[StagedRows][16];
 
-    for (uint32_t half = 0; half < 2u; half++) {
-        uint32_t pair[8] = {};
-        const cuda_block_q8_K *xqb[8] = {};
+    for (uint32_t half = 0; half < (StagedRows == 5u ? 1u : 2u); half++) {
+        uint32_t pair[StagedRows] = {};
+        const cuda_block_q8_K *xqb[StagedRows] = {};
         uint32_t np = 0;
         const uint32_t local_start = tile_start + half * 8u;
-        for (; np < 8u; np++) {
+        for (; np < StagedRows; np++) {
             const uint32_t local_pair = local_start + np;
             if (local_pair >= count) break;
             pair[np] = sorted_pairs[offsets[expert] + local_pair];
@@ -5692,33 +5879,38 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
         if (row < nrows) {
             const cuda_block_q4_K *gr =
                 (const cuda_block_q4_K *)(gate_base +
-                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * gate_expert_bytes +
                     (uint64_t)row * gate_row_bytes);
             const cuda_block_q4_K *ur =
                 (const cuda_block_q4_K *)(up_base +
-                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * gate_expert_bytes +
                     (uint64_t)row * gate_row_bytes);
-            float gate[8] = {};
-            float up[8] = {};
+            float gate[StagedRows] = {};
+            float up[StagedRows] = {};
             for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-                dev_dot_q4_K_q8_K_block8(
-                    gr + b, xqb[0] ? xqb[0] + b : NULL,
-                    xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL,
-                    xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL,
-                    xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL,
-                    xqb[7] ? xqb[7] + b : NULL, np, gate);
-                dev_dot_q4_K_q8_K_block8(
-                    ur + b, xqb[0] ? xqb[0] + b : NULL,
-                    xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL,
-                    xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL,
-                    xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL,
-                    xqb[7] ? xqb[7] + b : NULL, np, up);
+                if constexpr (StagedRows == 5u) {
+                    dev_dot_q4_K_q8_K_cold_block5(gr + b, xqb, b, np, gate);
+                    dev_dot_q4_K_q8_K_cold_block5(ur + b, xqb, b, np, up);
+                } else {
+                    dev_dot_q4_K_q8_K_block8(
+                        gr + b, xqb[0] ? xqb[0] + b : NULL,
+                        xqb[1] ? xqb[1] + b : NULL,
+                        xqb[2] ? xqb[2] + b : NULL,
+                        xqb[3] ? xqb[3] + b : NULL,
+                        xqb[4] ? xqb[4] + b : NULL,
+                        xqb[5] ? xqb[5] + b : NULL,
+                        xqb[6] ? xqb[6] + b : NULL,
+                        xqb[7] ? xqb[7] + b : NULL, np, gate);
+                    dev_dot_q4_K_q8_K_block8(
+                        ur + b, xqb[0] ? xqb[0] + b : NULL,
+                        xqb[1] ? xqb[1] + b : NULL,
+                        xqb[2] ? xqb[2] + b : NULL,
+                        xqb[3] ? xqb[3] + b : NULL,
+                        xqb[4] ? xqb[4] + b : NULL,
+                        xqb[5] ? xqb[5] + b : NULL,
+                        xqb[6] ? xqb[6] + b : NULL,
+                        xqb[7] ? xqb[7] + b : NULL, np, up);
+                }
             }
             for (uint32_t p = 0; p < np; p++) {
                 gate[p] = quarter_warp_sum_f32(gate[p], lane);

@@ -55,13 +55,13 @@ static int rocm_ranges_overlap(const ds4_gpu_tensor *a,
     return a0 < b0 + b->bytes && b0 < a0 + a->bytes;
 }
 
-extern "C" int ds4_gpu_glm5_causal_conv4_tensor(
+static int rocm_glm5_causal_conv4_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *history,
         const ds4_gpu_tensor *input,
         const ds4_gpu_tensor *weight,
         uint32_t n_tokens,
-        uint32_t channels) {
+        uint32_t channels, bool write_history) {
     if (!out || !history || !input || !weight || !out->ptr ||
         !history->ptr || !input->ptr || !weight->ptr || n_tokens == 0u ||
         (channels != 8192u && channels != 4096u)) {
@@ -86,13 +86,23 @@ extern "C" int ds4_gpu_glm5_causal_conv4_tensor(
         return 0;
     }
     constexpr uint32_t threads = 256u;
-    hipLaunchKernelGGL(ds4_glm5_causal_conv4_kernel,
-                       dim3((channels + threads - 1u) / threads),
-                       dim3(threads), 0, 0,
-                       (float *)out->ptr, (float *)history->ptr,
-                       (const float *)input->ptr,
-                       (const float *)weight->ptr, n_tokens, channels);
+#define DS4_CONV_LAUNCH(W) \
+    hipLaunchKernelGGL(ds4_glm5_causal_conv4_kernel<W>, \
+        dim3((channels + threads - 1u) / threads), dim3(threads), 0, 0, \
+        (float *)out->ptr, (float *)history->ptr, (const float *)input->ptr, \
+        (const float *)weight->ptr, n_tokens, channels)
+    if (write_history) DS4_CONV_LAUNCH(true);
+    else DS4_CONV_LAUNCH(false);
+#undef DS4_CONV_LAUNCH
     return hipGetLastError() == hipSuccess;
+}
+
+extern "C" int ds4_gpu_glm5_causal_conv4_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *history,
+        const ds4_gpu_tensor *input, const ds4_gpu_tensor *weight,
+        uint32_t n_tokens, uint32_t channels) {
+    return rocm_glm5_causal_conv4_tensor(out, history, input, weight,
+                                        n_tokens, channels, true);
 }
 
 static int rocm_glm5_wave32_available(void) {
@@ -113,7 +123,7 @@ static int rocm_glm5_wave32_available(void) {
 #endif
 }
 
-extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
+static int rocm_glm5_kda_recurrent_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *state,
         const ds4_gpu_tensor *q,
@@ -123,7 +133,7 @@ extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
         const ds4_gpu_tensor *beta,
         uint32_t n_tokens,
         uint32_t n_heads,
-        uint32_t head_dim) {
+        uint32_t head_dim, bool write_state) {
 #if !defined(DS4_GFX1151_WAVE32) || !DS4_GFX1151_WAVE32
     (void)out;
     (void)state;
@@ -135,6 +145,7 @@ extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
     (void)n_tokens;
     (void)n_heads;
     (void)head_dim;
+    (void)write_state;
     return 0;
 #else
     constexpr uint32_t expected_dim = 128u;
@@ -168,15 +179,27 @@ extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
         rocm_ranges_overlap(state, beta)) {
         return 0;
     }
-    hipLaunchKernelGGL(ds4_glm5_kda_wave32_kernel,
-                       dim3(1u, n_heads, head_dim / 4u),
-                       dim3(32u, 4u), 0, 0,
-                       (float *)out->ptr, (float *)state->ptr,
-                       (const float *)q->ptr, (const float *)k->ptr,
-                       (const float *)v->ptr, (const float *)gate->ptr,
-                       (const float *)beta->ptr, n_tokens, n_heads);
+#define DS4_RECURRENCE_LAUNCH(W) \
+    hipLaunchKernelGGL((ds4_glm5_kda_wave32_kernel<W, true>), \
+        dim3(1u, n_heads, head_dim / 4u), dim3(32u, 4u), 0, 0, \
+        (float *)out->ptr, (float *)state->ptr, (const float *)q->ptr, \
+        (const float *)k->ptr, (const float *)v->ptr, (const float *)gate->ptr, \
+        (const float *)beta->ptr, n_tokens, n_heads)
+    if (write_state) DS4_RECURRENCE_LAUNCH(true);
+    else DS4_RECURRENCE_LAUNCH(false);
+#undef DS4_RECURRENCE_LAUNCH
     return hipGetLastError() == hipSuccess;
 #endif
+}
+
+extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *beta, uint32_t n_tokens,
+        uint32_t n_heads, uint32_t head_dim) {
+    return rocm_glm5_kda_recurrent_tensor(out, state, q, k, v, gate, beta,
+                                         n_tokens, n_heads, head_dim, true);
 }
 
 static int rocm_glm5_model_view_init(
@@ -190,6 +213,109 @@ static int rocm_glm5_model_view_init(
     return ds4_rocm_model_range_view_tensor(
         view, args->model_map, args->model_size,
         offset, bytes, label);
+}
+
+static int rocm_glm5_replay_views(ds4_glm5_kda_layer_state *full,
+                                 uint32_t rank, ds4_gpu_tensor views[4],
+                                 ds4_glm5_kda_layer_state *local) {
+    if (!full || !local || rank > 1u || !rocm_glm5_wave32_available()) return 0;
+    ds4_gpu_tensor *sources[] = {full->q_history, full->k_history,
+                                full->v_history, full->recurrent};
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint64_t half = i == 3 ? 32u*128u*128u*4u : 4096u*3u*4u;
+        const auto *s = sources[i];
+        if (!s || !s->ptr || s->bytes != 2u*half ||
+            s->bytes > UINTPTR_MAX - (uintptr_t)s->ptr ||
+            (i && s->device_id != sources[0]->device_id)) return 0;
+        for (unsigned j = 0; j < i; ++j)
+            if (rocm_ranges_overlap(s, sources[j])) return 0;
+        views[i] = *s;
+        views[i].ptr = (char *)s->ptr + rank*half;
+        views[i].bytes = half;
+        if (s->host_ptr) views[i].host_ptr = (char *)s->host_ptr + rank*half;
+    }
+    *local = *full;
+    local->q_history = &views[0]; local->k_history = &views[1];
+    local->v_history = &views[2]; local->recurrent = &views[3];
+    // The journal belongs to the persistent full state, never this stack view.
+    local->replay = nullptr;
+    return 1;
+}
+
+static int rocm_glm5_replay_buffers_valid(
+        const ds4_glm5_kda_layer_state *full,
+        const ds4_glm5_kda_replay_buffers *b, uint32_t tokens) {
+    if (!full || !b || !tokens || tokens > 8u) return 0;
+    const ds4_gpu_tensor *journal[] = {b->raw_q,b->raw_k,b->raw_v,b->k,b->v,b->gate,b->beta};
+    const ds4_gpu_tensor *state[] = {full->q_history,full->k_history,full->v_history,full->recurrent};
+    for (unsigned i = 0; i < 7; ++i) {
+        const auto *t = journal[i];
+        const uint64_t bytes = (uint64_t)tokens * (i == 6 ? 32u : 4096u) * 4u;
+        if (!t || !t->ptr || t->bytes < bytes ||
+            t->device_id != state[0]->device_id) return 0;
+        for (const auto *s : state) if (rocm_ranges_overlap(t,s)) return 0;
+        for (unsigned j = 0; j < i; ++j)
+            if (rocm_ranges_overlap(t,journal[j])) return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_rocm_glm5_kda_verify_begin(
+        const ds4_glm5_kda_device_args *args) {
+    if (!args || !args->workspace || !args->replay || args->n_heads != 32u ||
+        (args->head_start != 0u && args->head_start != 32u)) return 0;
+    ds4_gpu_tensor views[4] = {};
+    ds4_glm5_kda_layer_state local = {};
+    if (!rocm_glm5_replay_views(args->state,args->head_start/32u,views,&local) ||
+        !rocm_glm5_replay_buffers_valid(args->state,args->replay,args->n_tokens))
+        return 0;
+    const auto *w = args->workspace;
+    const ds4_gpu_tensor *writes[] = {w->norm,w->q,w->k,w->v,w->f_low,w->g_low,
+        w->forget,w->beta,w->recurrent_out,w->qkv_activation_panel,args->gated_output};
+    const ds4_gpu_tensor *live[] = {args->state->q_history,args->state->k_history,
+        args->state->v_history,args->state->recurrent};
+    const auto *b = args->replay;
+    const ds4_gpu_tensor *journal[] = {b->raw_q,b->raw_k,b->raw_v,b->k,b->v,b->gate,b->beta};
+    for (const auto *dst : writes) if (dst) {
+        for (const auto *s : live) if (rocm_ranges_overlap(dst,s)) return 0;
+        for (const auto *j : journal) if (rocm_ranges_overlap(dst,j)) return 0;
+    }
+    ds4_glm5_kda_device_args sliced = *args;
+    sliced.state = &local;
+    const int ok = ds4_rocm_glm5_kda_layer_begin(&sliced);
+    // Seal the journal and surface asynchronous failure before it can commit.
+    const int synced = hipStreamSynchronize(0) == hipSuccess;
+    return ok && synced;
+}
+
+extern "C" int ds4_rocm_glm5_kda_replay_commit(
+        ds4_glm5_kda_layer_state *state,
+        const ds4_glm5_kda_replay_buffers *b,
+        uint32_t accepted, uint32_t rank) {
+#if !defined(DS4_GFX1151_WAVE32) || !DS4_GFX1151_WAVE32
+    (void)state; (void)b; (void)accepted; (void)rank;
+    return 0;
+#else
+    ds4_gpu_tensor views[4] = {};
+    ds4_glm5_kda_layer_state local = {};
+    if (!rocm_glm5_replay_views(state,rank,views,&local) ||
+        !rocm_glm5_replay_buffers_valid(state,b,accepted)) return 0;
+    hipLaunchKernelGGL((ds4_glm5_kda_wave32_kernel<true,false>),
+        dim3(1,32,32), dim3(32,4), 0, 0, nullptr,
+        (float *)local.recurrent->ptr, nullptr,
+        (const float *)b->k->ptr, (const float *)b->v->ptr,
+        (const float *)b->gate->ptr, (const float *)b->beta->ptr, accepted,32u);
+    int ok = hipGetLastError() == hipSuccess;
+    const ds4_gpu_tensor *raw[] = {b->raw_q,b->raw_k,b->raw_v};
+    for (unsigned i = 0; ok && i < 3; ++i) {
+        hipLaunchKernelGGL(ds4_glm5_conv_history_commit_kernel,
+            dim3(16),dim3(256),0,0,(float *)views[i].ptr,
+            (const float *)raw[i]->ptr,accepted,4096u);
+        ok = hipGetLastError() == hipSuccess;
+    }
+    const int synced = hipStreamSynchronize(0) == hipSuccess;
+    return ok && synced;
+#endif
 }
 
 static int rocm_glm5_workspace_fits(
@@ -322,6 +448,13 @@ static int rocm_glm5_kda_matmul_typed(
         strcmp(wmma_hilo_value, "1") == 0;
     static const int wmma_hilo_valid = wmma_hilo_value == NULL ||
         strcmp(wmma_hilo_value, "0") == 0 || wmma_hilo_enabled;
+    static const char *native_output_only_value =
+        getenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE_OUTPUT_ONLY");
+    static const int native_output_only = native_output_only_value != NULL &&
+        strcmp(native_output_only_value, "1") == 0;
+    static const int native_output_only_valid =
+        native_output_only_value == NULL ||
+        strcmp(native_output_only_value, "0") == 0 || native_output_only;
     if (!wmma_hilo_valid) {
         static int invalid_reported;
         if (!invalid_reported) {
@@ -331,7 +464,27 @@ static int rocm_glm5_kda_matmul_typed(
         }
         return 0;
     }
+    if (!native_output_only_valid) {
+        static int invalid_native_output_only_reported;
+        if (!invalid_native_output_only_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 native-BF16 output-only selector\n");
+            invalid_native_output_only_reported = 1;
+        }
+        return 0;
+    }
     if (wmma_hilo_enabled) {
+        /* Native activation rounding is deliberately isolated from the KDA
+         * inputs when requested.  Those projections feed the recurrent state
+         * and a BF16-only pass can change the route by layer 3.  The output
+         * projection has no recurrent consumer, so it remains a useful,
+         * shape-checked prefill experiment without changing model bytes. */
+        if (native_output_only &&
+            base_offset != args->weights->output) {
+            return ds4_gpu_matmul_bf16_tensor(
+                out, args->model_map, args->model_size, offset,
+                in_dim, out_dim, input, args->n_tokens);
+        }
         rocm_glm5_bf16_wmma_hilo_register_report();
         const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_tensor(
             out, args->model_map, args->model_size, offset,
@@ -372,8 +525,11 @@ static int rocm_glm5_kda_six_multiptr(
         const ds4_glm5_kda_device_args *args,
         uint32_t head_start, uint32_t n_heads,
         const ds4_gpu_tensor *input) {
-    const char *decode_selector =
-        getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
+    const char *decode_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_DECODE_MULTIPTR");
+    /* Legacy alias keeps old, immutable diagnostic manifests replayable. */
+    if (!decode_selector)
+        decode_selector = getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_MULTIPTR");
     const char *prefill_selector =
         getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     const int prefill = args && args->n_tokens != 1u;
@@ -691,6 +847,12 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
         return 0;
     }
 
+    const ds4_glm5_kda_replay_buffers *journal = args->replay;
+    if (journal &&
+        (!ds4_gpu_tensor_copy(journal->raw_q, 0, w->q, 0, kda_values * 4u) ||
+         !ds4_gpu_tensor_copy(journal->raw_k, 0, w->k, 0, kda_values * 4u) ||
+         !ds4_gpu_tensor_copy(journal->raw_v, 0, w->v, 0, kda_values * 4u)))
+        return 0;
     const uint64_t conv_offset =
         (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM * 4u * sizeof(float);
     const uint64_t conv_bytes =
@@ -698,21 +860,21 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
     ds4_gpu_tensor q_conv = {}, k_conv = {}, v_conv = {};
     if (!rocm_glm5_model_view_init(&q_conv, args, weights->q_conv + conv_offset,
                                    conv_bytes, "glm5_kda_q_conv") ||
-        !ds4_gpu_glm5_causal_conv4_tensor(
+        !rocm_glm5_causal_conv4_tensor(
             w->q, state->q_history, w->q, &q_conv,
-            tokens, channels) ||
+            tokens, channels, journal == nullptr) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_CONV)) return 0;
     if (!rocm_glm5_model_view_init(&k_conv, args, weights->k_conv + conv_offset,
                                    conv_bytes, "glm5_kda_k_conv") ||
-        !ds4_gpu_glm5_causal_conv4_tensor(
+        !rocm_glm5_causal_conv4_tensor(
             w->k, state->k_history, w->k, &k_conv,
-            tokens, channels) ||
+            tokens, channels, journal == nullptr) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_CONV)) return 0;
     if (!rocm_glm5_model_view_init(&v_conv, args, weights->v_conv + conv_offset,
                                    conv_bytes, "glm5_kda_v_conv") ||
-        !ds4_gpu_glm5_causal_conv4_tensor(
+        !rocm_glm5_causal_conv4_tensor(
             w->v, state->v_history, w->v, &v_conv,
-            tokens, channels) ||
+            tokens, channels, journal == nullptr) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_CONV)) return 0;
 
     ds4_glm5_kda_qk_norm_kernel<<<tokens * heads, 128u>>>(
@@ -755,10 +917,16 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
     if (hipGetLastError() != hipSuccess ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_GATE_PREP)) return 0;
 
-    if (!ds4_gpu_glm5_kda_recurrent_tensor(
+    if (journal &&
+        (!ds4_gpu_tensor_copy(journal->k, 0, w->k, 0, kda_values * 4u) ||
+         !ds4_gpu_tensor_copy(journal->v, 0, w->v, 0, kda_values * 4u) ||
+         !ds4_gpu_tensor_copy(journal->gate, 0, w->forget, 0, kda_values * 4u) ||
+         !ds4_gpu_tensor_copy(journal->beta, 0, w->beta, 0, beta_values * 4u)))
+        return 0;
+    if (!rocm_glm5_kda_recurrent_tensor(
             args->gated_output, state->recurrent,
             w->q, w->k, w->v, w->forget, w->beta,
-            tokens, heads, DS4_GLM5_KDA_HEAD_DIM) ||
+            tokens, heads, DS4_GLM5_KDA_HEAD_DIM, journal == nullptr) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_RECURRENCE)) return 0;
 
     if ((six_fused <= 0 && !rocm_glm5_kda_matmul_typed(
@@ -787,7 +955,7 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
      * following TP exchange provides ordering for its host-visible payload;
      * this opt-in probe measures whether the per-layer fence is redundant. */
     const char *async_begin = getenv("DS4_ROCM_GLM5_KDA_ASYNC_BEGIN");
-    if (async_begin && async_begin[0] == '1' && async_begin[1] == '\0')
+    if (journal || (async_begin && async_begin[0] == '1' && async_begin[1] == '\0'))
         return hipGetLastError() == hipSuccess;
     return hipStreamSynchronize(0) == hipSuccess;
 #endif

@@ -4,6 +4,7 @@
  * [token, channel], weights are [channel, tap], and history is
  * [channel, tap-1] oldest-first. Each channel is owned by one thread so a
  * continuation call observes exactly the state committed by the prior call. */
+template <bool WriteHistory = true>
 __global__ static void ds4_glm5_causal_conv4_kernel(
         float *output,
         float *history,
@@ -27,9 +28,27 @@ __global__ static void ds4_glm5_causal_conv4_kernel(
         h1 = h2;
         h2 = current;
     }
-    history[(uint64_t)channel * 3u] = h0;
-    history[(uint64_t)channel * 3u + 1u] = h1;
-    history[(uint64_t)channel * 3u + 2u] = h2;
+    if (WriteHistory) {
+        history[(uint64_t)channel * 3u] = h0;
+        history[(uint64_t)channel * 3u + 1u] = h1;
+        history[(uint64_t)channel * 3u + 2u] = h2;
+    }
+}
+
+/* Commit raw pre-convolution rows without reading any model weights. */
+__global__ static void ds4_glm5_conv_history_commit_kernel(
+        float *history, const float *raw, uint32_t tokens, uint32_t channels) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float h0 = history[(uint64_t)c * 3u];
+    float h1 = history[(uint64_t)c * 3u + 1u];
+    float h2 = history[(uint64_t)c * 3u + 2u];
+    for (uint32_t t = 0; t < tokens; ++t) {
+        h0 = h1; h1 = h2; h2 = raw[(uint64_t)t * channels + c];
+    }
+    history[(uint64_t)c * 3u] = h0;
+    history[(uint64_t)c * 3u + 1u] = h1;
+    history[(uint64_t)c * 3u + 2u] = h2;
 }
 
 __device__ static inline float ds4_glm5_wave_sum32(float value) {
@@ -42,6 +61,7 @@ __device__ static inline float ds4_glm5_wave_sum32(float value) {
 /* Fixed GLM-5 KDA recurrence. Four gfx1151 wave32 wavefronts cover four
  * value columns; grid.z covers all 128 columns. Each lane retains four key
  * rows in registers across the token loop. */
+template <bool WriteState = true, bool EmitOutput = true>
 __global__ static void ds4_glm5_kda_wave32_kernel(
         float *output,
         float *state,
@@ -88,17 +108,21 @@ __global__ static void ds4_glm5_kda_wave32_kernel(
         s1 += k[base + lane + 32u] * correction;
         s2 += k[base + lane + 64u] * correction;
         s3 += k[base + lane + 96u] * correction;
-        float emitted = s0 * q[base + lane] +
-                        s1 * q[base + lane + 32u] +
-                        s2 * q[base + lane + 64u] +
-                        s3 * q[base + lane + 96u];
-        emitted = ds4_glm5_wave_sum32(emitted);
-        if (lane == 0u) output[base + value_channel] = emitted;
+        if (EmitOutput) {
+            float emitted = s0 * q[base + lane] +
+                            s1 * q[base + lane + 32u] +
+                            s2 * q[base + lane + 64u] +
+                            s3 * q[base + lane + 96u];
+            emitted = ds4_glm5_wave_sum32(emitted);
+            if (lane == 0u) output[base + value_channel] = emitted;
+        }
     }
-    state[state_base + (uint64_t)lane * channels] = s0;
-    state[state_base + (uint64_t)(lane + 32u) * channels] = s1;
-    state[state_base + (uint64_t)(lane + 64u) * channels] = s2;
-    state[state_base + (uint64_t)(lane + 96u) * channels] = s3;
+    if (WriteState) {
+        state[state_base + (uint64_t)lane * channels] = s0;
+        state[state_base + (uint64_t)(lane + 32u) * channels] = s1;
+        state[state_base + (uint64_t)(lane + 64u) * channels] = s2;
+        state[state_base + (uint64_t)(lane + 96u) * channels] = s3;
+    }
 }
 #endif
 

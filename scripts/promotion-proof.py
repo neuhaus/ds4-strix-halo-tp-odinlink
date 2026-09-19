@@ -51,6 +51,18 @@ PAIR_ALLOWED_BUILD_FIELDS = {
     "source_commit", "ds4_sha256", "peer_ds4_sha256",
     "ds4_bench_tp_sha256",
 }
+# SDK comparisons are diagnostic until the migration lifecycle, actual loaded
+# runtime and per-model numerical/quality admission are connected to the gate.
+# An explicit arm identity is narrower than arbitrary manifest allowances.
+SDK_IDENTITY_FIELDS = {
+    "toolchain_id", "binary_toolchain_sha256", "binary_toolchain_comment",
+    "binary_runpath", "expected_binary_toolchain_sha256",
+}
+SDK_ARM_FIELDS = SDK_IDENTITY_FIELDS | PAIR_ALLOWED_BUILD_FIELDS
+SDK_CELLS = {"headline", "diverse", "long-context", "glm-53-q2",
+             "deepseek-0731-q4", "deepseek-0731-q2"}
+SDK_LIBRARY_PREFIXES = ("libamdhip64.", "libhsa-runtime64.", "libhipblas.",
+                        "libhipblaslt.", "librocblas.")
 SWITCH_MANIFEST_FIELDS = {
     "glm5_bf16_wmma_hilo": "DS4_ROCM_GLM5_BF16_WMMA_HILO",
     "glm5_bf16_wmma_qkv_fused": "DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED",
@@ -104,11 +116,145 @@ def validate_switches(value: object) -> dict[str, dict[str, str]]:
     return result
 
 
-def validate_performance_policy(value: object) -> dict:
+def validate_sdk_contrast(value: object) -> dict:
     if (not isinstance(value, dict) or
-            set(value) != {"contract", "target_metrics", "candidate_switches",
-                           "public_claim"}):
+            set(value) != {"kind", "control", "candidate", "cell_switches", "runtimes"} or
+            value.get("kind") != "sdk-contrast-v1"):
+        raise ProofError("SDK contrast has invalid fields")
+    for arm in ("control", "candidate"):
+        identity = value[arm]
+        if (not isinstance(identity, dict) or set(identity) != SDK_ARM_FIELDS or
+                any(not isinstance(item, str) or not item or "\n" in item
+                    for item in identity.values())):
+            raise ProofError(f"SDK {arm} identity is incomplete")
+        for field in SDK_ARM_FIELDS:
+            if field.endswith("sha256") and not re.fullmatch(
+                    r"[0-9a-f]{64}", identity[field]):
+                raise ProofError(f"SDK {arm} has invalid {field}")
+        if (not re.fullmatch(r"[0-9a-f]{40}", identity["source_commit"]) or
+                identity["ds4_sha256"] != identity["peer_ds4_sha256"] or
+                identity["binary_toolchain_sha256"] !=
+                    identity["expected_binary_toolchain_sha256"] or
+                identity["toolchain_id"] !=
+                    "elf-comment-sha256:" + identity["binary_toolchain_sha256"]):
+            raise ProofError(f"SDK {arm} source/build identity is inconsistent")
+    if value["control"]["toolchain_id"] == value["candidate"]["toolchain_id"]:
+        raise ProofError("SDK contrast requires distinct compiler identities")
+    for field in ("ds4_sha256", "ds4_bench_tp_sha256"):
+        if value["control"][field] == value["candidate"][field]:
+            raise ProofError("SDK contrast requires distinct inference and benchmark builds")
+    runtimes = value["runtimes"]
+    if not isinstance(runtimes, dict) or set(runtimes) != {"control", "candidate"}:
+        raise ProofError("SDK contrast requires both runtime identities")
+    for runtime in runtimes.values():
+        if (not isinstance(runtime, dict) or set(runtime) != {"sdk_root", "kernel", "libraries"} or
+                not isinstance(runtime["sdk_root"], str) or
+                not Path(runtime["sdk_root"]).is_absolute() or
+                not isinstance(runtime["kernel"], str) or not runtime["kernel"] or
+                not isinstance(runtime["libraries"], dict)):
+            raise ProofError("SDK runtime identity is incomplete")
+        libraries = runtime["libraries"]
+        if len(libraries) != len(SDK_LIBRARY_PREFIXES):
+            raise ProofError("SDK runtime requires the complete HIP/HSA/BLAS library set")
+        for prefix in SDK_LIBRARY_PREFIXES:
+            if sum(Path(path).name.startswith(prefix) for path in libraries) != 1:
+                raise ProofError("SDK runtime has missing or duplicate library families")
+        for path, digest in libraries.items():
+            if (not Path(path).is_absolute() or
+                    ".." in Path(path).parts or
+                    not Path(path).is_relative_to(runtime["sdk_root"]) or
+                    not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                raise ProofError("SDK runtime has an invalid library path/hash")
+    if runtimes["control"]["kernel"] != runtimes["candidate"]["kernel"]:
+        raise ProofError("SDK comparison must retain one kernel driver release")
+    cells = value["cell_switches"]
+    if not isinstance(cells, dict) or set(cells) != SDK_CELLS:
+        raise ProofError("SDK contrast requires all model/context cell bindings")
+    for switches in cells.values():
+        validate_switches(switches)
+    if any(cells[name] != cells["headline"] for name in ("diverse", "long-context")):
+        raise ProofError("SDK GLM Q4 screens must use the headline recipe")
+    return value
+
+
+def verify_sdk_arm(manifest: dict, arm: str, contrast: dict) -> None:
+    for field, expected in contrast[arm].items():
+        if manifest.get(field) != expected:
+            raise ProofError(f"{arm} run differs from frozen SDK identity in {field}")
+    if manifest.get("dspark") != "0":
+        raise ProofError("SDK migration comparison requires ordinary inference")
+    if manifest.get("rocprof_binary", "") or manifest.get("rocprof_sha256", ""):
+        raise ProofError("SDK timing comparison must be uninstrumented")
+    for field in ENV_FIELDS:
+        environment = parse_env(manifest.get(field, ""), f"SDK {arm} {field}")
+        if ((field in RANK_ENV_FIELDS and
+             environment.get("DS4_GLM5_NATIVE_DRAFT") != "0") or
+                environment.get("DS4_GLM5_NATIVE_DRAFT", "0") != "0"):
+            raise ProofError("SDK migration comparison requires explicit native MTP off")
+        if any(name.startswith("DS4_") and name.endswith("_PROFILE")
+               for name in environment):
+            raise ProofError("SDK timing comparison has a presence-based profiler")
+
+
+def verify_sdk_runtime(run: dict, value: object, root: Path, arm: str,
+                       contrast: dict) -> None:
+    path, bound = artifact(value, root, "live SDK runtime")
+    capture = json.loads(path.read_text())
+    manifest = run["manifest"]
+    runtime = contrast["runtimes"][arm]
+    if (not isinstance(capture, dict) or not manifest.get("tag") or
+            capture.get("tag") != manifest["tag"] or
+            capture.get("source") != manifest.get("source_commit") or
+            not isinstance(capture.get("ranks"), dict) or
+            set(capture["ranks"]) != set(("coordinator", "worker"))):
+        raise ProofError("SDK runtime capture differs from its benchmark identity")
+    manifest_bytes = Path(run["artifacts"]["manifest"]["path"]).read_bytes()
+    capture_hash = capture.get("manifest_sha256")
+    if capture_hash != hashlib.sha256(manifest_bytes).hexdigest():
+        # The launcher appends this one field after generation. A loading-time
+        # capture must bind every other original byte of the final manifest.
+        stripped, count = re.subn(
+            rb"(?m)^dump_generated_token_sha256=[0-9a-f]{64}\n", b"", manifest_bytes)
+        if count != 1 or capture_hash != hashlib.sha256(stripped).hexdigest():
+            raise ProofError("SDK runtime capture manifest hash does not bind this run")
+    for rank, record in capture["ranks"].items():
+        binary_field = "ds4_bench_tp_sha256" if rank == "coordinator" else "peer_ds4_sha256"
+        expected_env = parse_env(manifest[rank + "_env"], "runtime rank environment")
+        if (not isinstance(record, dict) or
+                record.get("executable_sha256") != manifest[binary_field] or
+                record.get("kernel") != runtime["kernel"] or
+                record.get("effective_environment") != expected_env or
+                record.get("runtime_environment") != expected_env or
+                expected_env.get("DS4_BENCH_RUN_ID") != manifest.get("run_id") or
+                type(record.get("pid")) is not int or record["pid"] <= 0 or
+                not str(record.get("start_ticks", "")).isdigit() or
+                type(record.get("observed_unix_ns")) is not int or
+                record["observed_unix_ns"] <= 0):
+            raise ProofError("SDK runtime rank process/settings binding is invalid")
+        libraries = record.get("libraries")
+        if (not isinstance(libraries, list) or len(libraries) != len(SDK_LIBRARY_PREFIXES) or
+                any(not isinstance(item, dict) or set(item) != {"path", "resolved", "sha256"}
+                    for item in libraries)):
+            raise ProofError("SDK runtime capture has incomplete mapped libraries")
+        if ({item["resolved"]: item["sha256"] for item in libraries} != runtime["libraries"] or
+                any(item["path"] != item["resolved"] for item in libraries)):
+            raise ProofError("SDK runtime library hashes differ from the frozen arm")
+        mappings = record.get("mappings")
+        if (not isinstance(mappings, list) or
+                any(not isinstance(line, str) or len(line.split(None, 5)) != 6 for line in mappings) or
+                {line.split(None, 5)[5] for line in mappings} != set(runtime["libraries"])):
+            raise ProofError("SDK runtime mapping evidence is incomplete")
+    run["artifacts"]["runtime"] = bound
+
+
+def validate_performance_policy(value: object) -> dict:
+    required = {"contract", "target_metrics", "candidate_switches", "public_claim"}
+    if (not isinstance(value, dict) or
+            set(value) not in (required, required | {"sdk_contrast"})):
         raise ProofError("performance policy has invalid fields")
+    migration = "sdk_contrast" in value
+    if migration:
+        validate_sdk_contrast(value["sdk_contrast"])
     contract = value["contract"]
     expected = {
         "schema_version", "method", "qualification_pairs", "merge_looks",
@@ -150,11 +296,15 @@ def validate_performance_policy(value: object) -> dict:
     else:
         raise ProofError("performance contract has an unsupported formal test")
     targets = value["target_metrics"]
-    if (not isinstance(targets, list) or not targets or
+    if (not isinstance(targets, list) or (not targets and not migration) or
             len(set(targets)) != len(targets) or
             set(targets) - {"prefill", "decode"} or
             type(value["public_claim"]) is not bool):
         raise ProofError("performance target declaration is invalid")
+    if migration and (targets or value["public_claim"] or
+                      formal_test["kind"] != "exact-sign-fixed-nine-v1"):
+        raise ProofError(
+            "SDK migration requires guard-only exact-sign timing without a speed claim")
     for name in ("minimum_gain", "maximum_untargeted_regression",
                  "maximum_control_regression"):
         number = contract[name]
@@ -173,6 +323,8 @@ def validate_performance_policy(value: object) -> dict:
                 (name.startswith("max_") and number > 0.10)):
             raise ProofError(f"performance contract {name} is invalid")
     switches = validate_switches(value["candidate_switches"])
+    if migration and switches:
+        raise ProofError("SDK migration switches must be bound per cell")
     return {**value, "candidate_switches": switches}
 
 
@@ -382,7 +534,8 @@ def compare_manifests(repo: Path, control: Path, candidate: Path,
 def normalize_pair(value: object, root: Path, repo: Path, *, lane: str,
                    control_fnv: str, source_commits: dict[str, str],
                    candidate_switches: dict[str, dict[str, str]],
-                   expected_candidate_id: str | None = None) -> dict:
+                   expected_candidate_id: str | None = None,
+                   sdk_contrast: dict | None = None) -> dict:
     required = {"pair_id", "order", "control", "candidate",
                 "allowed_fields", "allowed_env"}
     if not isinstance(value, dict) or set(value) != required:
@@ -407,6 +560,9 @@ def normalize_pair(value: object, root: Path, repo: Path, *, lane: str,
         if switch in candidate_switches
     }
     permitted_fields = PAIR_ALLOWED_BUILD_FIELDS | switch_fields
+    if sdk_contrast is not None:
+        validate_sdk_contrast(sdk_contrast)
+        permitted_fields |= SDK_IDENTITY_FIELDS
     unexpected = set(allowed_fields) - permitted_fields
     if unexpected:
         raise ProofError(
@@ -415,13 +571,22 @@ def normalize_pair(value: object, root: Path, repo: Path, *, lane: str,
     if set(allowed_env) != set(candidate_switches):
         raise ProofError(
             "paired environment allowances must exactly match initialized switches")
+    arms = {arm: value[arm] for arm in ("control", "candidate")}
+    if sdk_contrast is not None:
+        for arm, run in arms.items():
+            if not isinstance(run, dict) or set(run) != set(RUN_ARTIFACTS) | {"runtime"}:
+                raise ProofError("SDK run requires live runtime evidence from both ranks")
+        arms = {arm: {key: run[key] for key in RUN_ARTIFACTS} for arm, run in arms.items()}
     control = normalize_run(
-        value["control"], root, repo, lane=lane, expected_fnv=control_fnv)
+        arms["control"], root, repo, lane=lane, expected_fnv=control_fnv)
     candidate = normalize_run(
-        value["candidate"], root, repo, lane=lane,
+        arms["candidate"], root, repo, lane=lane,
         expected_fnv=control_fnv if lane == "A" else None)
     for arm_name, run in (("control", control), ("candidate", candidate)):
         manifest = run["manifest"]
+        if sdk_contrast is not None:
+            verify_sdk_arm(manifest, arm_name, sdk_contrast)
+            verify_sdk_runtime(run, value[arm_name]["runtime"], root, arm_name, sdk_contrast)
         if (expected_candidate_id is not None and
                 manifest.get("candidate_id") != expected_candidate_id):
             raise ProofError(
@@ -551,18 +716,24 @@ def normalize_screen(name: str, value: object, root: Path, repo: Path, *,
                      screen_limits: dict[str, float],
                      frontier: int | None = None,
                      minimum_frontier: int | None = None,
-                     prompt_sha256: str | None = None) -> dict:
+                     prompt_sha256: str | None = None,
+                     sdk_contrast: dict | None = None) -> dict:
     required = {"pair", "trajectory", "control_fnv64", "max_prefill_regression",
                 "max_decode_regression"}
     if not isinstance(value, dict) or set(value) != required:
         raise ProofError(f"{name} screen has invalid fields")
+    if (sdk_contrast is not None and
+            (not isinstance(value.get("trajectory"), dict) or
+             value["trajectory"].get("mode") != "exact")):
+        raise ProofError("SDK screen is missing model-specific numerical/quality admission")
     control_fnv = str(value["control_fnv64"]).lower()
     if not re.fullmatch(r"[0-9a-f]{16}", control_fnv):
         raise ProofError(f"{name} screen has an invalid control fingerprint")
     pair = normalize_pair(value["pair"], root, repo, lane=lane,
                           control_fnv=control_fnv,
                           source_commits=source_commits,
-                          candidate_switches=candidate_switches)
+                          candidate_switches=candidate_switches,
+                          sdk_contrast=sdk_contrast)
     control = pair["control"]
     candidate = pair["candidate"]
     actual_frontier = int(control["result"]["frontier"])
@@ -693,7 +864,8 @@ def performance_decision(pairs: list[dict], policy: dict) -> dict:
         "familywise_confidence_level": None if qualification else 0.95,
         "metrics": result,
         "decision": decision,
-        "merge_eligible": bool(passed and not qualification),
+        "merge_eligible": bool(passed and not qualification and
+                               "sdk_contrast" not in policy),
         "passed": passed,
     }
 
@@ -713,7 +885,8 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
     stage = str(spec["stage"])
     baseline_fnv = str(spec["baseline_fnv64"]).lower()
     if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", candidate_id) or
-            lane not in {"A", "B", "C"} or stage not in {"qualification", "promotion"} or
+            lane not in {"A", "B", "C"} or
+            stage not in {"qualification", "promotion", "sdk-diagnostic"} or
             not re.fullmatch(r"sha256:[0-9a-f]{64}", str(spec["baseline_id"])) or
             not re.fullmatch(r"[0-9a-f]{16}", baseline_fnv) or
             spec["required_provider"] not in {"roce-v2", "odinlink"}):
@@ -738,6 +911,11 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         raise ProofError(
             "paired control and candidate benchmark producer source differs")
     performance_policy = validate_performance_policy(spec["performance"])
+    sdk_contrast = performance_policy.get("sdk_contrast")
+    if (sdk_contrast is not None) != (stage == "sdk-diagnostic"):
+        raise ProofError(
+            "SDK contrast is diagnostic-only pending migration admission; "
+            "it cannot qualify or promote a candidate")
     if spec["required_provider"] != performance_policy["contract"]["required_provider"]:
         raise ProofError("proof provider differs from the frozen performance contract")
     formal_test = performance_policy["contract"]["formal_test"]
@@ -755,7 +933,9 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
                 calibration.get("design", {}).get("looks") !=
                     performance_policy["contract"]["merge_looks"]):
             raise ProofError("repeated-Student calibration is internally inconsistent")
-    candidate_switches = performance_policy["candidate_switches"]
+    candidate_switches = (performance_policy["candidate_switches"]
+                          if sdk_contrast is None else
+                          sdk_contrast["cell_switches"]["headline"])
     screen_limits = performance_policy["contract"]["screens"]
     long_prompt = repo / LONG_CONTEXT_PROMPT
     if not long_prompt.is_file() or sha256(long_prompt) != LONG_CONTEXT_PROMPT_SHA256:
@@ -767,7 +947,8 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
                             control_fnv=baseline_fnv,
                             source_commits=source_commits,
                             candidate_switches=candidate_switches,
-                            expected_candidate_id=candidate_id)
+                            expected_candidate_id=candidate_id,
+                            sdk_contrast=sdk_contrast)
              for item in raw_pairs]
     pair_ids = [item["pair_id"] for item in pairs]
     if len(set(pair_ids)) != len(pair_ids):
@@ -784,7 +965,7 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         raise ProofError("headline candidate runs do not have one deterministic fingerprint")
     performance = performance_decision(pairs, performance_policy)
     if ((stage == "qualification" and len(pairs) != 3) or
-            (stage == "promotion" and len(pairs) not in {5, 7, 9})):
+            (stage in {"promotion", "sdk-diagnostic"} and len(pairs) not in {5, 7, 9})):
         raise ProofError(
             "qualification requires three pairs; promotion requires 5, 7, or 9")
     diverse = normalize_screen(
@@ -792,7 +973,7 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         source_commits=source_commits,
         candidate_switches=candidate_switches, screen_limits=screen_limits,
         frontier=4096,
-        prompt_sha256=DIVERSE_PROMPT_SHA256)
+        prompt_sha256=DIVERSE_PROMPT_SHA256, sdk_contrast=sdk_contrast)
     if stage == "qualification":
         if spec["long_context_screen"] is not None or spec["ordinary_regressions"] != []:
             raise ProofError(
@@ -804,7 +985,7 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
             source_commits=source_commits,
             candidate_switches=candidate_switches, screen_limits=screen_limits,
             minimum_frontier=8192,
-            prompt_sha256=LONG_CONTEXT_PROMPT_SHA256)
+            prompt_sha256=LONG_CONTEXT_PROMPT_SHA256, sdk_contrast=sdk_contrast)
     named_glm_screens = [("diverse", diverse)]
     if long_context is not None:
         named_glm_screens.append(("long-context", long_context))
@@ -818,23 +999,29 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
     glm_runs = [run for pair in pairs for run in (pair["control"], pair["candidate"])]
     for _, screen in named_glm_screens:
         glm_runs.extend((screen["pair"]["control"], screen["pair"]["candidate"]))
+    identity_fields = tuple(key for key in GLM_IDENTITY_FIELDS
+                            if sdk_contrast is None or key != "toolchain_id")
     reference_identity = {
-        key: glm_runs[0]["manifest"].get(key) for key in GLM_IDENTITY_FIELDS
+        key: glm_runs[0]["manifest"].get(key) for key in identity_fields
     }
     for required_field in ("model", "model_size", "model_sample_sha256", "toolchain_id"):
-        if not reference_identity[required_field]:
+        if not glm_runs[0]["manifest"].get(required_field):
             raise ProofError(f"GLM promotion run is missing {required_field}")
     for run in glm_runs[1:]:
-        identity = {key: run["manifest"].get(key) for key in GLM_IDENTITY_FIELDS}
+        identity = {key: run["manifest"].get(key) for key in identity_fields}
         if identity != reference_identity:
             raise ProofError("4K/8K/headline GLM runs differ in model, toolchain, or layout")
     regressions = spec["ordinary_regressions"]
+    required_regressions = (REQUIRED_REGRESSIONS if sdk_contrast is None else
+                            REQUIRED_REGRESSIONS | {"glm-53-q2"})
     if (not isinstance(regressions, list) or
-            (stage == "promotion" and
+            (stage in {"promotion", "sdk-diagnostic"} and
              {str(item.get("name")) for item in regressions
-              if isinstance(item, dict)} != REQUIRED_REGRESSIONS)):
-        raise ProofError("promotion regressions must cover DeepSeek 0731 Q4 and Q2")
+              if isinstance(item, dict)} != required_regressions) or
+            len(regressions) != (0 if stage == "qualification" else len(required_regressions))):
+        raise ProofError("promotion regressions must cover each required model exactly once")
     normalized_regressions = []
+    regression_model_hashes = set()
     for item in regressions:
         if set(item) != {"name", "baseline_fnv64", "model", "screen"}:
             raise ProofError("ordinary regression has invalid fields")
@@ -852,6 +1039,11 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
                 model["quantization"] not in {"Q4_K", "Q2_K"}):
             raise ProofError("ordinary regression model/fingerprint identity is invalid")
         model_path = Path(model["path"]).resolve()
+        if sdk_contrast is not None:
+            expected_quant = "Q4_K" if item["name"] == "deepseek-0731-q4" else "Q2_K"
+            if model["quantization"] != expected_quant or model["sha256"] in regression_model_hashes:
+                raise ProofError("SDK regression cells require distinct models and the named quantization")
+            regression_model_hashes.add(model["sha256"])
         try:
             actual_size, actual_sample = sampled_model_sha256(model_path)
         except OSError as error:
@@ -863,13 +1055,21 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         normalized = normalize_screen(
             str(item["name"]), item["screen"], root, repo, lane=lane,
             source_commits=source_commits,
-            candidate_switches=candidate_switches, screen_limits=screen_limits,
-            frontier=2048, prompt_sha256=DEEPSEEK_PROMPT_SHA256)
+            candidate_switches=(candidate_switches if sdk_contrast is None else
+                                sdk_contrast["cell_switches"][item["name"]]),
+            screen_limits=screen_limits,
+            frontier=2048, prompt_sha256=DEEPSEEK_PROMPT_SHA256,
+            sdk_contrast=sdk_contrast)
         if normalized["control_fnv64"] != regression_fnv:
             raise ProofError("ordinary regression screen fingerprint is inconsistent")
         for run in (normalized["pair"]["control"],
                     normalized["pair"]["candidate"]):
             manifest = run["manifest"]
+            if sdk_contrast is not None:
+                expected_arch = "glm5-next" if item["name"] == "glm-53-q2" else "deepseek4"
+                if (reference_identity.get("model_arch") != "glm5-next" or
+                        manifest.get("model_arch") != expected_arch):
+                    raise ProofError("SDK regression cell has the wrong model architecture")
             if (manifest.get("rdma_profile") != spec["required_provider"] or
                     manifest.get("model") != model["path"] or
                     manifest.get("model_size") != str(model["size"]) or
@@ -916,12 +1116,14 @@ def calculate(spec: object, root: Path, repo: Path) -> dict:
         "diverse_screen": diverse,
         "long_context_screen": long_context,
         "ordinary_regressions": normalized_regressions,
+        **({"admission": "none-diagnostic-only"} if sdk_contrast is not None else {}),
         "passed": passed,
     }
 
 
 def denormalize_run(run: dict) -> dict:
-    return {name: run["artifacts"][name] for name in RUN_ARTIFACTS}
+    names = (*RUN_ARTIFACTS, "runtime") if "runtime" in run["artifacts"] else RUN_ARTIFACTS
+    return {name: run["artifacts"][name] for name in names}
 
 
 def proof_to_spec(proof: dict) -> dict:

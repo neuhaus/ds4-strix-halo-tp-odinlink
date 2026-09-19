@@ -4495,6 +4495,7 @@ typedef struct {
     ds4_tensor *output;
     ds4_tensor *nextn_eh_proj;
     ds4_glm5_next_layer_weights layer[DS4_MAX_LAYER];
+    ds4_tensor *nextn_enorm, *nextn_hnorm, *nextn_shared_head_norm;
     ds4_glm5_layer_kind schedule[DS4_MAX_LAYER];
     uint32_t layer_count;
     uint32_t trunk_count;
@@ -4532,12 +4533,19 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
     }
     w->nextn_eh_proj = required_tensorf(
         m, "blk.%u.nextn.eh_proj.weight", trunk_count);
+    w->nextn_enorm = required_tensorf(m, "blk.%u.nextn.enorm.weight", trunk_count);
+    w->nextn_hnorm = required_tensorf(m, "blk.%u.nextn.hnorm.weight", trunk_count);
+    w->nextn_shared_head_norm = required_tensorf(
+        m, "blk.%u.nextn.shared_head_norm.weight", trunk_count);
     w->trunk_count = trunk_count;
     w->nextn_count = nextn_count;
     w->offsets.token_embd = w->token_embd->abs_offset;
     w->offsets.output_norm = w->output_norm->abs_offset;
     w->offsets.output = w->output->abs_offset;
     w->offsets.nextn_eh_proj = w->nextn_eh_proj->abs_offset;
+    w->offsets.nextn_enorm = w->nextn_enorm->abs_offset;
+    w->offsets.nextn_hnorm = w->nextn_hnorm->abs_offset;
+    w->offsets.nextn_shared_head_norm = w->nextn_shared_head_norm->abs_offset;
     w->offsets.token_embd_type = w->token_embd->type;
     w->offsets.output_type = w->output->type;
     w->offsets.layer_count = layer_count;
@@ -6335,6 +6343,9 @@ static void config_validate_glm5_next_model(const ds4_model *m,
                                2, 4096, 154880, 0);
     tensor_expect_layout(bound.nextn_eh_proj,
                          DS4_TENSOR_BF16, 2, 8192, 4096, 0);
+    tensor_expect_layout(bound.nextn_enorm, DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(bound.nextn_hnorm, DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(bound.nextn_shared_head_norm, DS4_TENSOR_F32, 1, 4096, 0, 0);
     for (uint32_t il = 0; il < layers; ++il) {
         tensor_expect_layout(required_tensorf(m, "blk.%u.attn_norm.weight", il),
                              DS4_TENSOR_F32, 1, 4096, 0, 0);
@@ -51430,6 +51441,17 @@ struct ds4_session {
     ds4_gpu_tensor *glm5_next_out;
     ds4_gpu_tensor *glm5_next_logits;
     bool glm5_next_ready;
+    /* Native block45 is private; ordinary target ownership stays above. */
+    ds4_glm5_next_state glm5_native_state;
+    ds4_glm5_next_workspace *glm5_native_ws, *glm5_native_warm_ws;
+    ds4_glm5_next_workspace *glm5_native_verify_ws[3];
+    ds4_gpu_tensor *glm5_native_previous, *glm5_native_chain, *glm5_native_hidden;
+    ds4_gpu_tensor *glm5_native_normalized, *glm5_native_shifted;
+    ds4_gpu_tensor *glm5_native_hc[2], *glm5_native_logits;
+    float *glm5_native_host_logits;
+    uint64_t glm5_native_cycle;
+    uint32_t glm5_native_rows;
+    bool glm5_native_previous_valid;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
@@ -51662,6 +51684,73 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                 capacity, big_capacity);
         return 0;
     }
+    const uint32_t native_rows = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(e->tp.ctx));
+    if (native_rows == UINT32_MAX ||
+        native_rows != ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"))) {
+        fprintf(stderr, "ds4: native GLM5 draft width must be 0/2/4/6/8 and match the TP hello\n");
+        return 0;
+    }
+    const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+    const bool use_handoff = handoff && strcmp(handoff, "1") == 0;
+    const char *mla_handoff = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+    const bool use_mla_handoff = mla_handoff && strcmp(mla_handoff, "1") == 0;
+    if ((mla_handoff && strcmp(mla_handoff, "0") && strcmp(mla_handoff, "1")) ||
+        use_mla_handoff != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_handoff_config_valid(ds4_tp_prefill_config(e->tp.ctx))) {
+        fprintf(stderr, "ds4: native MLA FFN handoff requires matching hello, native draft and FFN handoff\n");
+        return 0;
+    }
+    const char *shared = getenv("DS4_ROCM_GLM5_VERIFY_SHARED_Q8");
+    const uint32_t expert_pairs = ds4_tp_glm5_expert_pairs_parse(
+        getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS"));
+    if (expert_pairs != ds4_tp_glm5_expert_pairs_mode(ds4_tp_prefill_config(e->tp.ctx)) ||
+        !ds4_tp_glm5_expert_pairs_config_valid(ds4_tp_prefill_config(e->tp.ctx))) {
+        fprintf(stderr, "ds4: native expert pairs require mode0/1/2, matching hello, native6 and MLA/FFN handoff\n");
+        return 0;
+    }
+    const char *mla_attn = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+    const bool use_mla_attn = mla_attn && strcmp(mla_attn, "1") == 0;
+    const char *mla_row_sync = getenv("DS4_GLM5_VERIFY_MLA_ROW_SYNC");
+    const char *mla_owned = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if ((mla_attn && strcmp(mla_attn, "0") && strcmp(mla_attn, "1")) ||
+        use_mla_attn != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF) != 0u) ||
+        !ds4_tp_glm5_mla_attn_handoff_config_valid(ds4_tp_prefill_config(e->tp.ctx)) ||
+        (use_mla_attn && (!mla_owned || strcmp(mla_owned, "1"))) ||
+        (mla_row_sync && strcmp(mla_row_sync, "0") && strcmp(mla_row_sync, "1")) ||
+        (mla_row_sync && !strcmp(mla_row_sync, "1") && !use_mla_attn)) {
+        fprintf(stderr, "ds4: native MLA attention handoff requires matching hello, native2/4/6, owned heads, MLA/FFN handoff and valid row-sync\n");
+        return 0;
+    }
+    const char *ffn_queue = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
+    const char *mla_output = getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH");
+    if ((mla_output && strcmp(mla_output, "0") && strcmp(mla_output, "1")) ||
+        (mla_output && !strcmp(mla_output, "1") && !use_mla_attn)) {
+        fprintf(stderr, "ds4: native MLA output batch requires attention handoff and selector0/1\n");
+        return 0;
+    }
+    const bool use_ffn_queue = ffn_queue && strcmp(ffn_queue, "1") == 0;
+    if ((ffn_queue && strcmp(ffn_queue, "0") && strcmp(ffn_queue, "1")) ||
+        use_ffn_queue != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE) != 0u) ||
+        !ds4_tp_glm5_ffn_queue_config_valid(ds4_tp_prefill_config(e->tp.ctx))) {
+        fprintf(stderr, "ds4: native FFN queue requires matching hello, native draft and FFN handoff\n");
+        return 0;
+    }
+    const bool handoff_modes_valid = !use_handoff || ds4_tp_glm5_handoff_modes_valid(
+        getenv("DS4_ROCM_GLM5_SHARED_Q8_PAIR_DECODE"),
+        getenv("DS4_ROCM_GLM5_SHARED_ROUTE_OVERLAP"),
+        getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP"),
+        getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH"));
+    if ((handoff && strcmp(handoff, "0") && strcmp(handoff, "1")) ||
+        use_handoff != ((ds4_tp_prefill_config(e->tp.ctx) &
+            DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF) != 0u) ||
+        (use_handoff && (!native_rows || !shared || strcmp(shared, "1"))) ||
+        !handoff_modes_valid) {
+        fprintf(stderr, "ds4: native FFN handoff requires matching hello, native draft, shared-Q8 batch and compatible scalar/shared-route settings\n");
+        return 0;
+    }
     uint32_t workspace_capacity = 1u;
     const char *batch_env = getenv("DS4_GLM5_NEXT_PREFILL_BATCH");
     const char *reuse_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
@@ -51737,6 +51826,60 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             return 0;
         }
     }
+    if (native_rows) {
+        if (!e->q4k_kshard_active || e->glm_mtp || e->mtp_ready || e->dspark ||
+            (ds4_tp_runtime_features(e->tp.ctx) & DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) ||
+            !ds4_glm5_next_draft_state_init(&s->glm5_native_state,
+                &e->glm5_next->offsets, capacity, stderr) ||
+            !ds4_glm5_next_target_verify_reserve(&s->glm5_next_exec, &s->glm5_next_state, native_rows) ||
+            !ds4_glm5_next_mla_replay_reserve(&s->glm5_native_state.mla[45], native_rows - 1u)) {
+            fprintf(stderr, "ds4: native GLM5 requires exact target verification and resident original Q4_K halves\n");
+            return 0;
+        }
+        s->glm5_native_ws = ds4_glm5_next_draft_workspace_create(capacity);
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uint32_t rows = ds4_tp_glm5_native_workspace_rows(native_rows, i);
+            if (!rows) continue;
+            s->glm5_native_verify_ws[i] = ds4_glm5_next_workspace_create_capacity_context(rows, capacity);
+            if (!s->glm5_native_verify_ws[i]) return 0;
+            ds4_glm5_next_workspace_begin_decode(s->glm5_native_verify_ws[i]);
+            if (expert_pairs && rows == 6u &&
+                !ds4_glm5_next_expert_pairs_supported(&s->glm5_next_exec, s->glm5_native_verify_ws[i])) {
+                ds4_tp_mark_failed(e->tp.ctx);
+                fprintf(stderr, "ds4: native expert pair startup admission failed\n");
+                return 0;
+            }
+            if (mla_output && !strcmp(mla_output, "1") &&
+                !ds4_glm5_next_mla_output_batch_supported(&s->glm5_next_exec,
+                    s->glm5_native_verify_ws[i])) {
+                ds4_tp_mark_failed(e->tp.ctx);
+                fprintf(stderr, "ds4: native MLA output batch startup admission failed rows=%u\n", rows);
+                return 0;
+            }
+        }
+        s->glm5_native_previous = ds4_gpu_tensor_alloc(row_bytes);
+        s->glm5_native_chain = ds4_gpu_tensor_alloc(row_bytes);
+        s->glm5_native_hidden = ds4_gpu_tensor_alloc(row_bytes);
+        s->glm5_native_normalized = ds4_gpu_tensor_alloc(256u * row_bytes);
+        s->glm5_native_shifted = ds4_gpu_tensor_alloc(256u * row_bytes);
+        s->glm5_native_hc[0] = ds4_gpu_tensor_alloc(native_rows * row_bytes * 4u);
+        s->glm5_native_hc[1] = ds4_gpu_tensor_alloc(native_rows * row_bytes * 4u);
+        s->glm5_native_logits = ds4_gpu_tensor_alloc((uint64_t)native_rows * DS4_N_VOCAB * sizeof(float));
+        s->glm5_native_host_logits = malloc((size_t)native_rows * DS4_N_VOCAB * sizeof(float));
+        if (!s->glm5_native_ws || !s->glm5_native_previous || !s->glm5_native_chain ||
+            !s->glm5_native_hidden || !s->glm5_native_normalized || !s->glm5_native_shifted ||
+            !s->glm5_native_hc[0] || !s->glm5_native_hc[1] || !s->glm5_native_logits ||
+            !s->glm5_native_host_logits) return 0;
+        s->glm5_native_rows = native_rows;
+        if (mla_output && !strcmp(mla_output, "1"))
+            fprintf(stderr, "ds4: native MLA output batch startup admitted layers=11 max_rows=%u weights=resident_original\n", native_rows);
+        fprintf(stderr, "ds4: native GLM5 draft enabled (research, max target rows=%u)\n", native_rows);
+        fprintf(stderr, "ds4: native GLM5 config proposals=%u hello=0x%016llx verifier_workspaces=%u/%u/%u\n",
+            native_rows-1u, (unsigned long long)ds4_tp_prefill_config(e->tp.ctx),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[0]),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[1]),
+            ds4_glm5_next_workspace_capacity(s->glm5_native_verify_ws[2]));
+    }
     s->glm5_next_ready = true;
     fprintf(stderr, "ds4: GLM5 ordinary executor enabled (experimental, TP/RDMA)\n");
     return 1;
@@ -51744,6 +51887,24 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
 
 static void ds4_session_glm5_next_release(ds4_session *s) {
     if (!s) return;
+    free(s->glm5_native_host_logits); s->glm5_native_host_logits = NULL;
+    ds4_gpu_tensor_free(s->glm5_native_logits); s->glm5_native_logits = NULL;
+    for (unsigned i = 0; i < 2u; ++i) {
+        ds4_gpu_tensor_free(s->glm5_native_hc[i]); s->glm5_native_hc[i] = NULL;
+    }
+    ds4_gpu_tensor_free(s->glm5_native_previous); s->glm5_native_previous = NULL;
+    ds4_gpu_tensor_free(s->glm5_native_chain); s->glm5_native_chain = NULL;
+    ds4_gpu_tensor_free(s->glm5_native_hidden); s->glm5_native_hidden = NULL;
+    ds4_gpu_tensor_free(s->glm5_native_normalized); s->glm5_native_normalized = NULL;
+    ds4_gpu_tensor_free(s->glm5_native_shifted); s->glm5_native_shifted = NULL;
+    ds4_glm5_next_workspace_destroy(s->glm5_native_ws); s->glm5_native_ws = NULL;
+    ds4_glm5_next_workspace_destroy(s->glm5_native_warm_ws); s->glm5_native_warm_ws = NULL;
+    for (unsigned i = 0; i < 3u; ++i) {
+        ds4_glm5_next_workspace_destroy(s->glm5_native_verify_ws[i]);
+        s->glm5_native_verify_ws[i] = NULL;
+    }
+    ds4_glm5_next_state_free(&s->glm5_native_state);
+    s->glm5_native_rows = 0; s->glm5_native_previous_valid = false;
     ds4_gpu_tensor_free(s->glm5_next_logits);
     ds4_gpu_tensor_free(s->glm5_next_out);
     ds4_gpu_tensor_free(s->glm5_next_cur);
@@ -51758,6 +51919,11 @@ static void ds4_session_glm5_next_release(ds4_session *s) {
     s->glm5_next_prefill_ws = NULL;
     s->glm5_next_ready = false;
 }
+
+/* Consume shifted teacher inputs before target hidden tiles are released.
+ * N target inputs imply N-1 private rows; retain the last target hidden for
+ * the next unconsumed input. Scratch contains activations only. */
+#include "ds4_glm5_native_session.inc"
 
 static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
                                                char *err, size_t errlen) {
@@ -51789,6 +51955,10 @@ static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
         !ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits,
                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
         snprintf(err, errlen, "GLM5 output projection failed");
+        return 1;
+    }
+    if (!ds4_session_glm5_native_teach(s, s->glm5_next_ws, s->glm5_next_cur, &token, 1u)) {
+        snprintf(err, errlen, "GLM5 native scalar teacher update failed");
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
@@ -51826,7 +51996,9 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     const char *reuse_ws_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
     const bool reuse_ws = reuse_ws_env &&
         strcmp(reuse_ws_env, "1") == 0 && s->glm5_next_prefill_ws &&
-        ds4_glm5_next_workspace_capacity(s->glm5_next_prefill_ws) >= n_tokens;
+        ds4_glm5_next_workspace_capacity(s->glm5_next_prefill_ws) >= n_tokens &&
+        (!s->glm5_native_rows ||
+         ds4_glm5_next_workspace_capacity(s->glm5_next_prefill_ws) == n_tokens);
     ds4_glm5_next_workspace *w = reuse_ws ? s->glm5_next_ws :
         ds4_glm5_next_workspace_create_capacity_context(
             n_tokens, (uint32_t)s->ctx_size);
@@ -51904,6 +52076,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float));
         ds4_gpu_tensor_free(last);
     }
+    if (ok) ok = ds4_session_glm5_native_teach(s, w, cur, tokens, n_tokens);
     if (ok) {
         for (uint32_t i = 0u; i < n_tokens; ++i) token_vec_push(&s->checkpoint, tokens[i]);
         s->checkpoint_valid = true;
@@ -51920,7 +52093,24 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     if (!reuse_ws) ds4_glm5_next_workspace_destroy(w);
     return ok ? 0 : 1;
 }
+
 #endif
+
+int ds4_session_tp_glm5_native_cycle(ds4_session *s, uint64_t session_id, uint64_t cycle,
+        uint32_t prefix, int root, uint32_t rows, int eos, char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)session_id; (void)cycle; (void)prefix; (void)root; (void)rows; (void)eos;
+    if (errlen) snprintf(err, errlen, "native GLM5 requires GPU support");
+    return 1;
+#else
+    if (!s || !s->engine || !s->engine->tp.active || s->engine->tp.rank != 1) return 1;
+    /* Worker sessions are selected by the command loop's registered ID map.
+     * Bind that identity on the first explicit native command, never an EVAL. */
+    if (!s->tp_session_id && !s->glm5_native_cycle) s->tp_session_id = session_id;
+    const ds4_tp_native_cycle command = {session_id, cycle, prefix, rows, root, eos};
+    return ds4_session_glm5_native_cycle_run(s, &command, NULL, err, errlen) < 0 ? 1 : 0;
+#endif
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -53894,6 +54084,9 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
             metal_graph_tp_prefill_ffn_wavefront_requested());
     }
 #if defined(DS4_ROCM_BUILD)
+    const char *bulk_recv_ready = getenv("DS4_TP_BULK_RECV_READY");
+    if (bulk_recv_ready && strcmp(bulk_recv_ready, "1") == 0)
+        config |= DS4_TP_CONFIG_BULK_RECV_READY;
     const char *score_batch =
         getenv("DS4_ROCM_GLM5_INDEXER_SCORE_BATCH");
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
@@ -53904,6 +54097,24 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
         mla_wmma && strcmp(mla_wmma, "1") == 0) {
         config |= DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA;
+    }
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && e->glm5_next) {
+        const uint32_t rows = ds4_tp_glm5_native_rows_parse(getenv("DS4_GLM5_NATIVE_DRAFT"));
+        config |= ds4_tp_glm5_native_config(rows);
+        config |= ds4_tp_glm5_expert_pairs_config(ds4_tp_glm5_expert_pairs_parse(
+            getenv("DS4_ROCM_GLM5_VERIFY_EXPERT_PAIRS")));
+        const char *handoff = getenv("DS4_ROCM_GLM5_VERIFY_FFN_HANDOFF");
+        if (handoff && strcmp(handoff, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF;
+        const char *mla_handoff = getenv("DS4_ROCM_GLM5_VERIFY_MLA_FFN_HANDOFF");
+        if (mla_handoff && strcmp(mla_handoff, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF;
+        const char *ffn_queue = getenv("DS4_ROCM_GLM5_VERIFY_FFN_QUEUE");
+        if (ffn_queue && strcmp(ffn_queue, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_FFN_QUEUE;
+        const char *mla_attn = getenv("DS4_ROCM_GLM5_VERIFY_MLA_ATTN_HANDOFF");
+        if (mla_attn && strcmp(mla_attn, "1") == 0)
+            config |= DS4_TP_CONFIG_GLM5_VERIFY_MLA_ATTN_HANDOFF;
     }
 #endif
     return config;
@@ -53929,6 +54140,12 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (e && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && e->tp.active) {
+        const uint32_t native_rows = ds4_tp_glm5_native_rows(ds4_tp_prefill_config(e->tp.ctx));
+        if (native_rows) return (int)native_rows;
+    }
+#endif
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
@@ -63601,12 +63818,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             start = s->checkpoint.len;
         } else {
-            if (!ds4_glm5_next_state_reset(&s->glm5_next_state)) {
+            if (!ds4_glm5_next_state_reset(&s->glm5_next_state) ||
+                (s->glm5_native_rows && !ds4_glm5_next_state_reset(&s->glm5_native_state))) {
                 snprintf(err, errlen, "GLM5 state reset failed");
                 return 1;
             }
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            s->glm5_native_previous_valid = false;
         }
         const char *batch_env = getenv("DS4_GLM5_NEXT_PREFILL_BATCH");
         /* Batch prefill remains an explicit experiment until the packed
@@ -63648,6 +63867,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds4_session_glm5_next_forward_token(s, prompt->v[i], err, errlen);
             if (rc) {
                 ds4_glm5_next_state_invalidate(&s->glm5_next_state);
+                if (s->glm5_native_rows) ds4_glm5_next_state_invalidate(&s->glm5_native_state);
+                s->glm5_native_previous_valid = false;
                 s->checkpoint.len = 0;
                 s->checkpoint_valid = false;
                 return 1;
@@ -70323,7 +70544,29 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
-    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (!s || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+    if (s->glm5_native_rows) {
+        int limit = max_tokens < accepted_cap ? max_tokens : accepted_cap;
+        if (limit > s->ctx_size - s->checkpoint.len) limit = s->ctx_size - s->checkpoint.len;
+        if (limit < 1) return 0;
+        const uint32_t rows = ds4_tp_glm5_native_cycle_rows(s->glm5_native_rows, (uint32_t)limit);
+        if (rows < 2u || first_token == eos_token) {
+            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+            accepted[0] = first_token;
+            return 1;
+        }
+        if (!s->engine || !s->engine->tp.active || s->engine->tp.rank != 0) return -1;
+        const ds4_tp_native_cycle command = {s->tp_session_id, s->glm5_native_cycle + 1u,
+            (uint32_t)s->checkpoint.len, rows, first_token, eos_token};
+        if (!ds4_tp_send_native_cycle(s->engine->tp.ctx, &command)) {
+            ds4_session_invalidate(s);
+            if (errlen) snprintf(err, errlen, "tp: native cycle send failed");
+            return -1;
+        }
+        return ds4_session_glm5_native_cycle_run(s, &command, accepted, err, errlen);
+    }
+#endif
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -71065,6 +71308,11 @@ void ds4_session_invalidate(ds4_session *s) {
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    if (s->glm5_next_ready) {
+        ds4_glm5_next_state_invalidate(&s->glm5_next_state);
+        if (s->glm5_native_rows) ds4_glm5_next_state_invalidate(&s->glm5_native_state);
+        s->glm5_native_previous_valid = false;
+    }
     ds4_session_glm_reset_dense_cache(s);
 #endif
 }
@@ -71076,6 +71324,16 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+#ifndef DS4_NO_GPU
+    if (s->glm5_native_rows && pos != s->checkpoint.len) {
+        /* Arbitrary rewind has no recurrent-state journal. Refill the
+         * requested prefix through sync instead of reusing future KDA state. */
+        s->checkpoint_valid = false;
+        ds4_glm5_next_state_invalidate(&s->glm5_next_state);
+        ds4_glm5_next_state_invalidate(&s->glm5_native_state);
+        s->glm5_native_previous_valid = false;
+    }
+#endif
     s->checkpoint.len = pos;
     s->tp_peer_top2_valid = false;
     s->mtp_draft_valid = false;

@@ -78,6 +78,8 @@ typedef struct {
     uint64_t output_norm;
     uint64_t output;
     uint64_t nextn_eh_proj;
+    /* Native block45 norms; the draft has plain residuals, without mHC. */
+    uint64_t nextn_enorm, nextn_hnorm, nextn_shared_head_norm;
     /* Exact GGUF types for ordinary-inference root matrices. Production
      * bindings populate these; zero preserves the original BF16 contract for
      * synthetic offset fixtures created before the fields existed. */
@@ -92,6 +94,25 @@ typedef struct {
 } ds4_glm5_next_model_offsets;
 
 struct ds4_glm5_next_state;
+struct ds4_glm5_next_mla_replay;
+struct ds4_tp;
+
+/* Host-only ownership/progress for an explicit full-target transaction.
+ * A nonzero tokens field excludes ordinary execution. All bound resources
+ * must remain alive and immutable until finish or state reset/invalidation. */
+typedef struct {
+    const ds4_glm5_next_model_offsets *model;
+    const void *model_map;
+    uint64_t model_size;
+    struct ds4_tp *tp;
+    ds4_gpu_tensor *tp_slab, *tp_big_out, *tp_big_in;
+    void *tp_big_out_host, *tp_big_in_host;
+    uint64_t *tp_sequence;
+    uint64_t sequence_end, prefill_config, frontier;
+    uint32_t rank, runtime_features, tokens, next_layer;
+    uint32_t input_tokens[8];
+    bool complete;
+} ds4_glm5_next_verification;
 
 typedef struct {
     ds4_gpu_tensor *compact_kv;
@@ -116,6 +137,7 @@ typedef struct {
     uint32_t first_valid;
     bool valid;
     struct ds4_glm5_next_state *owner;
+    struct ds4_glm5_next_mla_replay *replay;
 } ds4_glm5_next_mla_state;
 
 typedef struct ds4_glm5_next_state {
@@ -125,6 +147,11 @@ typedef struct ds4_glm5_next_state {
     uint32_t context_capacity;
     uint32_t mla_count;
     uint64_t bytes;
+    uint32_t pending_mla_verifications;
+    ds4_glm5_next_verification verification;
+    /* A private native draft owns only mla[45], with no trunk/KDA storage. */
+    bool draft_only;
+    const ds4_glm5_next_model_offsets *draft_model;
     bool valid;
 } ds4_glm5_next_state;
 
@@ -148,8 +175,11 @@ int ds4_glm5_next_mla_sparse_selection_plan(
         uint32_t *selected_pools, uint32_t *selected_tokens);
 /* Stop a dense tile exactly at the sparse boundary. If the negotiated sparse
  * bridge is disabled, use scalar execution thereafter. If it is enabled,
- * later tiles retain their requested size while each sparse MLA attention
- * stage executes causally through the established scalar implementation. */
+ * later tiles are capped by the requested size while each sparse MLA
+ * attention stage executes causally through the established scalar path.
+ * Tiles larger than 256 rows retain complete M256 groups; a smaller tail
+ * follows separately so projection dispatch matches the M256 reference.
+ * Group boundaries are relative to the current sync start or crossover. */
 uint32_t ds4_glm5_next_prefill_chunk(
         uint32_t position, uint32_t remaining, uint32_t requested_batch,
         bool allow_sparse_batch);
@@ -168,6 +198,9 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
                              uint32_t context_capacity,
                              FILE *accounting);
 int ds4_glm5_next_state_reset(ds4_glm5_next_state *state);
+int ds4_glm5_next_draft_state_init(ds4_glm5_next_state *state,
+                                   const ds4_glm5_next_model_offsets *model,
+                                   uint32_t context_capacity, FILE *accounting);
 void ds4_glm5_next_state_invalidate(ds4_glm5_next_state *state);
 void ds4_glm5_next_state_free(ds4_glm5_next_state *state);
 /* Plan/commit one compact MLA row without mutating state before the GPU work
@@ -176,6 +209,39 @@ int ds4_glm5_next_mla_append_plan(
         const ds4_glm5_next_mla_state *mla, uint32_t *tail_slot,
         uint32_t *pool_index, bool *publish_pool);
 int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
+
+/* Explicit small-batch verifier storage; no ordinary-path allocation. The
+ * borrowed view shares append-only KV/pools but owns private tails/counters.
+ * Use it only until finish/reset/abort, and obey its causal lengths. The
+ * caller must finish a successful full layer pass before accepting any rows;
+ * on a failed pass invalidate the owning next_state instead. Target MLA
+ * supports 2/4/6/8 rows; a private native owner supports 1..8, permitting M-1
+ * proposals for an M-row target pass without an unused extra output head. */
+int ds4_glm5_next_mla_replay_reserve(ds4_glm5_next_mla_state *mla,
+                                     uint32_t capacity);
+uint64_t ds4_glm5_next_mla_replay_bytes(const ds4_glm5_next_mla_state *mla);
+int ds4_glm5_next_mla_verify_ready(const ds4_glm5_next_mla_state *mla,
+                                    uint32_t tokens);
+/* Nonmutating all-layer commit preflight, including staged-tail completeness. */
+int ds4_glm5_next_mla_verify_pending(const ds4_glm5_next_mla_state *mla,
+                                      uint32_t frontier, uint32_t tokens);
+int ds4_glm5_next_mla_verify_begin(ds4_glm5_next_mla_state *mla,
+                                    uint32_t tokens,
+                                    ds4_glm5_next_mla_state **view);
+/* Record normalized index keys and raw pool gates before workspace reuse.
+ * Rows are contiguous in token order; staging may precede append_commit.
+ * Ordinary unreserved/inactive states take a no-op path. */
+int ds4_glm5_next_mla_verify_record(ds4_glm5_next_mla_state *view,
+                                     uint32_t position,
+                                     const ds4_gpu_tensor *keys,
+                                     uint64_t key_offset,
+                                     const ds4_gpu_tensor *gates,
+                                     uint64_t gate_offset,
+                                     uint32_t tokens);
+/* accepted counts consumed input rows, including the root, not predictions.
+ * Zero discards a completed pass. No weights, full-KV copies or GPU readback. */
+int ds4_glm5_next_mla_verify_finish(ds4_glm5_next_mla_state *mla,
+                                     uint32_t accepted);
 
 #ifdef __cplusplus
 }

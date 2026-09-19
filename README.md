@@ -21,17 +21,19 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **231.87 t/s** | **19.92 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `5e0fa38210276c41`, zero fallback |
-| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **270.10 t/s** | **19.89 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `0163c44015591445`, zero fallback |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; paired regression check | **304.22 t/s** | **21.19 t/s** | one candidate run at `71e6a24`, 2026-09-15; exact FNV `0163c44015591445`, zero fallback |
+| Original Q4_K baseline | pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, ordered prefill | **278.43 t/s** | **19.59 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality exception |
+| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048 prompt + 300 decode; one regression run | **270.10 t/s** | **19.89 t/s** | retained ROCm 7.14 result, `71e6a24`, 2026-09-15 |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048 prompt + 300 decode; one run, synchronous gates | **323.47 t/s** | **20.99 t/s** | ROCm 10, `897db2e`, 2026-09-19; quality exception |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-The current rates are individual regression observations, not repeated-run
-headline estimates. Both quantizations preserved the paired control fingerprint
-and met the 3% regression limits. Huihui and Antirez use different model files;
-their rates are not a controlled engine comparison. No expanded-weight cache
-or payload fallback was used.
+These are individual observations, not repeated-run estimates. All RDMA rows
+used unchanged model bytes, zero payload fallback and no expanded-weight cache.
+The Q2 ordered-prefill result requires `DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1`.
+Huihui and Antirez use different model files, so their rates are not a
+controlled engine comparison. The ROCm 10 migration has an approved
+[one-time quality exception](docs/ROCM10-MIGRATION.md); failed checks remain
+recorded. OdinLink has not been remeasured on the new SDK.
 
 ### Q4_K throughput through 10K context
 
@@ -42,7 +44,7 @@ adds 2,048 prompt tokens at the stated context frontier, then measures 300
 generated tokens. It uses the same diverse prompt corpus throughout. The
 separate full 10,240-token prefill has a three-run median of **289.23 t/s**;
 its decode median is **18.76 t/s**. The sweep has not been repeated for the
-September 15 update.
+ROCm 10 update.
 
 ```sh
 DS4_BENCH_RDMA_PROFILE=roce-v2 \
@@ -59,19 +61,17 @@ DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; geometric mean of nine paired runs | **93.43 t/s** | **10.29 t/s** | source `71e6a24`, 2026-09-15; exact FNV `9012bd4d7c5ce422`, zero fallback |
-| **GLM-5.3 Flash Q4_K over OdinLink** | 4,096 prompt + 300 decode, batch 256; one matched diagnostic pair | **97.89 t/s** | **9.77 t/s** | candidate `71e6a24`, 2026-09-15; exact FNV `9012bd4d7c5ce422`, zero fallback |
-| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256; one matched diagnostic pair | **36.31 t/s** | **10.39 t/s** | candidate `71e6a24`, 2026-09-15; mixed IQ2_XXS/Q2_K, exact FNV `4dabfb16bc99c81b`, zero fallback |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256; one run | **103.42 t/s** | **10.14 t/s** | ROCm 10, `074a7ba`, 2026-09-19; unchanged 300-token output |
+| **GLM-5.3 Flash Q4_K over OdinLink** | 4,096 prompt + 300 decode, batch 256; one diagnostic run | **97.89 t/s** | **9.77 t/s** | retained ROCm 7.14 result, `71e6a24`, 2026-09-15 |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256; one run | **39.75 t/s** | **10.52 t/s** | ROCm 10, `897db2e`, 2026-09-19; mixed IQ2_XXS/Q2_K; quality exception |
 
-The Q4_K RoCE v2 result uses the unchanged original Antirez GGUF and overall
-decode throughput. All nine runs are retained, including the 58.71 t/s prefill
-sample. The matched control averaged 87.45/10.11 t/s. Numerical300, paired
-100-case quality, 8K context, and DeepSeek Q4/Q2 checks passed. The 300 prefill /
-20 decode t/s GLM target remains unmet. See the [measured recipe](docs/GLM53-ROCE-RECIPE.md).
-
-The other two GLM rows are single candidate observations. Their matched
-controls measured 90.79/9.74 t/s for Q4 OdinLink and 38.44/10.52 t/s for Q2
-RoCE v2; the latter pair showed 5.5% lower candidate prefill.
+These ordinary-decode runs use the original Antirez GGUFs, zero payload
+fallback and no expanded-weight cache. Q4 at 8,192+300 measured
+**103.43 prefill / 10.27 decode t/s**, also with unchanged generated tokens.
+These remain single-run measurements. GLM Q2 is covered by the
+[one-time quality exception](docs/ROCM10-MIGRATION.md).
+The 300 prefill / 20 decode t/s GLM target remains unmet. See the
+[measured recipe](docs/GLM53-ROCE-RECIPE.md).
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its main Q4_K rows
@@ -79,8 +79,8 @@ use the Antirez reference model listed below. The Antirez Q4_K model does not
 fit one 128 GB node; TP=2 keeps one expert shard on each node. Q2_K
 and Q4_K run without a persistent expanded-weight cache.
 
-The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
-release results.
+The build pins ROCm Core SDK 10.0.0. Each table row identifies its measured
+SDK; historical ROCm 7.14 rows do not represent the new runtime.
 
 GLM-5.3 Flash support uses a staged TP=2 path that keeps the model's KDA state
 sharded by attention head and does not change the validated DeepSeek production
@@ -91,12 +91,12 @@ sampling-mode correction is documented at
 optimization record is at
 `$DS4_RESEARCH_ROOT/glm5-next-tp2/staged-optimization-plan-20260901.md`.
 
-The ordinary benchmark and deployment launchers enable the validated ordered
-ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
-projection, cooperative HC decode stage, exact long-context indexer top-k, and
-RoCE prefill wavefront automatically. The wavefront provider-gates itself off
-on OdinLink. DSpark stays opt-in and does not inherit that target-only
-schedule.
+The ordinary benchmark and deployment launchers use synchronous ROCm TP gates
+with the pinned SDK. DeepSeek also enables the temporal-compressor schedule,
+shape-gated M256/K128 Q8 projection, cooperative HC decode stage, exact
+long-context indexer top-k, and RoCE prefill wavefront. The wavefront
+provider-gates itself off on OdinLink. DSpark stays opt-in and does not inherit
+that target-only schedule.
 
 The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory
@@ -121,26 +121,26 @@ Both nodes need ROCm support for `gfx1151`, passwordless SSH from the
 coordinator to the worker, and their own local copy of the same repository
 commit and GGUF at the same absolute paths. Their filesystems are not shared.
 
-Follow [DS4 on Strix Halo](STRIXHALO.md) for the Ubuntu 26.04 ROCm 7.14
+Follow [DS4 on Strix Halo](STRIXHALO.md) for the Ubuntu 26.04 ROCm 10.0.0
 tarball, rocWMMA header isolation, memory-layout decision, Secure Boot check,
 and coordinator-to-worker SSH setup. Ubuntu 26.04 apt currently supplies ROCm
-7.1; it is not a substitute for the validated 7.14 bundle.
+7.1; it is not a substitute for the pinned 10.0.0 bundle.
 
 Build on both nodes:
 
 ```sh
 git clone https://github.com/wkljohn/ds4-strix-halo-tp-odinlink.git
 cd ds4-strix-halo-tp-odinlink
-HIP_PATH=/absolute/path/to/rocm-7.14.0 \
-CPATH=/absolute/path/to/rocm-7.14.0/include \
-CPLUS_INCLUDE_PATH=/absolute/path/to/rocm-7.14.0/include \
-DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
+HIP_PATH=/absolute/path/to/rocm-10.0.0 \
+CPATH=/absolute/path/to/rocm-10.0.0/include \
+CPLUS_INCLUDE_PATH=/absolute/path/to/rocm-10.0.0/include \
+DS4_ROCM_HOME=/absolute/path/to/rocm-10.0.0 \
   make -j"$(nproc)" strix-halo
 ```
 
-`DS4_ROCM_HOME` must name the ROCm 7.14 installation root containing
-`bin/hipcc`; setting it explicitly prevents an older `/opt/rocm` installation
-from being selected accidentally.
+`DS4_ROCM_HOME` must name the ROCm 10.0.0 installation root containing
+`bin/hipcc`. The build verifies the SDK, compiler and core library checksums
+against [the toolchain pin](scripts/rocm-toolchain.lock.json).
 
 Create the benchmark configuration on node 1:
 

@@ -3138,7 +3138,7 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
         }
         return 0;
     }
-    if (lds_exact && n_head == 64u && kv_lora_dim == 512u &&
+    if (lds_exact && (n_head == 64u || n_head == 32u) && kv_lora_dim == 512u &&
         qk_nope == 256u && qk_dim == 256u && row_bytes == 272u) {
         constexpr size_t shared_bytes =
             (256u + 192u * 69u) * sizeof(uint32_t);
@@ -3147,12 +3147,13 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
             n_head, qk_nope, kv_lora_dim, qk_dim, row_bytes);
         const cudaError_t launch_err = cudaGetLastError();
         if (launch_err == cudaSuccess) {
-            static int notice_printed = 0;
-            if (!notice_printed) {
+            static int notice_printed[2] = {0, 0};
+            const unsigned notice_index = n_head == 32u;
+            if (!notice_printed[notice_index]) {
                 fprintf(stderr, DS4_GPU_LOG_PREFIX
                         "GLM5 one-token k_b projection using exact "
-                        "LDS-staged Q8 rows\n");
-                notice_printed = 1;
+                        "LDS-staged Q8 rows (heads=%u)\n", n_head);
+                notice_printed[notice_index] = 1;
             }
             return 1;
         }
@@ -4130,7 +4131,7 @@ static int glm_causal_gemm_scratch_part(
     return 1;
 }
 
-static int glm_attention_lora_causal_exact_head_shared(
+static int glm_attention_lora_causal_exact_head_shared_tile256(
         ds4_gpu_tensor *lora_out,
         const ds4_gpu_tensor *qk_low,
         const ds4_gpu_tensor *kv_lora_cache,
@@ -4141,9 +4142,12 @@ static int glm_attention_lora_causal_exact_head_shared(
         uint32_t kv_lora_dim,
         uint32_t qk_nope,
         uint32_t qk_rope) {
+    const bool owned_32 = n_head == 32u && cuda_env_present(getenv(
+        "DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED_OWNED_32"));
     if (!lora_out || !qk_low || !kv_lora_cache || !lora_out->ptr ||
         !qk_low->ptr || !kv_lora_cache->ptr || n_tokens != 256u ||
-        n_head != 64u || kv_lora_dim != 512u || qk_nope != 256u ||
+        ((!owned_32 && n_head != 64u) || (owned_32 && n_head != 32u)) ||
+        kv_lora_dim != 512u || qk_nope != 256u ||
         qk_rope != 0u || n_selected == 0u || n_selected > 2048u) {
         return 0;
     }
@@ -4223,6 +4227,66 @@ static int glm_attention_lora_causal_exact_head_shared(
                 n_selected, pos0, (unsigned long long)scratch_bytes,
                 (unsigned long long)reserve_bytes);
         logged_bytes = scratch_bytes;
+    }
+    return 1;
+}
+
+static int glm_attention_lora_causal_exact_head_shared(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope) {
+    if (n_tokens == 256u)
+        return glm_attention_lora_causal_exact_head_shared_tile256(
+            lora_out, qk_low, kv_lora_cache, n_tokens, pos0, n_selected,
+            n_head, kv_lora_dim, qk_nope, qk_rope);
+
+    uint32_t end_pos = 0u;
+    const bool owned_32 = n_head == 32u && cuda_env_present(getenv(
+        "DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED_OWNED_32"));
+    if ((n_tokens != 512u && n_tokens != 1024u) ||
+        ((!owned_32 && n_head != 64u) || (owned_32 && n_head != 32u)) ||
+        kv_lora_dim != 512u || qk_nope != 256u ||
+        qk_rope != 0u ||
+        !glm_rocm_check_token_span(pos0, n_tokens, &end_pos) ||
+        n_selected != end_pos || n_selected > 2048u ||
+        !cuda_tensor_has_elems3(lora_out, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(qk_low, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(kv_lora_cache, n_selected, kv_lora_dim, sizeof(float)))
+        return 0;
+
+    /* Larger outer batches improve expert grouping and amortize layer/TP
+     * scheduling. Keep attention on its validated M256 geometry and bounded
+     * scratch. Match each serial tile's visible prefix, not merely its causal
+     * mask, so score layout and softmax/PV reduction spans stay unchanged. */
+    const uint64_t row_bytes = (uint64_t)n_head * kv_lora_dim * sizeof(float);
+    for (uint32_t base = 0u; base < n_tokens; base += 256u) {
+        const uint64_t offset = (uint64_t)base * row_bytes;
+        ds4_gpu_tensor out_view = *lora_out;
+        ds4_gpu_tensor low_view = *qk_low;
+        out_view.ptr = (char *)lora_out->ptr + offset;
+        low_view.ptr = (char *)qk_low->ptr + offset;
+        out_view.host_ptr = lora_out->host_ptr ? (char *)lora_out->host_ptr + offset : NULL;
+        low_view.host_ptr = qk_low->host_ptr ? (char *)qk_low->host_ptr + offset : NULL;
+        out_view.bytes = low_view.bytes = 256u * row_bytes;
+        out_view.owner = low_view.owner = 0;
+        const int result = glm_attention_lora_causal_exact_head_shared_tile256(
+            &out_view, &low_view, kv_lora_cache, 256u, pos0 + base,
+            pos0 + base + 256u, n_head, kv_lora_dim, qk_nope, qk_rope);
+        if (result != 1) return -1;  /* Never fall back over partial output. */
+    }
+    static int reported;
+    if (!reported) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM exact head-shared attention M256 subtiles engaged "
+                "outer_tokens=%u scratch_capacity_unchanged=1\n", n_tokens);
+        reported = 1;
     }
     return 1;
 }
@@ -5674,7 +5738,7 @@ static int glm_attention_indexed_lora_launch(
     }
     const bool nope_decode_exact_geometry =
         n_tokens == 1u && !causal_range && has_selected &&
-        !cache_f16 && n_head == 64u && kv_lora_dim == 512u &&
+        !cache_f16 && (n_head == 64u || n_head == 32u) && kv_lora_dim == 512u &&
         qk_nope == 256u && qk_rope == 0u;
     const char *nope_shared_pv_value =
         getenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
@@ -5696,10 +5760,10 @@ static int glm_attention_indexed_lora_launch(
         /* Allocate the validated maximum once.  Decode grows its selected
          * frontier from a few rows to 2048; sizing to the current frontier
          * would repeatedly cudaFree/cudaMalloc and synchronize the device. */
-        const uint64_t score_floats = (uint64_t)64u * 2051u;
-        if (score_floats > (UINT64_MAX / sizeof(float)) - 64u) return 0;
+        const uint64_t score_floats = (uint64_t)n_head * 2051u;
+        if (score_floats > (UINT64_MAX / sizeof(float)) - n_head) return 0;
         const uint64_t scratch_bytes =
-            (score_floats + 64u) * sizeof(float);
+            (score_floats + n_head) * sizeof(float);
         float *weights =
             (float *)cuda_attention_seq_scratch_alloc(scratch_bytes);
         if (!weights) return 0;
@@ -5707,7 +5771,7 @@ static int glm_attention_indexed_lora_launch(
         const size_t qk_shmem =
             ((size_t)512u + n_selected) * sizeof(float);
         glm_attention_indexed_lora_nope_f32_decode_qk_weights_kernel<<<
-                64u, 256u, qk_shmem>>>(
+                n_head, 256u, qk_shmem>>>(
                 weights,
                 denoms,
                 (const float *)qk_low->ptr,
@@ -5719,7 +5783,7 @@ static int glm_attention_indexed_lora_launch(
                      "glm indexed NoPE F32 shared-PV QK launch")) {
             return 0;
         }
-        const dim3 pv_grid(8u, 16u, 1u);
+        const dim3 pv_grid(n_head / 8u, 16u, 1u);
         glm_attention_indexed_lora_nope_f32_decode_shared_pv_kernel<<<
                 pv_grid, 256u>>>(
                 (float *)lora_out->ptr,
@@ -5729,19 +5793,20 @@ static int glm_attention_indexed_lora_launch(
                 (const int32_t *)selected->ptr,
                 n_selected,
                 cache_cap);
-        static int notice_printed;
-        if (!notice_printed) {
+        static int notice_printed[2];
+        const unsigned notice_index = n_head == 32u;
+        if (!notice_printed[notice_index]) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "GLM5 NoPE F32 indexed decode exact shared-PV active "
-                    "(selected=%u scratch=%.2f MiB)\n",
-                    n_selected, (double)scratch_bytes / 1048576.0);
-            notice_printed = 1;
+                    "(heads=%u selected=%u scratch=%.2f MiB)\n",
+                    n_head, n_selected, (double)scratch_bytes / 1048576.0);
+            notice_printed[notice_index] = 1;
         }
         return cuda_ok(cudaGetLastError(),
                        "glm indexed NoPE F32 shared-PV launch");
     }
     if (nope_decode_exact && nope_decode_exact_geometry) {
-        const dim3 exact_grid(64u, 1u, 1u);
+        const dim3 exact_grid(n_head, 1u, 1u);
         const size_t exact_shmem =
             ((size_t)512u + n_selected) * sizeof(float);
         glm_attention_indexed_lora_nope_f32_decode_exact_kernel<<<
@@ -5752,13 +5817,14 @@ static int glm_attention_indexed_lora_launch(
                 (const int32_t *)selected->ptr,
                 n_selected,
                 cache_cap);
-        static int notice_printed;
-        if (!notice_printed) {
+        static int notice_printed[2];
+        const unsigned notice_index = n_head == 32u;
+        if (!notice_printed[notice_index]) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "GLM5 NoPE F32 indexed decode exact specialization "
-                    "engaged (heads=64 latent=512 selected=%u)\n",
-                    n_selected);
-            notice_printed = 1;
+                    "engaged (heads=%u latent=512 selected=%u)\n",
+                    n_head, n_selected);
+            notice_printed[notice_index] = 1;
         }
         return cuda_ok(cudaGetLastError(),
                        "glm indexed NoPE F32 exact decode launch");

@@ -104,6 +104,33 @@
     },
     {
       "decision": "adapted",
+      "donor_commit": "94818d89209a76706c6588bae5d939198e6db065",
+      "donor_commit_name": "94818d8",
+      "donor_patch_id": "9283cf020b28a8110eb526aba4117ab436fd22cd",
+      "donor_patch_sha256": "4d097963f3e8e11f7755051eafb1616c036b0a07768b40aa0644741e4b81f9e1",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-uncensored-20260915/research/six-pointer-shared-activation-result-20260918.md",
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-uncensored-20260915/research/upstream-architecture-survey-20260918.md"
+      ],
+      "paths": [
+        "rocm/ds4_rocm_bf16_toktile.cuh",
+        "rocm/ds4_rocm_matmul.cuh",
+        "tests/test_rocm_glm5_six_prefill_exact.cu"
+      ],
+      "reason": "Adapt the upstream six-projection ordering and strict fused eligibility observed in SGLang GLM5, using independent native GGUF BF16 pointers and no concatenated cache; the selector remains default-off pending dual-rank gates.",
+      "recorded_at": "2026-09-17T23:46:58+00:00",
+      "research_branch": "research/glm53-uncensored-six-kda-20260917",
+      "result_commit": "2e8a29f394439e3cb570e648606c716ce6dec271",
+      "result_patch_id": "8ddb751dead1526948da28196fe2b974b7ea079f",
+      "result_patch_sha256": "d3eb265b3aedbaabf391d438c03bd6394bfbe2ff7b864a4b05a0d2b890b7e8d6",
+      "source": {
+        "access_date": "2026-09-18",
+        "title": "SGLang GLM-5.3 six-way KDA projection fusion (adapted through DS4 QKV pointer precedent)",
+        "url": "https://github.com/sgl-project/sglang/tree/bd45cd50ca900dd821f829ca9adfbf9aa3336bda"
+      }
+    },
+    {
+      "decision": "adapted",
       "donor_commit": "c285966175390b528cd7db564b7639d7511cad03",
       "donor_commit_name": "c285966",
       "donor_patch_id": "empty",
