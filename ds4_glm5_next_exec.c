@@ -2642,6 +2642,30 @@ static int mla_sparse_selection_attention(
         project_output, finish_attention, false, NULL);
 }
 
+static int mla_output_small_m(const ds4_glm5_next_exec_ctx *ctx, uint32_t il,
+        const ds4_glm5_next_workspace *batch, uint32_t rows, bool launch) {
+    const uint32_t full = GLM5_HEADS * GLM5_HEAD_DIM, local = full / 2u;
+    return (launch ? ds4_rocm_glm5_mla_output_q8_small_m :
+        ds4_rocm_glm5_mla_output_q8_small_m_supported)(ctx->tp_big_out,
+        ctx->model_map, ctx->model_size, ctx->model->layer[il].mla.output,
+        full, ctx->tp_rank * local, local, GLM5_WIDTH,
+        (uint64_t)full / GLM5_Q8_QK * GLM5_Q8_BLOCK_BYTES, batch->mla_heads, rows);
+}
+
+int ds4_glm5_next_mla_output_batch_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *batch) {
+    if (!context_valid(ctx) || !batch || !batch->decode_phase || ctx->tp_rank > 1u ||
+        (batch->capacity_tokens != 2u && batch->capacity_tokens != 4u && batch->capacity_tokens != 6u))
+        return 0;
+    unsigned count = 0u;
+    for (uint32_t il = 0u; il < ctx->model->trunk_count; ++il) {
+        if (ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_MLA) continue;
+        if (!mla_output_small_m(ctx, il, batch, batch->capacity_tokens, false)) return 0;
+        ++count;
+    }
+    return count == 11u;
+}
+
 /* Keep causal attention and the M1 projection/residual arithmetic unchanged.
  * Only the output reduction is deferred. Heads and mHC coefficients live in
  * existing batch scratch; do not reuse the scalar row's overwritten split. */
@@ -2683,11 +2707,7 @@ static int verify_mla_attention_handoff(const ds4_glm5_next_exec_ctx *ctx,
     }
     if (profile) profile->last = glm5_exec_now_sec();
     if (ok && batch_output) {
-        ok = ds4_rocm_glm5_mla_output_q8_small_m(ctx->tp_big_out,
-            ctx->model_map, ctx->model_size, layer->mla.output,
-            GLM5_HEADS * GLM5_HEAD_DIM, ctx->tp_rank * head_elements,
-            head_elements, GLM5_WIDTH, (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM / 32u * 34u,
-            batch->mla_heads, rows);
+        ok = mla_output_small_m(ctx, il, batch, rows, true);
     }
     for (uint32_t t = 0u; ok && !batch_output && t < rows; ++t) {
         ds4_gpu_tensor *heads = ds4_gpu_tensor_view(batch->mla_heads, t * head_row, head_row);
@@ -4898,10 +4918,8 @@ static int layer_verify_run(const ds4_glm5_next_exec_ctx *ctx,
     /* Model binding already requires each MLA output to be Q8_0 K16384/N4096.
      * Check modes, resident range and scratch before starting private replay.
      * The causal loop writes packed owned32 heads, not full64-head rows. */
-    if (batch_output && !ds4_rocm_glm5_mla_output_q8_small_m_supported(
-            ctx->tp_big_out, ctx->model_map, ctx->model_size, layer->mla.output,
-            16384u, ctx->tp_rank * 8192u, 8192u, GLM5_WIDTH, 17408u,
-            batch_w->mla_heads, n_tokens)) {
+    if (batch_output && !mla_output_small_m(ctx, il, batch_w, n_tokens, false)) {
+        ds4_tp_mark_failed(ctx->tp);
         fprintf(stderr, "ds4: native MLA output batch unsupported resident layout/settings\n");
         return 0;
     }

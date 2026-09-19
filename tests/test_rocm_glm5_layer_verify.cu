@@ -40,6 +40,7 @@ struct ds4_tp {
     bool attn_pending=false, observe_attn=false, fail_attn_completion=false;
     unsigned attn_outputs=0, attn_drains=0, fail_attn_output=0;
     unsigned attn_prepares=0, fail_attn_prepare=0;
+    unsigned output_batch_calls=0, output_scalar_calls=0;
     uint64_t attn_sequence=0;
     uint32_t attn_layer=0, attn_rows=0;
 };
@@ -240,6 +241,16 @@ static void serial_row(ds4_glm5_next_exec_ctx &x,unsigned il,State &s,Workspace 
     ds4_gpu_tensor_free(in);
 }
 
+static void check_output_engagement(const ds4_glm5_next_exec_ctx &x,
+        unsigned batch_before,unsigned scalar_before,unsigned m,unsigned layers) {
+    const char *option=std::getenv("DS4_ROCM_GLM5_VERIFY_MLA_OUTPUT_BATCH");
+    if (!option) return;
+    REQUIRE(!std::strcmp(option,"0") || !std::strcmp(option,"1"));
+    const bool enabled=!std::strcmp(option,"1");
+    REQUIRE(x.tp->output_batch_calls-batch_before==(enabled?layers:0u));
+    REQUIRE(x.tp->output_scalar_calls-scalar_before==(enabled?0u:layers*m));
+}
+
 static void run_case(ds4_glm5_next_exec_ctx &x,unsigned il,unsigned m,unsigned prefix,unsigned accepted) {
     State base(*x.model), reference(*x.model), candidate(*x.model);
     Workspace scalar(1), batch(m);
@@ -262,7 +273,9 @@ static void run_case(ds4_glm5_next_exec_ctx &x,unsigned il,unsigned m,unsigned p
     const unsigned handoff_before=x.tp->handoff_bulk_calls;
     const unsigned agree_before=x.tp->layer_agrees[0];
     const unsigned attn_before=x.tp->attn_bulk_calls;
+    const unsigned batch_before=x.tp->output_batch_calls,scalar_before=x.tp->output_scalar_calls;
     REQUIRE(ds4_glm5_next_layer_verify(&x,il,&candidate.s,batch,scalar,verify_inputs,got,m));
+    check_output_engagement(x,batch_before,scalar_before,m,il%4==3?1u:0u);
     REQUIRE(x.tp->aux_calls==aux_before && x.tp->bulk_calls>bulk_before);
     if (il%4==3 && (x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF))
         REQUIRE(x.tp->handoff_bulk_calls==handoff_before+1 && x.tp->layer_agrees[0]==agree_before+1);
@@ -405,7 +418,9 @@ static void target_case(ds4_glm5_next_exec_ctx &x,unsigned m,unsigned prefix,uns
         }
     };
     guard_tp_tail(true);
+    const unsigned output_batch_before=x.tp->output_batch_calls,output_scalar_before=x.tp->output_scalar_calls;
     REQUIRE(ds4_glm5_next_target_verify(&x,&candidate.s,batch,scalar,tokens,m,scratch,got,logits));
+    check_output_engagement(x,output_batch_before,output_scalar_before,m,11u);
     scratch.check(); got.check(); logits.check(); guard_tp_tail(false);
     const unsigned handoffs=(x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_FFN_HANDOFF)?
         ((x.tp->prefill_config & DS4_TP_CONFIG_GLM5_VERIFY_MLA_FFN_HANDOFF)?42u:31u):0u;
@@ -692,14 +707,14 @@ static void mla_output_batch_failures(ds4_glm5_next_exec_ctx &x) {
         }
         if (failure==2) REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE","6",1)==0);
         if (failure==3) x.tp->prefill_config=(config & ~DS4_TP_CONFIG_GLM5_NATIVE_SIX) | ds4_tp_glm5_native_config(8);
-        x.tp->observe_attn=failure>=4;
+        x.tp->observe_attn=true;
         if (failure==4) x.tp->fail_attn_output=1;
         if (failure==5) x.tp->fail_attn_completion=true;
         REQUIRE(!ds4_glm5_next_layer_verify(&x,3,&state.s,batch,scalar,input,output,m));
         x.tp->observe_attn=false;
         REQUIRE(*x.tp_sequence==sequence && x.tp->calls==calls && x.tp->handoff_bulk_calls==ffns);
         if (failure<4) REQUIRE(state.s.valid && x.tp->attn_agrees==agrees &&
-            !state.s.pending_mla_verifications);
+            !state.s.pending_mla_verifications && !x.tp->attn_outputs && !x.tp->attn_prepares);
         else REQUIRE(!state.s.valid && !state.s.pending_mla_verifications && x.tp->failed &&
             x.tp->attn_agrees==agrees+1 && x.tp->attn_outputs==1 && x.tp->attn_drains==1 &&
             !x.tp->fail_attn_output && !x.tp->fail_attn_completion &&
@@ -800,8 +815,10 @@ static void target_timing(ds4_glm5_next_exec_ctx &x,unsigned m,bool heads_only=f
         queue_timed_sample=queue_compare && sample>=4;
         const auto start=std::chrono::steady_clock::now();
         if (arm || heads_only) {
+            const unsigned output_batch_before=x.tp->output_batch_calls,output_scalar_before=x.tp->output_scalar_calls;
             REQUIRE(ds4_glm5_next_target_verify(&x,&state.s,batch,scalar,tokens,m,
                 batch_scratch,batch_hidden,batch_logits));
+            check_output_engagement(x,output_batch_before,output_scalar_before,m,11u);
             REQUIRE(ds4_glm5_next_target_verify_finish(&x,&state.s,m));
         } else for (unsigned t=0;t<m;++t)
             serial_target_reserved(x,state,scalar,tokens[t],scratch,hidden,logits);
@@ -971,6 +988,27 @@ int main(int argc,char **argv) {
         x.tp_sequence=&sequence;
         const unsigned first_rank=resident?resident_rank:0u;
         const unsigned end_rank=resident?resident_rank+1u:2u;
+        if (output_compare) {
+            x.tp_rank=resident_rank;
+            for (unsigned m : {2u,4u,6u}) {
+                Workspace batch(m);
+                REQUIRE(ds4_glm5_next_mla_output_batch_supported(&x,batch));
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE","6",1)==0);
+                REQUIRE(!ds4_glm5_next_mla_output_batch_supported(&x,batch));
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE","1",1)==0);
+                auto other=x;
+                auto changed_model=model;
+                other.model=&changed_model;
+                for (unsigned il=3;il<45;il+=4) {
+                    const auto saved=changed_model.layer[il].mla.output;
+                    changed_model.layer[il].mla.output=g.size-2;
+                    REQUIRE(!ds4_glm5_next_mla_output_batch_supported(&other,batch));
+                    changed_model.layer[il].mla.output=saved;
+                }
+            }
+            REQUIRE(!peer.output_batch_calls && !peer.output_scalar_calls && !peer.calls);
+            std::puts("MLA_OUTPUT_STARTUP all11 resident ranges and2/4/6 workspaces checked before any launch PASS");
+        }
         if (native) {
             peer.rank=x.tp_rank=resident_rank;
             if (refresh) { native_hidden_tile_checks(x); native_refresh_checks(x); }

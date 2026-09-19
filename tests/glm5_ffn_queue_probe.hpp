@@ -84,6 +84,7 @@ int __wrap_ds4_rocm_glm5_mla_output_q8_small_m(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *x, uint32_t rows) {
     const int ok=__real_ds4_rocm_glm5_mla_output_q8_small_m(
         out,map,size,offset,full,first,k,n,stride,x,rows);
+    if (ok && queue_test_peer) ++queue_test_peer->output_batch_calls;
     if (queue_test_peer && queue_test_peer->observe_attn &&
         ++queue_test_peer->attn_outputs==queue_test_peer->fail_attn_output) {
         REQUIRE(ok);
@@ -98,6 +99,8 @@ int __wrap_ds4_gpu_matmul_q8_0_kslice_tensor(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *x, uint64_t input_start) {
     const int ok=__real_ds4_gpu_matmul_q8_0_kslice_tensor(out,map,size,offset,
         in_dim,start,count,out_dim,x,input_start);
+    if (ok && queue_test_peer && in_dim==16384 && count==8192 && out_dim==4096)
+        ++queue_test_peer->output_scalar_calls;
     if (queue_test_peer && queue_test_peer->observe_attn &&
         ++queue_test_peer->attn_outputs==queue_test_peer->fail_attn_output) {
         REQUIRE(ok);

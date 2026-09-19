@@ -113,6 +113,10 @@ void ds4_glm5_next_workspace_begin_prefill(
         ds4_glm5_next_workspace *workspace);
 void ds4_glm5_next_workspace_begin_decode(
         ds4_glm5_next_workspace *workspace);
+/* Session admission after resident spans and exact verifier workspaces exist.
+ * Checks every trunk MLA output without enqueue, allocation or state mutation. */
+int ds4_glm5_next_mla_output_batch_supported(const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_workspace *workspace);
 
 /* Explicit native block45 workspace: one scalar activation set and one
  * bounded eight-expert packed window, invalidated before each reuse. */

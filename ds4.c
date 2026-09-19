@@ -51836,6 +51836,13 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             s->glm5_native_verify_ws[i] = ds4_glm5_next_workspace_create_capacity_context(rows, capacity);
             if (!s->glm5_native_verify_ws[i]) return 0;
             ds4_glm5_next_workspace_begin_decode(s->glm5_native_verify_ws[i]);
+            if (mla_output && !strcmp(mla_output, "1") &&
+                !ds4_glm5_next_mla_output_batch_supported(&s->glm5_next_exec,
+                    s->glm5_native_verify_ws[i])) {
+                ds4_tp_mark_failed(e->tp.ctx);
+                fprintf(stderr, "ds4: native MLA output batch startup admission failed rows=%u\n", rows);
+                return 0;
+            }
         }
         s->glm5_native_previous = ds4_gpu_tensor_alloc(row_bytes);
         s->glm5_native_chain = ds4_gpu_tensor_alloc(row_bytes);
@@ -51851,6 +51858,8 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             !s->glm5_native_hc[0] || !s->glm5_native_hc[1] || !s->glm5_native_logits ||
             !s->glm5_native_host_logits) return 0;
         s->glm5_native_rows = native_rows;
+        if (mla_output && !strcmp(mla_output, "1"))
+            fprintf(stderr, "ds4: native MLA output batch startup admitted layers=11 max_rows=%u weights=resident_original\n", native_rows);
         fprintf(stderr, "ds4: native GLM5 draft enabled (research, max target rows=%u)\n", native_rows);
         fprintf(stderr, "ds4: native GLM5 config proposals=%u hello=0x%016llx verifier_workspaces=%u/%u/%u\n",
             native_rows-1u, (unsigned long long)ds4_tp_prefill_config(e->tp.ctx),

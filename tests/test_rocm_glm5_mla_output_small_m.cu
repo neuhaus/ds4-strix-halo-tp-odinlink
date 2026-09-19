@@ -61,6 +61,10 @@ int main(int argc, char **argv) {
         !std::strcmp(std::getenv("DS4_ROCM_GLM5_Q8_DECODE_TILE"), "1"));
     REQUIRE(std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH") &&
         !std::strcmp(std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH"), "8"));
+    const char *nt_env = std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    const char *rows_env = std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    const bool had_nt = nt_env != nullptr, had_rows = rows_env != nullptr;
+    const std::string original_nt = nt_env ? nt_env : "", original_rows = rows_env ? rows_env : "";
     REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY", "1", 1) == 0);
     Glm5TestGGUF g; REQUIRE(g.open_file(path));
     uint64_t offsets[11], sizes[11];
@@ -162,6 +166,8 @@ int main(int argc, char **argv) {
                 offsets[index], 16384u, rank * 8192u, 8192u, 4096u, 17408u, x.view, m));
             REQUIRE(!ds4_rocm_glm5_mla_output_q8_small_m(out.view, g.map + 1u, g.size - 1u,
                 offsets[index], 16384u, rank * 8192u, 8192u, 4096u, 17408u, x.view, m));
+            REQUIRE(ds4_gpu_synchronize());
+            for (float v : out.read()) REQUIRE(v == 12345.0f);
             ++refusals;
             for (const char *mode : {"0", "2", "3", "4", "5", "6", "invalid"}) {
                 REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE", mode, 1) == 0); reject_mode();
@@ -173,9 +179,11 @@ int main(int argc, char **argv) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH", "8", 1) == 0);
             ds4_gpu_set_quality(true); reject_mode(); ds4_gpu_set_quality(false);
             REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL", "invalid", 1) == 0); reject_mode();
-            REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL", "1", 1) == 0);
+            REQUIRE((had_nt ? setenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL", original_nt.c_str(), 1) :
+                unsetenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL")) == 0);
             REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK", "7", 1) == 0); reject_mode();
-            REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK", "32", 1) == 0);
+            REQUIRE((had_rows ? setenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK", original_rows.c_str(), 1) :
+                unsetenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK")) == 0);
 
             const auto timed_input = inputs(m, layer, 2u);
             REQUIRE(ds4_gpu_tensor_write(x.view, 0u, timed_input.data(), timed_input.size() * 4u));

@@ -8203,7 +8203,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_glm5_mla_output_calls[0] || g_glm5_mla_output_calls[1] || g_glm5_mla_output_calls[2]) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "MLA output batch launches m2=%llu m4=%llu m6=%llu weight_cache_bytes=0\n",
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "MLA output batch submissions m2=%llu m4=%llu m6=%llu weights=resident_original\n",
             (unsigned long long)g_glm5_mla_output_calls[0],
             (unsigned long long)g_glm5_mla_output_calls[1],
             (unsigned long long)g_glm5_mla_output_calls[2]);

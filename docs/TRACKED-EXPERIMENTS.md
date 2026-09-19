@@ -241,7 +241,11 @@ MLA attention handoff. It defaults off, requires the existing negotiated
 handoff, preflights resident weights/modes/buffers before private replay and
 keeps mandatory completion agreement on launch failure. There is no scalar
 retry after failed batch launch. Both effective rank settings must match;
-the wire schedule is unchanged. Cleanup reports successful M2/M4/M6 launches.
+the wire schedule is unchanged. Session startup checks all eleven resident
+output tensors for each exact workspace; per-layer checks remain and mark
+transport failed if a later admission check fails. Cleanup reports M2/M4/M6
+submissions; clean run completion is checked separately. Fixtures assert
+batch-versus-scalar engagement per arm and exercise startup refusal.
 Prefill, drafting and ordinary scalar tails keep their existing dispatch.
 See `research/mla-output-integration-plan-3fd2018.md` for real-rank fixtures
 and prospective same-binary4K/8K model comparisons before any promotion.
