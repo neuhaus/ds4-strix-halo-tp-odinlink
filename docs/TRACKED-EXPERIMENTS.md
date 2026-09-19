@@ -112,6 +112,17 @@ Run targeted CPU/protocol checks and
 kernels default-off until their applicable gates pass. Keep advisor reviews in
 the promotion dossier; a repair or experiment commit is not a promotion.
 
+The quality launcher's `deepseek-ordinary` teacher arm records complete
+independent-case logits over RoCE v2 with both clean rank terminal proofs,
+matching DeepSeek feature negotiation and hashes of the selected fixture
+contents. `compare-teacher-logits.py --score-arm-mode deepseek-sdk` permits
+different frozen executable identities with otherwise matching experiment
+settings, reopens terminal/dump evidence, and remains threshold-free diagnostic
+output. It cannot grant a Lane B admission. When an unchanged inference binary
+is reused under a newer harness, record its separate source and executable
+pins; retain the stale-build check and original build dossier. See
+`$DS4_RESEARCH_ROOT/candidates/glm53-mtp-20260919/deepseek-teacher-admission-plan.md`.
+
 ## Active uncensored-model verifier track
 
 `research/glm53-uncensored-six-kda-20260917` extends current main with

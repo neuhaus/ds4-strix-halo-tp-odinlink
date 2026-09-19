@@ -146,6 +146,28 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
     echo "error: teacher-logit directory must be empty: $TEACHER_LOGITS_DIR" >&2
     exit 2
   fi
+  if [[ $TEACHER_ARM == deepseek-ordinary ]]; then
+    [[ $MODEL_ARCH == deepseek4 && $RDMA_PROFILE == roce-v2 ]] || {
+      echo "error: deepseek-ordinary teacher capture requires deepseek4 over RoCE v2" >&2; exit 2;
+    }
+    for kv in "${EXTRA_ENV[@]}"; do
+      case $kv in
+        DS4_GLM5_NATIVE_DRAFT=0|DS4_ROCM_GLM5_Q8_DECODE_TILE=1) ;;
+        DS4_DSPARK_*=*|DS4_*MTP*=*|DS4_GLM5_*=*|DS4_GLM_*=*|DS4_ROCM_GLM*=*)
+          echo "error: deepseek-ordinary forbids speculative/GLM controls: ${kv%%=*}" >&2; exit 2 ;;
+        DS4_TP_RDMA_LOGITS=*)
+          [[ $kv == DS4_TP_RDMA_LOGITS=1 ]] || {
+            echo "error: DeepSeek teacher capture requires full-vocabulary RDMA logits" >&2; exit 2;
+          } ;;
+      esac
+    done
+    # The two allowed GLM entries above preserve existing DeepSeek recipes:
+    # native drafting is explicitly off; the GLM-only Q8 selector is inert.
+    TEACHER_VALIDATOR=$REPO/scripts/compare-teacher-logits.py
+    TEACHER_VALIDATOR_HASH=$(sha256sum "$TEACHER_VALIDATOR" | awk '{print $1}')
+    TEACHER_FIXTURE_HASH=$(python3 "$TEACHER_VALIDATOR" --validate-capture --root "$REPO" \
+      --fixture "$MANIFEST" --start-case "$START_CASE" --cases "$MAX_CASES")
+  else
   if [[ " ${EXTRA_ENV[*]} " == *' DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT='* ]]; then
     echo "error: teacher-logit diagnostics isolate decode KDA output K-slice; batch K-slice must be unset" >&2
     exit 2
@@ -207,6 +229,7 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
     echo "error: teacher-logit diagnostics require an explicit GLM5 prefill batch" >&2
     exit 2
   }
+  fi
 fi
 
 # score_official and ds4 are different executables linked against the same
@@ -285,6 +308,21 @@ LOCAL_HASH=$(sha256sum "$REPO/ds4" | awk '{print $1}')
 PEER_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
 [[ $LOCAL_HASH == "$PEER_HASH" ]] || { echo "error: rank binary hashes differ" >&2; exit 1; }
 SOURCE_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+INFERENCE_SOURCE_COMMIT=${DS4_QUALITY_INFERENCE_SOURCE_COMMIT:-$SOURCE_COMMIT}
+if [[ -n ${DS4_QUALITY_INFERENCE_SOURCE_COMMIT:-} ]]; then
+  [[ $INFERENCE_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ &&
+     ${DS4_QUALITY_EXPECT_DS4_SHA256:-} == "$LOCAL_HASH" &&
+     ${DS4_QUALITY_EXPECT_SCORER_SHA256:-} == "$(sha256sum "$SCORER" | awk '{print $1}')" ]] || {
+    echo "error: explicit inference source requires matching ds4/scorer hashes" >&2; exit 2;
+  }
+  if ! git -C "$REPO" cat-file -e "$INFERENCE_SOURCE_COMMIT^{commit}" ||
+     ! git -C "$REPO" diff --quiet "$INFERENCE_SOURCE_COMMIT" -- \
+       '*.c' '*.h' '*.cu' '*.cuh' '*.cpp' '*.inc'; then
+    echo "error: reused inference binaries require identical implementation source" >&2; exit 2;
+  fi
+elif [[ -n ${DS4_QUALITY_EXPECT_DS4_SHA256:-}${DS4_QUALITY_EXPECT_SCORER_SHA256:-} ]]; then
+  echo "error: binary hash pins require an explicit inference source" >&2; exit 2
+fi
 if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
    git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null &&
    [[ -z $(git -C "$REPO" ls-files --others --exclude-standard) ]]; then
@@ -595,6 +633,39 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
   git -C "$REPO" diff --binary HEAD -- > "$TEACHER_LOGITS_DIR/source.diff"
   git -C "$REPO" status --porcelain=v1 --untracked-files=all \
     > "$TEACHER_LOGITS_DIR/source.status"
+  if [[ $TEACHER_ARM == deepseek-ordinary ]]; then
+    [[ $(sha256sum "$TEACHER_VALIDATOR" | awk '{print $1}') == "$TEACHER_VALIDATOR_HASH" &&
+       $(python3 "$TEACHER_VALIDATOR" --validate-capture --root "$REPO" --fixture "$MANIFEST" \
+          --start-case "$START_CASE" --cases "$MAX_CASES" \
+          --dumps "$TEACHER_LOGITS_DIR" --scores "$SCORES" --model "$MODEL") == "$TEACHER_FIXTURE_HASH" ]] || {
+      echo "error: invalid teacher capture or changed fixture/validator" >&2; exit 1;
+    }
+    for log in "$COORD_LOG" "$WORKER_LOG"; do
+      if [[ $(grep -c 'Q4_K WMMA startup rank=' "$log") != 1 ||
+            $(grep '^ds4-tp: transport proof ' "$log") != 'ds4-tp: transport proof requested=rdma active=rdma payload_fallback_calls=0 failed=0' ]] ||
+         ! grep -Fq "rdma GID index $RDMA_GID_INDEX (RoCE v2)" "$log" ||
+         ! grep -q 'expanded_weight_cache_bytes=0\([[:space:]]\|$\)' "$log" ||
+         grep -Eq 'expanded_weight_cache_bytes=[1-9]' "$log"; then
+        echo "error: DeepSeek capture lacks startup/RoCE/zero-fallback/cache proof in $log" >&2; exit 1;
+      fi
+    done
+    COORD_FEATURES=$(grep 'Q4_K WMMA startup rank=' "$COORD_LOG")
+    WORKER_FEATURES=$(grep 'Q4_K WMMA startup rank=' "$WORKER_LOG")
+    [[ $COORD_FEATURES == *'startup rank=0 '* && $WORKER_FEATURES == *'startup rank=1 '* &&
+       ${COORD_FEATURES/startup rank=0 /startup rank=1 } == "$WORKER_FEATURES" ]] || {
+      echo "error: DeepSeek rank negotiation differs" >&2; exit 1;
+    }
+    for field in kshard kda_tp kda_output_kslice quality kill_switch; do
+      [[ " $COORD_FEATURES " == *" $field=0 "* ]] || {
+        echo "error: invalid DeepSeek startup $field" >&2; exit 1;
+      }
+    done
+    [[ $COORD_FEATURES =~ negotiated=(0x[0-9a-fA-F]+)([[:space:]]|$) ]] || {
+      echo "error: missing DeepSeek negotiation mask" >&2; exit 1;
+    }
+    COORD_NEGOTIATED=${BASH_REMATCH[1]}
+    WORKER_NEGOTIATED=$COORD_NEGOTIATED
+  else
   COORD_FEATURES=$(grep -E 'GLM5 TP features: kda_tp=[01] kda_output_kslice=[01]' \
     "$COORD_LOG" | tail -1 || true)
   WORKER_FEATURES=$(grep -E 'GLM5 TP features: kda_tp=[01] kda_output_kslice=[01]' \
@@ -606,9 +677,17 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
     echo "error: teacher-logit diagnostic lacks negotiated feature proof" >&2
     exit 1
   }
+  fi
   {
     printf 'producer=gguf-tools/quality-testing/score_official.c\n'
+    printf 'tag=%s\n' "$TAG"
     printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+    printf 'inference_source_commit=%s\n' "$INFERENCE_SOURCE_COMMIT"
+    printf 'model_arch=%s\ncontext=%s\n' "$MODEL_ARCH" "$CONTEXT"
+    if [[ $TEACHER_ARM == deepseek-ordinary ]]; then
+      printf 'fixture_content_sha256=%s\n' "$TEACHER_FIXTURE_HASH"
+      printf 'capture_validator_sha256=%s\n' "$TEACHER_VALIDATOR_HASH"
+    fi
     printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
     printf 'model=%s\n' "$MODEL"
     printf 'model_size=%s\n' "$LOCAL_SIZE"
@@ -638,6 +717,7 @@ fi
 {
   printf 'tag=%s\n' "$TAG"
   printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+  printf 'inference_source_commit=%s\n' "$INFERENCE_SOURCE_COMMIT"
   printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
   printf 'model=%s\n' "$MODEL"
   printf 'model_size=%s\n' "$LOCAL_SIZE"

@@ -8,11 +8,13 @@ It never turns its built-in defaults into a lane-B acceptance policy.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import heapq
 import json
 import math
 import re
+import runpy
 import shlex
 import sys
 from pathlib import Path
@@ -68,6 +70,147 @@ def top_ids(values: list[float], count: int) -> list[int]:
     selected = heapq.nlargest(
         count, enumerate(values), key=lambda item: (item[1], -item[0]))
     return [index for index, _ in selected]
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def score_fixture(path: Path, root: Path, start: int, count: int) -> tuple[list, str]:
+    rows = [line.split('\t') for line in path.read_text().splitlines()
+            if line and not line.startswith('#')][start:start + count]
+    require(len(rows) == count, 'incomplete selected fixture')
+    seen, snapshot = set(), []
+    for row in rows:
+        require(3 <= len(row) <= 4 and row[0] not in seen, 'invalid or duplicate fixture case')
+        seen.add(row[0])
+        hashes = []
+        for index, name in enumerate(row[1:]):
+            require(bool(name) or index == 2, 'empty prompt or continuation path')
+            hashes.append(sha256(root / name) if name else None)
+        snapshot.append([row[0], *hashes])
+    digest = hashlib.sha256(json.dumps(snapshot, separators=(',', ':')).encode()).hexdigest()
+    return rows, digest
+
+
+def validate_score_capture(directory: Path, scores_path: Path, model: str,
+                           case_ids: list[str] | None = None) -> None:
+    with scores_path.open() as stream:
+        scores = list(csv.DictReader(stream, delimiter='\t'))
+    ids = [row['id'] for row in scores]
+    require(bool(ids) and len(set(ids)) == len(ids), 'empty or duplicate score cases')
+    require(case_ids is None or ids == case_ids, 'score/fixture case mismatch')
+    expected = []
+    for row in scores:
+        prefix, count = int(row['prompt_tokens']), int(row['target_tokens'])
+        require(prefix > 0 and count > 0, 'invalid case length')
+        expected.extend((row['id'], step, prefix) for step in range(count))
+    files = sorted(directory.glob('decode_*.logits.json'))
+    require([p.name for p in files] == [f'decode_{i:06d}.logits.json' for i in range(len(expected))],
+            'incomplete or noncontiguous teacher dumps')
+    signature = None
+    for index, (path, (case, step, prefix)) in enumerate(zip(files, expected)):
+        value = load(path)
+        require(value['source'] == 'ds4-score-official-frozen-teacher' and
+                value.get('backend') == 'rocm' and value.get('model') == model,
+                'wrong logit producer/backend/model')
+        require(all(value[key] is False for key in ('quality', 'dspark', 'dspark_strict')),
+                'teacher capture must use ordinary production arithmetic')
+        for key, wanted in (('case_id', case), ('case_step', step), ('prefix_tokens', prefix),
+                            ('position', prefix + step), ('decode_step', index)):
+            require(value.get(key) == wanted and type(value.get(key)) is type(wanted),
+                    f'{path.name}: invalid {key}')
+        logits, vocab = value['logits'], value['vocab']
+        require(type(vocab) is int and vocab > 1 and
+                all(type(x) in (int, float) for x in logits), 'invalid vocabulary/logits')
+        require(type(value['quant_bits']) is int and value['quant_bits'] in (2, 4), 'invalid quantization')
+        current = (vocab, value['quant_bits'])
+        require(signature is None or signature == current, 'inconsistent vocabulary/quantization')
+        signature = current
+        for key in ('teacher_token', 'argmax_id', 'runner_up_id'):
+            require(type(value[key]) is int and 0 <= value[key] < vocab, f'invalid {key}')
+        top = top_ids(logits, 2)
+        require(top == [value['argmax_id'], value['runner_up_id']], 'invalid top-two metadata')
+        for key, computed in (('teacher_logit', logits[value['teacher_token']]),
+                ('argmax_logit', logits[top[0]]), ('runner_up_logit', logits[top[1]]),
+                ('top1_margin', logits[top[0]] - logits[top[1]]),
+                ('teacher_gap', logits[top[0]] - logits[value['teacher_token']])):
+            actual = value.get(key)
+            # Round-tripped %.9g floats and FP32-computed differences have
+            # small serialization error; this is not an SDK drift tolerance.
+            require(type(actual) in (int, float) and math.isfinite(actual) and
+                    math.isclose(actual, computed, rel_tol=2e-6, abs_tol=2e-5),
+                    f'inconsistent {key}')
+
+
+def capture_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description='Validate a teacher capture without quality thresholds')
+    parser.add_argument('--root', required=True, type=Path)
+    parser.add_argument('--fixture', required=True, type=Path)
+    parser.add_argument('--start-case', required=True, type=int)
+    parser.add_argument('--cases', required=True, type=int)
+    parser.add_argument('--dumps', type=Path)
+    parser.add_argument('--scores', type=Path)
+    parser.add_argument('--model')
+    args = parser.parse_args(argv)
+    try:
+        require(args.start_case >= 0 and args.cases > 0, 'invalid case range')
+        require(all((args.dumps, args.scores, args.model)) or not any((args.dumps, args.scores, args.model)),
+                'capture validation requires dumps, scores and model')
+        rows, digest = score_fixture(args.fixture, args.root, args.start_case, args.cases)
+        if args.dumps:
+            validate_score_capture(args.dumps, args.scores, args.model, [row[0] for row in rows])
+        print(digest)
+        return 0
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f'quality-logits: {error}', file=sys.stderr)
+        return 1
+
+
+def verify_deepseek_captures(directories: tuple[Path, Path], manifests: tuple[dict, dict]) -> None:
+    """An attested SDK diagnostic only; never an admission or threshold bypass."""
+    terminal = runpy.run_path(str(Path(__file__).with_name('compare-quality-scores.py')))['terminal_proof']
+    require(manifests[0].get('run_id') != manifests[1].get('run_id'), 'teacher comparison reuses a process run')
+    prior_env = prior_features = None
+    for directory, meta in zip(directories, manifests):
+        require(meta.get('teacher_arm') == 'deepseek-ordinary' and meta.get('model_arch') == 'deepseek4',
+                'DeepSeek comparison requires two deepseek-ordinary captures')
+        require(meta['source_dirty'] == '0' and meta['rdma_profile'] == 'roce-v2',
+                'DeepSeek capture requires clean source and RoCE v2')
+        require(all(re.fullmatch(r'[0-9a-f]{64}', meta.get(key, '')) for key in
+                    ('ds4_sha256', 'scorer_sha256', 'fixture_content_sha256', 'files_sha256')),
+                'invalid DeepSeek capture identity')
+        scores = Path(meta['scores_path'])
+        terminal(scores, meta, required=True)
+        require(sha256(directory / 'files.sha256') == meta['files_sha256'], 'changed dump inventory')
+        inventory = []
+        for line in (directory / 'files.sha256').read_text().splitlines():
+            digest, name = line.split('  ', 1)
+            require(re.fullmatch(r'decode_[0-9]{6}.logits.json', name) is not None,
+                    'invalid dump inventory filename')
+            require(sha256(directory / name) == digest, 'changed teacher dump')
+            inventory.append(name)
+        require(inventory == [p.name for p in sorted(directory.glob('decode_*.logits.json'))],
+                'dump inventory coverage differs')
+        require(len(inventory) == int(meta['teacher_positions']), 'wrong teacher position count')
+        validate_score_capture(directory, scores, meta['model'])
+        with scores.open() as stream:
+            require(len(list(csv.DictReader(stream, delimiter='\t'))) == int(meta['cases']),
+                    'wrong case count')
+        for rank in ('coordinator', 'worker'):
+            items = [item.split('=', 1) for item in shlex.split(meta[rank + '_env'])]
+            env = dict(items)
+            require(len(env) == len(items), 'duplicate effective setting')
+            require(env.pop('DS4_BENCH_RUN_ID', None) == meta['run_id'], 'mixed effective run identity')
+            require(env.get('DS4_TP_RDMA_LOGITS') == '1' and env.get('DS4_TP_GREEDY_TOP2', '0') == '0' and
+                    env.get('DS4_GLM5_NATIVE_DRAFT', '0') == '0' and not any(k.startswith('DS4_DSPARK_') for k in env),
+                    'DeepSeek teacher capture requires ordinary full RDMA logits')
+            require(prior_env is None or env == prior_env, 'DeepSeek effective settings differ')
+            prior_env = env
+            feature = meta[rank + '_features'].replace('startup rank=1 ', 'startup rank=0 ')
+            require(prior_features is None or feature == prior_features, 'DeepSeek negotiated features differ')
+            prior_features = feature
 
 
 def probability_metrics(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float, float, float]:
@@ -386,6 +529,8 @@ def clustered_mean_interval(values: list[float], groups: list[np.ndarray], *,
 
 
 def main() -> int:
+    if sys.argv[1:2] == ['--validate-capture']:
+        return capture_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("reference_dir", type=Path)
     parser.add_argument("candidate_dir", type=Path)
@@ -408,10 +553,13 @@ def main() -> int:
             "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math",
             "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar",
             "attn-scalar-vs-exact-split",
-            "attn-repeat"),
-        help="required arm relationship for score_official GLM5 diagnostics")
+            "attn-repeat", "deepseek-sdk"),
+        help="required score_official arm relationship; deepseek-sdk is threshold-free only")
     args = parser.parse_args()
+    deepseek_sdk = args.score_arm_mode == 'deepseek-sdk'
     try:
+        if deepseek_sdk and (args.thresholds or args.allow_quality_difference):
+            raise ValueError('DeepSeek SDK comparison is diagnostic-only, without thresholds or quality-mode changes')
         if args.score_arm_mode == "q8-decode-tile" and args.allow_quality_difference:
             raise ValueError("Q8 decode tile comparison forbids --allow-quality-difference")
         thresholds = load_thresholds(args.thresholds)
@@ -446,6 +594,11 @@ def main() -> int:
                 "scorer_sha256", "quality_input_sha256", "start_case",
                 "cases", "teacher_positions", "rdma_profile",
             )
+            if deepseek_sdk:
+                identity_fields = tuple(key for key in identity_fields if key not in
+                                        ('ds4_sha256', 'scorer_sha256')) + (
+                    'inference_source_commit', 'model_arch', 'context', 'fixture_content_sha256',
+                    'quality_launcher_sha256', 'capture_validator_sha256')
             missing = [field for field in identity_fields
                        if field not in reference_manifest or
                        field not in candidate_manifest]
@@ -457,216 +610,220 @@ def main() -> int:
                     raise ValueError(
                         f"manifest {field}: {reference_manifest[field]!r} != "
                         f"{candidate_manifest[field]!r}")
-            expected_arms = {
-                "kda-tp": ("kda-off", "kda-tp"),
-                "kda-kslice": ("kda-tp", "kda-kslice"),
-                "repeat": ("kda-kslice", "kda-kslice"),
-                "q8-decode-tile": ("kda-tp", "kda-tp"),
-                "full-split-order-null": ("kda-tp", "kda-tp"),
-                "null-vs-kslice": ("kda-tp", "kda-kslice"),
-                "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
-                "attn-scalar-vs-f32-gemm": ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-sync": ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-postdiv": ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-default-math":
-                    ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-postdiv-default-math":
-                    ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
-                    ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
-                    ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
-                    ("attn-scalar", "attn-gemm-f32"),
-                "attn-scalar-vs-exact-split":
-                    ("attn-scalar", "attn-exact-split"),
-                "attn-repeat": ("attn-scalar", "attn-scalar"),
-            }[args.score_arm_mode]
-            actual_arms = (reference_manifest.get("teacher_arm"),
-                           candidate_manifest.get("teacher_arm"))
-            if actual_arms != expected_arms:
-                raise ValueError(
-                    f"score arm relationship {actual_arms!r} != {expected_arms!r}")
-
-            def parse_env(encoded: str) -> dict[str, str]:
-                values: dict[str, str] = {}
-                for item in shlex.split(encoded):
-                    if "=" not in item:
-                        raise ValueError(f"malformed extra_env item {item!r}")
-                    key, value = item.split("=", 1)
-                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
-                        raise ValueError(f"duplicate or invalid extra_env key {key!r}")
-                    values[key] = value
-                return values
-
-            ref_env = parse_env(reference_manifest.get("extra_env", ""))
-            cand_env = parse_env(candidate_manifest.get("extra_env", ""))
-            selectors = {"DS4_GLM5_KDA_TP", "DS4_GLM5_KDA_OUTPUT_KSLICE"}
-            if args.score_arm_mode == "q8-decode-tile":
-                tile_key = "DS4_ROCM_GLM5_Q8_DECODE_TILE"
-                if (ref_env.get(tile_key), cand_env.get(tile_key)) != ("0", "1"):
-                    raise ValueError("Q8 decode tile comparison requires explicit TILE=0 versus TILE=1")
-                selectors.add(tile_key)
-            elif args.score_arm_mode == "full-split-order-null":
-                null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
-                if null_key in ref_env or cand_env.get(null_key) != "1":
-                    raise ValueError(
-                        "full-split-order null requires the legal reorder only "
-                        "in the candidate arm")
-                selectors.add(null_key)
-            elif args.score_arm_mode == "null-vs-kslice":
-                null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
-                if ref_env.get(null_key) != "1" or null_key in cand_env:
-                    raise ValueError(
-                        "null-vs-kslice requires the legal reorder only in "
-                        "the reference arm")
-                selectors.add(null_key)
-            elif args.score_arm_mode == "fallback-vs-kslice":
-                fallback_key = "DS4_ROCM_DISABLE_BF16_DECODE_MLP64"
-                if ref_env.get(fallback_key) != "1" or fallback_key in cand_env:
-                    raise ValueError(
-                        "fallback-vs-kslice requires the independent BF16 "
-                        "fallback only in the reference arm")
-                selectors.add(fallback_key)
-            elif args.score_arm_mode == "attn-scalar-vs-exact-split":
-                exact_key = "DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT"
-                research_keys = {
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
-                }
-                if ref_env.get(exact_key) != "0" or exact_key in cand_env or \
-                        any(key in ref_env or key in cand_env
-                            for key in research_keys):
-                    raise ValueError(
-                        "exact-split comparison requires rollback only in the "
-                        "scalar arm and no research selectors")
-                selectors.add(exact_key)
-            elif args.score_arm_mode.startswith("attn-scalar-vs-f32-gemm"):
-                nope_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE"
-                f32_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"
-                if (nope_key in ref_env or f32_key in ref_env or
-                        cand_env.get(nope_key) != "1" or
-                        cand_env.get(f32_key) != "1"):
-                    raise ValueError(
-                        "attention comparison requires FP32 NoPE GEMM only "
-                        "in the candidate arm")
-                selectors.update((nope_key, f32_key))
-                diagnostic = {
-                    "attn-scalar-vs-f32-gemm": None,
-                    "attn-scalar-vs-f32-gemm-sync":
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
-                    "attn-scalar-vs-f32-gemm-postdiv":
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+            if deepseek_sdk:
+                verify_deepseek_captures((args.reference_dir, args.candidate_dir),
+                                        (reference_manifest, candidate_manifest))
+            if not deepseek_sdk:
+                expected_arms = {
+                    "kda-tp": ("kda-off", "kda-tp"),
+                    "kda-kslice": ("kda-tp", "kda-kslice"),
+                    "repeat": ("kda-kslice", "kda-kslice"),
+                    "q8-decode-tile": ("kda-tp", "kda-tp"),
+                    "full-split-order-null": ("kda-tp", "kda-tp"),
+                    "null-vs-kslice": ("kda-tp", "kda-kslice"),
+                    "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
+                    "attn-scalar-vs-f32-gemm": ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-f32-gemm-sync": ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-f32-gemm-postdiv": ("attn-scalar", "attn-gemm-f32"),
                     "attn-scalar-vs-f32-gemm-default-math":
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
-                    "attn-scalar-vs-f32-gemm-postdiv-default-math": None,
-                    "attn-scalar-vs-f32-gemm-postdiv-pv-scalar": None,
+                        ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-f32-gemm-postdiv-default-math":
+                        ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
+                        ("attn-scalar", "attn-gemm-f32"),
                     "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
-                        None,
-                    "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar": None,
+                        ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
+                        ("attn-scalar", "attn-gemm-f32"),
+                    "attn-scalar-vs-exact-split":
+                        ("attn-scalar", "attn-exact-split"),
+                    "attn-repeat": ("attn-scalar", "attn-scalar"),
                 }[args.score_arm_mode]
-                diagnostic_keys = {
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
-                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
-                }
-                if args.score_arm_mode == \
-                        "attn-scalar-vs-f32-gemm-postdiv-default-math":
-                    required = {
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
-                    }
-                    if any(cand_env.get(key) != "1" for key in required) or \
-                            any(key not in required and key in cand_env
-                                for key in diagnostic_keys):
+                actual_arms = (reference_manifest.get("teacher_arm"),
+                               candidate_manifest.get("teacher_arm"))
+                if actual_arms != expected_arms:
+                    raise ValueError(
+                        f"score arm relationship {actual_arms!r} != {expected_arms!r}")
+
+                def parse_env(encoded: str) -> dict[str, str]:
+                    values: dict[str, str] = {}
+                    for item in shlex.split(encoded):
+                        if "=" not in item:
+                            raise ValueError(f"malformed extra_env item {item!r}")
+                        key, value = item.split("=", 1)
+                        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+                            raise ValueError(f"duplicate or invalid extra_env key {key!r}")
+                        values[key] = value
+                    return values
+
+                ref_env = parse_env(reference_manifest.get("extra_env", ""))
+                cand_env = parse_env(candidate_manifest.get("extra_env", ""))
+                selectors = {"DS4_GLM5_KDA_TP", "DS4_GLM5_KDA_OUTPUT_KSLICE"}
+                if args.score_arm_mode == "q8-decode-tile":
+                    tile_key = "DS4_ROCM_GLM5_Q8_DECODE_TILE"
+                    if (ref_env.get(tile_key), cand_env.get(tile_key)) != ("0", "1"):
+                        raise ValueError("Q8 decode tile comparison requires explicit TILE=0 versus TILE=1")
+                    selectors.add(tile_key)
+                elif args.score_arm_mode == "full-split-order-null":
+                    null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
+                    if null_key in ref_env or cand_env.get(null_key) != "1":
                         raise ValueError(
-                            "attention comparison requires postdiv and "
-                            "default-math selectors")
-                    selectors.update(required)
-                elif args.score_arm_mode == \
-                        "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
-                    required = {
+                            "full-split-order null requires the legal reorder only "
+                            "in the candidate arm")
+                    selectors.add(null_key)
+                elif args.score_arm_mode == "null-vs-kslice":
+                    null_key = "DS4_ROCM_BF16_FULL_SPLIT_ORDER"
+                    if ref_env.get(null_key) != "1" or null_key in cand_env:
+                        raise ValueError(
+                            "null-vs-kslice requires the legal reorder only in "
+                            "the reference arm")
+                    selectors.add(null_key)
+                elif args.score_arm_mode == "fallback-vs-kslice":
+                    fallback_key = "DS4_ROCM_DISABLE_BF16_DECODE_MLP64"
+                    if ref_env.get(fallback_key) != "1" or fallback_key in cand_env:
+                        raise ValueError(
+                            "fallback-vs-kslice requires the independent BF16 "
+                            "fallback only in the reference arm")
+                    selectors.add(fallback_key)
+                elif args.score_arm_mode == "attn-scalar-vs-exact-split":
+                    exact_key = "DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT"
+                    research_keys = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32",
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
-                    }
-                    if any(cand_env.get(key) != "1" for key in required) or \
-                            any(key not in required and key in cand_env
-                                for key in diagnostic_keys):
-                        raise ValueError(
-                            "attention comparison requires postdiv, scalar "
-                            "score, and scalar PV selectors")
-                    selectors.update(required)
-                elif args.score_arm_mode == \
-                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
-                    required = {
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
-                    }
-                    if any(cand_env.get(key) != "1" for key in required) or \
-                            any(key not in required and key in cand_env
-                                for key in diagnostic_keys):
-                        raise ValueError(
-                            "attention comparison requires postdiv and "
-                            "PV-scalar selectors")
-                    selectors.update(required)
-                elif args.score_arm_mode == \
-                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
-                    required = {
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
-                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
                     }
-                    if any(cand_env.get(key) != "1" for key in required) or \
-                            any(key not in required and key in cand_env
+                    if ref_env.get(exact_key) != "0" or exact_key in cand_env or \
+                            any(key in ref_env or key in cand_env
+                                for key in research_keys):
+                        raise ValueError(
+                            "exact-split comparison requires rollback only in the "
+                            "scalar arm and no research selectors")
+                    selectors.add(exact_key)
+                elif args.score_arm_mode.startswith("attn-scalar-vs-f32-gemm"):
+                    nope_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE"
+                    f32_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"
+                    if (nope_key in ref_env or f32_key in ref_env or
+                            cand_env.get(nope_key) != "1" or
+                            cand_env.get(f32_key) != "1"):
+                        raise ValueError(
+                            "attention comparison requires FP32 NoPE GEMM only "
+                            "in the candidate arm")
+                    selectors.update((nope_key, f32_key))
+                    diagnostic = {
+                        "attn-scalar-vs-f32-gemm": None,
+                        "attn-scalar-vs-f32-gemm-sync":
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
+                        "attn-scalar-vs-f32-gemm-postdiv":
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "attn-scalar-vs-f32-gemm-default-math":
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                        "attn-scalar-vs-f32-gemm-postdiv-default-math": None,
+                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar": None,
+                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
+                            None,
+                        "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar": None,
+                    }[args.score_arm_mode]
+                    diagnostic_keys = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
+                    }
+                    if args.score_arm_mode == \
+                            "attn-scalar-vs-f32-gemm-postdiv-default-math":
+                        required = {
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                        }
+                        if any(cand_env.get(key) != "1" for key in required) or \
+                                any(key not in required and key in cand_env
+                                    for key in diagnostic_keys):
+                            raise ValueError(
+                                "attention comparison requires postdiv and "
+                                "default-math selectors")
+                        selectors.update(required)
+                    elif args.score_arm_mode == \
+                            "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
+                        required = {
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
+                        }
+                        if any(cand_env.get(key) != "1" for key in required) or \
+                                any(key not in required and key in cand_env
+                                    for key in diagnostic_keys):
+                            raise ValueError(
+                                "attention comparison requires postdiv, scalar "
+                                "score, and scalar PV selectors")
+                        selectors.update(required)
+                    elif args.score_arm_mode == \
+                            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
+                        required = {
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                        }
+                        if any(cand_env.get(key) != "1" for key in required) or \
+                                any(key not in required and key in cand_env
+                                    for key in diagnostic_keys):
+                            raise ValueError(
+                                "attention comparison requires postdiv and "
+                                "PV-scalar selectors")
+                        selectors.update(required)
+                    elif args.score_arm_mode == \
+                            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
+                        required = {
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                        }
+                        if any(cand_env.get(key) != "1" for key in required) or \
+                                any(key not in required and key in cand_env
+                                    for key in diagnostic_keys):
+                            raise ValueError(
+                                "attention comparison requires postdiv, PV-scalar, "
+                                "and default-math selectors")
+                        selectors.update(required)
+                    elif diagnostic is None:
+                        if any(key in cand_env for key in diagnostic_keys):
+                            raise ValueError(
+                                "base attention comparison forbids repair selectors")
+                    else:
+                        if cand_env.get(diagnostic) != "1" or any(
+                                key != diagnostic and key in cand_env
                                 for key in diagnostic_keys):
-                        raise ValueError(
-                            "attention comparison requires postdiv, PV-scalar, "
-                            "and default-math selectors")
-                    selectors.update(required)
-                elif diagnostic is None:
-                    if any(key in cand_env for key in diagnostic_keys):
-                        raise ValueError(
-                            "base attention comparison forbids repair selectors")
-                else:
-                    if cand_env.get(diagnostic) != "1" or any(
-                            key != diagnostic and key in cand_env
-                            for key in diagnostic_keys):
-                        raise ValueError(
-                            f"attention comparison requires only {diagnostic}")
-                    selectors.add(diagnostic)
-            if ({k: v for k, v in ref_env.items() if k not in selectors} !=
-                    {k: v for k, v in cand_env.items() if k not in selectors}):
-                raise ValueError("score arms differ outside the declared selectors")
-            selector_expectations = {
-                "kda-off": ("0", "0"),
-                "kda-tp": ("1", "0"),
-                "kda-kslice": ("1", "1"),
-                "attn-scalar": ("1", "0"),
-                "attn-gemm-f32": ("1", "0"),
-                "attn-exact-split": ("1", "0"),
-            }
-            for manifest, env, arm in (
-                    (reference_manifest, ref_env, actual_arms[0]),
-                    (candidate_manifest, cand_env, actual_arms[1])):
-                expected_tp, expected_slice = selector_expectations[arm]
-                if (env.get("DS4_GLM5_KDA_TP"),
-                        env.get("DS4_GLM5_KDA_OUTPUT_KSLICE")) != (
-                            expected_tp, expected_slice):
-                    raise ValueError(f"manifest arm {arm} has the wrong KDA selectors")
-                expected_features = re.compile(
-                    rf"GLM5 TP features: kda_tp={expected_tp} "
-                    rf"kda_output_kslice={expected_slice}$")
-                for field in ("coordinator_features", "worker_features"):
-                    if not expected_features.search(manifest.get(field, "")):
-                        raise ValueError(f"manifest arm {arm} has invalid {field}")
+                            raise ValueError(
+                                f"attention comparison requires only {diagnostic}")
+                        selectors.add(diagnostic)
+                if ({k: v for k, v in ref_env.items() if k not in selectors} !=
+                        {k: v for k, v in cand_env.items() if k not in selectors}):
+                    raise ValueError("score arms differ outside the declared selectors")
+                selector_expectations = {
+                    "kda-off": ("0", "0"),
+                    "kda-tp": ("1", "0"),
+                    "kda-kslice": ("1", "1"),
+                    "attn-scalar": ("1", "0"),
+                    "attn-gemm-f32": ("1", "0"),
+                    "attn-exact-split": ("1", "0"),
+                }
+                for manifest, env, arm in (
+                        (reference_manifest, ref_env, actual_arms[0]),
+                        (candidate_manifest, cand_env, actual_arms[1])):
+                    expected_tp, expected_slice = selector_expectations[arm]
+                    if (env.get("DS4_GLM5_KDA_TP"),
+                            env.get("DS4_GLM5_KDA_OUTPUT_KSLICE")) != (
+                                expected_tp, expected_slice):
+                        raise ValueError(f"manifest arm {arm} has the wrong KDA selectors")
+                    expected_features = re.compile(
+                        rf"GLM5 TP features: kda_tp={expected_tp} "
+                        rf"kda_output_kslice={expected_slice}$")
+                    for field in ("coordinator_features", "worker_features"):
+                        if not expected_features.search(manifest.get(field, "")):
+                            raise ValueError(f"manifest arm {arm} has invalid {field}")
         elif args.score_arm_mode is not None:
             raise ValueError("--score-arm-mode applies only to score_official dumps")
 
@@ -678,7 +835,7 @@ def main() -> int:
                                       load(cand_path), thresholds,
                                       args.allow_quality_difference,
                                       args.score_arm_mode == "q8-decode-tile"))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
         return 1
 
