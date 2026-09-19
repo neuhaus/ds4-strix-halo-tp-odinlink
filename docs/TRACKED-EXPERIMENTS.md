@@ -227,3 +227,12 @@ The local `DS4_GLM5_VERIFY_MLA_ROW_SYNC=1` diagnostic retains per-row completion
 fences and requires this handoff. Both selectors default off; prefill and
 drafting retain their original schedule. No model or weight-cache change.
 See `research/mla-attn-handoff-plan-cc04c40.md` in the candidate dossier.
+
+The dedicated `ds4_rocm_glm5_mla_output_q8_small_m` leaf tests exact output
+weight reuse for M2/M4/M6, source K16384, local K8192 and N4096. It reuses
+the existing shared-Q8 kernel with the original full packed row stride and
+float activation rows, adds no weight allocation, and is not selected by
+the executor yet. Real-weight tests cover all trunk MLA output tensors,
+both rank slices, panel/token isolation, canaries and refused shapes/modes.
+See `research/mla-output-leaf-plan-f9146c7.md`; a component result does not
+establish full-model performance or permission to enable this leaf.

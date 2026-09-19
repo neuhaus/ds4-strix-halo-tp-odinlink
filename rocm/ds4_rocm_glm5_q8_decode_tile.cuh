@@ -562,3 +562,48 @@ extern "C" int ds4_rocm_glm5_shared_q8_small_m(
 #undef DS4_SHARED_Q8_LAUNCH
     return cuda_ok(cudaGetLastError(), "GLM5 shared Q8 small-M exact launch");
 }
+
+/* Dedicated original-Q8 MLA output leaf. Keep the shared-expert admission
+ * unchanged: this tensor has a full K16384 source row and a packed K8192
+ * activation row. The caller establishes Q8_0 type and rank/slice ownership.
+ * Reuse the exact same kernel instantiation and scalar accumulation order. */
+extern "C" int ds4_rocm_glm5_mla_output_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    if (!out || !x || !model_map ||
+        (tokens != 2u && tokens != 4u && tokens != 6u) ||
+        full_in_dim != 16384u || in_dim != 8192u || out_dim != 4096u ||
+        row_bytes != 17408u || (k_first != 0u && k_first != 8192u)) return 0;
+    const char *prefetch = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
+    const char *nt = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    const char *rows = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    if (glm5_q8_decode_tile_mode() != 1 || g_quality_mode ||
+        !cuda_runtime_config()->q8_decode_sharedx_64k ||
+        !prefetch || strcmp(prefetch, "8") ||
+        (nt && strcmp(nt, "0") && strcmp(nt, "1")) ||
+        (rows && strcmp(rows, "8") && strcmp(rows, "16") && strcmp(rows, "32")))
+        return 0;
+    const uint64_t x_bytes = (uint64_t)tokens * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)tokens * out_dim * sizeof(float);
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    if (!cuda_tensor_has_bytes(x, x_bytes) || !cuda_tensor_has_bytes(out, out_bytes) ||
+        offset % 2u || !cuda_model_range_fits(model_size, offset, weight_bytes)) return 0;
+    const uintptr_t op = (uintptr_t)out->ptr, xp = (uintptr_t)x->ptr;
+    if (!op || !xp || op % 4u || xp % 4u ||
+        (op <= xp ? out_bytes > xp - op : x_bytes > op - xp)) return 0;
+    const auto *w = (const unsigned char *)cuda_model_range_ptr(
+        model_map, offset, weight_bytes, "mla_output_q8_small_m");
+    if (!w) return 0;
+    w += (uint64_t)(k_first / 32u) * 34u;
+#define DS4_MLA_OUTPUT_Q8_LAUNCH(M) \
+    glm5_shared_q8_small_m_kernel<M, false><<<out_dim / 8u, 256u>>>( \
+        (float *)out->ptr, nullptr, w, nullptr, (const float *)x->ptr, \
+        in_dim, out_dim, row_bytes)
+    if (tokens == 2u) DS4_MLA_OUTPUT_Q8_LAUNCH(2u);
+    else if (tokens == 4u) DS4_MLA_OUTPUT_Q8_LAUNCH(4u);
+    else DS4_MLA_OUTPUT_Q8_LAUNCH(6u);
+#undef DS4_MLA_OUTPUT_Q8_LAUNCH
+    return cuda_ok(cudaGetLastError(), "GLM5 MLA output Q8 small-M exact launch");
+}

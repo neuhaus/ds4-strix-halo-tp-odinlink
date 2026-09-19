@@ -83,6 +83,20 @@ int ds4_rocm_glm5_shared_q8_small_m(
     return 0;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_mla_output_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t full_in_dim, uint32_t k_first,
+        uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
+        const ds4_gpu_tensor *x, uint32_t tokens) {
+    (void)out; (void)model_map; (void)model_size; (void)offset;
+    (void)full_in_dim; (void)k_first; (void)in_dim; (void)out_dim;
+    (void)row_bytes; (void)x; (void)tokens;
+    return 0;
+}
+
 static void glm5_phase_trace(const ds4_glm5_next_exec_ctx *ctx,
                              const char *phase, uint32_t layer,
                              uint32_t n_tokens) {
